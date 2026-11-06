@@ -21,15 +21,15 @@ export function ModelConfigFields({ value, onChange, disabled = false, prefix = 
       <div><label htmlFor={`${prefix}-api-mode`}>API 模式</label><select id={`${prefix}-api-mode`} value={value.api_mode} onChange={(event) => change({ api_mode: event.target.value })}>
         <option value="chat">Chat</option><option value="responses" disabled={value.provider === 'anthropic'}>Responses</option>
       </select></div>
-      <div className="span-all"><label htmlFor={`${prefix}-base-url`}>API 地址</label><input id={`${prefix}-base-url`} type="url" value={value.base_url ?? ''} onChange={(event) => change({ base_url: event.target.value || null })} placeholder="留空使用供应商默认地址" spellCheck={false} autoComplete="off" /></div>
-      <div><label htmlFor={`${prefix}-model-id`}>实际模型 ID</label><input id={`${prefix}-model-id`} list={`${prefix}-candidates`} value={value.model_id} onChange={(event) => change({ model_id: event.target.value })} required spellCheck={false} autoComplete="off" /><datalist id={`${prefix}-candidates`}>{candidates.map((id) => <option key={id} value={id} />)}</datalist></div>
-      <div><label htmlFor={`${prefix}-credential-env`}>服务端凭据引用</label><input id={`${prefix}-credential-env`} value={value.credential_env} onChange={(event) => change({ credential_env: event.target.value })} placeholder="例如 MODEL_API_KEY" required spellCheck={false} autoComplete="off" /></div>
+      <div className="span-all"><label htmlFor={`${prefix}-base-url`}>API 地址</label><input id={`${prefix}-base-url`} type="url" maxLength={4096} value={value.base_url ?? ''} onChange={(event) => change({ base_url: event.target.value || null })} placeholder="留空使用供应商默认地址" spellCheck={false} autoComplete="off" /></div>
+      <div><label htmlFor={`${prefix}-model-id`}>实际模型 ID</label><input id={`${prefix}-model-id`} list={`${prefix}-candidates`} value={value.model_id} maxLength={200} onChange={(event) => change({ model_id: event.target.value })} required spellCheck={false} autoComplete="off" /><datalist id={`${prefix}-candidates`}>{candidates.map((id) => <option key={id} value={id} />)}</datalist></div>
+      <div><label htmlFor={`${prefix}-credential-env`}>服务端凭据引用</label><input id={`${prefix}-credential-env`} value={value.credential_env} pattern="[A-Z][A-Z0-9_]{0,100}" maxLength={101} onChange={(event) => change({ credential_env: event.target.value })} placeholder="例如 MODEL_API_KEY" required spellCheck={false} autoComplete="off" /></div>
     </div>
     <p className="field-help">这里只保存凭据的环境变量名或服务端引用，不输入 API key。模型列表是候选 ID；接口、工具调用和上下文能力仍需分别验证。</p>
     <div className="settings-grid settings-numbers">
-      <div><label htmlFor={`${prefix}-max-input`}>输入 token 上限</label><input id={`${prefix}-max-input`} type="number" min={1} step={1} required value={value.max_input_tokens} onChange={(event) => change({ max_input_tokens: Number(event.target.value) })} /></div>
-      <div><label htmlFor={`${prefix}-max-output`}>输出 token 上限</label><input id={`${prefix}-max-output`} type="number" min={1} step={1} required value={value.max_output_tokens} onChange={(event) => change({ max_output_tokens: Number(event.target.value) })} /></div>
-      <div><label htmlFor={`${prefix}-timeout`}>请求超时（秒）</label><input id={`${prefix}-timeout`} type="number" min={1} step={1} required value={value.timeout_seconds} onChange={(event) => change({ timeout_seconds: Number(event.target.value) })} /></div>
+      <div><label htmlFor={`${prefix}-max-input`}>输入 token 上限</label><input id={`${prefix}-max-input`} type="number" min={16384} max={200000} step={1} required value={value.max_input_tokens} onChange={(event) => change({ max_input_tokens: Number(event.target.value) })} /></div>
+      <div><label htmlFor={`${prefix}-max-output`}>输出 token 上限</label><input id={`${prefix}-max-output`} type="number" min={128} max={16384} step={1} required value={value.max_output_tokens} onChange={(event) => change({ max_output_tokens: Number(event.target.value) })} /></div>
+      <div><label htmlFor={`${prefix}-timeout`}>请求超时（秒）</label><input id={`${prefix}-timeout`} type="number" min={1} max={300} step={1} required value={value.timeout_seconds} onChange={(event) => change({ timeout_seconds: Number(event.target.value) })} /></div>
     </div>
     <label className="checkbox-label"><input type="checkbox" checked={value.allow_private_http} onChange={(event) => change({ allow_private_http: event.target.checked })} />允许连接已授权的私网 HTTP 地址</label>
     <h3>计费与价格元数据</h3>
@@ -38,10 +38,10 @@ export function ModelConfigFields({ value, onChange, disabled = false, prefix = 
     </select>
     {metered ? <>
       <div className="settings-grid">
-        <div><label htmlFor={`${prefix}-input-price`}>每百万输入 tokens 单价（US$）</label><input id={`${prefix}-input-price`} type="number" min={0} step="any" required value={value.input_price_per_million ?? ''} onChange={(event) => change({ input_price_per_million: event.target.value === '' ? null : Number(event.target.value) })} /></div>
-        <div><label htmlFor={`${prefix}-output-price`}>每百万输出 tokens 单价（US$）</label><input id={`${prefix}-output-price`} type="number" min={0} step="any" required value={value.output_price_per_million ?? ''} onChange={(event) => change({ output_price_per_million: event.target.value === '' ? null : Number(event.target.value) })} /></div>
+        <div><label htmlFor={`${prefix}-input-price`}>每百万输入 tokens 单价（US$）</label><input id={`${prefix}-input-price`} type="number" min={0} step="any" required value={value.input_price_per_million ?? ''} onChange={(event) => { event.currentTarget.setCustomValidity(event.target.value !== '' && Number(event.target.value) <= 0 ? '单价必须大于 0。' : ''); change({ input_price_per_million: event.target.value === '' ? null : Number(event.target.value) }); }} /></div>
+        <div><label htmlFor={`${prefix}-output-price`}>每百万输出 tokens 单价（US$）</label><input id={`${prefix}-output-price`} type="number" min={0} step="any" required value={value.output_price_per_million ?? ''} onChange={(event) => { event.currentTarget.setCustomValidity(event.target.value !== '' && Number(event.target.value) <= 0 ? '单价必须大于 0。' : ''); change({ output_price_per_million: event.target.value === '' ? null : Number(event.target.value) }); }} /></div>
       </div>
-      <label htmlFor={`${prefix}-price-source`}>价格来源</label><input id={`${prefix}-price-source`} value={value.price_source ?? ''} onChange={(event) => change({ price_source: event.target.value || null })} required placeholder="供应商价格页或已确认的价格依据与日期" />
+      <label htmlFor={`${prefix}-price-source`}>价格来源</label><input id={`${prefix}-price-source`} value={value.price_source ?? ''} maxLength={500} onChange={(event) => change({ price_source: event.target.value || null })} required placeholder="供应商价格页或已确认的价格依据与日期" />
       <p className="field-help">Run 费用按冻结价格估算，与账户账单分开记录。价格未知时不能按零计费。</p>
     </> : <p className="field-help">包月连接的货币费用保持未知，仍受 Run 调用、token 和时长预算控制。选择此项前应已确认实际 API 的包月授权。</p>}
   </fieldset>;
@@ -112,7 +112,7 @@ export function AccountUsageReport({ result }: { result: AccountUsageResult }) {
 type ProfileDraft = { id: string; name: string; model: ModelConfig; usage_adapter: ModelProfile['usage_adapter'] };
 const freshModel: ModelConfig = {
   provider: 'openai', model_id: '', api_mode: 'responses', base_url: null, credential_env: 'MODEL_API_KEY',
-  max_input_tokens: 16000, max_output_tokens: 4000, timeout_seconds: 60, billing_mode: 'metered',
+  max_input_tokens: 32768, max_output_tokens: 2048, timeout_seconds: 60, billing_mode: 'metered',
   input_price_per_million: null, output_price_per_million: null, price_source: null, allow_private_http: false,
 };
 const profileDraft = (profile?: ModelProfile): ProfileDraft => profile
