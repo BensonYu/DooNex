@@ -320,7 +320,18 @@ class Worker:
                     return False
 
                 def role_event(kind, payload):
-                    event(kind, {**payload, **attribution})
+                    event(
+                        kind,
+                        {
+                            **payload,
+                            **attribution,
+                            **(
+                                {"session_generation": generation}
+                                if generation_service
+                                else {}
+                            ),
+                        },
+                    )
 
                 def before_model(input_tokens, output_tokens):
                     self.fence()
@@ -497,7 +508,10 @@ class Worker:
                     role=role,
                     on_finish=finishes.append,
                     **(
-                        {"execution_policy": "finish_only"}
+                        {
+                            "execution_policy": "finish_only",
+                            "frozen_prompt": request["prompt"],
+                        }
                         if generation_service
                         else {}
                     ),
@@ -524,6 +538,29 @@ class Worker:
                     raise Halt("运行已停止或时长用尽")
                 if result != "finished":
                     raise RuntimeError("SDK 未确认任务完成：" + str(result))
+                if generation_service:
+                    # SDK files alone are not an output trust anchor after a
+                    # crash. Match the exact finish against the original event
+                    # already persisted in the product database for this role
+                    # and session generation before binding a candidate.
+                    with self.store.connect() as c:
+                        recorded = c.execute(
+                            "SELECT payload FROM events WHERE run_id=%s AND kind='sdk' "
+                            "AND payload->>'kind'='ActionEvent' AND payload->>'tool_name'='finish' "
+                            "AND payload->>'assignment_id'=%s AND payload->>'session_generation'=%s",
+                            (run_id, attribution["assignment_id"], str(generation)),
+                        ).fetchall()
+                    if (
+                        not finishes
+                        or not recorded
+                        or len({row["payload"]["id"] for row in recorded}) != 1
+                        or any(
+                            row["payload"].get("action", {}).get("message")
+                            != finishes[-1]
+                            for row in recorded
+                        )
+                    ):
+                        raise ValueError("生成完成输出与原会话的数据库事件不一致")
                 return finishes[-1] if finishes else None
 
             def complete_role(role, **updates):

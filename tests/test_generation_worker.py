@@ -293,3 +293,37 @@ def test_generation_unknown_call_resume_preserves_reservation(
     assert final["usage"]["reserved_tokens"] == first["usage"]["reserved_tokens"]
     assert final["first_started_at"] == first["first_started_at"]
     assert calls == []
+
+
+def test_saved_finish_tampering_cannot_replace_original_model_output(
+    setup_generation, monkeypatch
+):
+    service, body, _files, _taskset, _project = setup_generation
+    calls = transport(monkeypatch)
+    _draft, run = enqueue(service, body)
+    original = Generation.save_output
+
+    def interrupt_before_output(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(Generation, "save_output", interrupt_before_output)
+    Worker(service.settings).run(once=True)
+    first = service.store.get(run["id"])
+    assert first["state"] == "interrupted" and len(calls) == 1
+    directory = run_directory(service.settings, run["id"])
+    changed = 0
+    for path in (directory / "session-executor-0").rglob("*.json"):
+        value = json.loads(path.read_text())
+        if value.get("kind") == "ActionEvent" and value.get("tool_name") == "finish":
+            value["action"]["message"] = '{"append_text":"FORGED FINISH"}'
+            path.write_text(json.dumps(value))
+            changed += 1
+    assert changed == 1
+    monkeypatch.setattr(Generation, "save_output", original)
+    resume(service, run["id"])
+    Worker(service.settings).run(once=True)
+    final = service.store.get(run["id"])
+    assert final["state"] == "failed"
+    assert not final.get("generation_output")
+    assert not final.get("generation_candidate")
+    assert len(calls) == final["usage"]["calls"] == 1
