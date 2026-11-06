@@ -1,0 +1,20 @@
+name: doonex
+services:
+  postgres:
+    image: postgres:18.1-alpine@sha256:aa6eb304ddb6dd26df23d05db4e5cb05af8951cda3e0dc57731b771e0ef4ab29
+    environment:
+      POSTGRES_USER: doonex
+      POSTGRES_DB: doonex
+      POSTGRES_PASSWORD: ${DOONEX_DB_PASSWORD:?Set a private DOONEX_DB_PASSWORD}
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U doonex -d doonex"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+volumes:
+  postgres:

@@ -21,6 +21,7 @@ eval-private/
 __pycache__/
 *.py[cod]
 .venv/
+.bootstrap/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

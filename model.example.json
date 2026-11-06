@@ -1,0 +1,15 @@
+{
+  "provider": "openai",
+  "model_id": "REPLACE_WITH_ACTUAL_API_MODEL_ID",
+  "api_mode": "chat",
+  "credential_env": "DOONEX_LLM_API_KEY",
+  "base_url": null,
+  "max_input_tokens": 32768,
+  "max_output_tokens": 2048,
+  "timeout_seconds": 60,
+  "input_price_per_million": null,
+  "output_price_per_million": null,
+  "price_source": null,
+  "billing_mode": "metered",
+  "allow_private_http": false
+}
