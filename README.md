@@ -90,16 +90,15 @@ git status --short
 
 `test_local.py` 启动一次性 PostgreSQL，运行包含真实 Docker 边界检查的测试，结束后清理测试数据库容器。SDK 合同测试使用模拟供应商响应；它们不消耗真实模型额度，也不替代真实发布验收。
 
-确认凭据、模型和授权范围后，可参照以下命令运行独立受控样例。用户已授权当前包月验收 campaign 不设累计上限，以下显式标记仅适用于 `subscription`；每个 Run 仍受调用、token 和 300 秒时长限制，示例上限不保证完成：
+确认凭据、模型和本轮授权范围后，可参照以下命令运行独立受控样例。每个 Run 受调用、token 和 300 秒时长限制，示例上限不保证完成：
 
 ```bash
 .venv/bin/python scripts/live_acceptance.py --confirm-model-usage \
   --model ACTUAL_API_MODEL_ID --workflow execute_review \
-  --sample-name m2-sample-acceptance-01 --max-calls 10 --max-tokens 100000 \
-  --authorize-subscription-campaign
+  --sample-name m2-sample-acceptance-01 --max-calls 10 --max-tokens 100000
 ```
 
-将 `ACTUAL_API_MODEL_ID` 替换为真实 API ID，并在授权范围内选择单 Run 调用和 token 上限。脚本生成独立的受控样例；已有 `sample-project` 及历史运行保留，后续样例使用不同的 `m2-sample-...` 名称。它仅执行本次创建的 Run，已有 worker 运行时拒绝启动；真实运行、会话和工件保存在私有数据目录。campaign 账本保留原 10 次调用/100,000 token 授权、授权变更、M1 历史、失败尝试和未知用量；排队前预留本次额度，中断或结果未明时保留预留，不得删除或重置账本。按量模式不能使用无累计上限的包月授权，仍须确认累计额度与单价。默认单执行流程可显式选 `--workflow execute`。脚本成功仍须完成 [PRD 发布验收](docs/PRD.md#8-发布验收与测量) 和 [M2 实施记录](docs/M2_IMPLEMENTATION.md) 中的其他检查。
+将 `ACTUAL_API_MODEL_ID` 替换为真实 API ID，并在授权范围内选择单 Run 调用和 token 上限。脚本生成独立的受控样例；已有 `sample-project` 及历史运行保留，后续样例使用不同的 `m2-sample-...` 名称。它仅执行本次创建的 Run，已有 worker 运行时拒绝启动；真实运行、会话和工件保存在私有数据目录。新 campaign 默认累计上限为 10 次调用/100,000 token；只有用户明确授权当前包月验收不设累计上限时，才追加 `--authorize-subscription-campaign`，且仅适用于 `subscription`。本项目这次授权变更及结果见 M2 实施记录，不代表其他用户已经授权。账本保留历史限额、授权变更、失败和未知用量；排队前预留本次额度，中断或结果未明时保留预留，不得删除或重置账本。按量模式仍须确认累计额度与单价。默认单执行流程可显式选 `--workflow execute`。脚本成功仍须完成 [PRD 发布验收](docs/PRD.md#8-发布验收与测量) 和 [M2 实施记录](docs/M2_IMPLEMENTATION.md) 中的其他检查。
 
 ## 当前限制
 
@@ -120,6 +119,7 @@ git status --short
 | [架构说明](docs/ARCHITECTURE.md) | 运行边界、数据、恢复与安全约束 |
 | [M1 实施记录](docs/M1_IMPLEMENTATION.md) | 首次兼容性、受控验收与历史失败 |
 | [M2 实施记录](docs/M2_IMPLEMENTATION.md) | 当前多项目与执行/审查验收状态 |
+| [模型接入参考](docs/MODEL_INTEGRATION.md) | cc-switch 研究、网关只读实测与尚未实现的模型配置/用量计划 |
 | [路线图](docs/ROADMAP.md) | 阶段依赖和退出条件 |
 | [Skill Arena](docs/SKILL_ARENA.md) | 后续私有竞技的唯一详细规则 |
 | [AGENTS.md](AGENTS.md) | 仓库协作与验证约定 |
