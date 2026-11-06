@@ -188,6 +188,19 @@ def synthetic_batch(product, request_data, monkeypatch, **changes):
         }
 
     monkeypatch.setattr(service.arena, "attempt", classified)
+
+    def inspection(run):
+        # Pure aggregation tests use an explicit controller inspection adapter;
+        # the real Arena/Evidence contract is exercised by the 45-artifact test
+        # and independent review regressions, without this adapter.
+        valid = (run.get("evidence") or {}).get("report_sha256") == "e" * 64
+        return {
+            "valid": valid,
+            "verified": valid,
+            "report": {"run_id": run["id"], "commands": run["request"]["checks"]},
+        }
+
+    monkeypatch.setattr(service.arena, "inspect_run_evidence", inspection)
     monkeypatch.setattr(
         service.arena,
         "detail",

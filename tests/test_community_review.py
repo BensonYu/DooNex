@@ -450,6 +450,8 @@ def test_review_public_arena_requires_database_digest_and_actual_report_run_iden
         )["public"]["eligible"]
     except CommunityError:
         observations["missing_database_report_digest"] = False
+    classified = service.arena.attempt(selected)
+    assert classified["classification"] == "failed" and not classified["evidence_valid"]
     with service.store.locked(run_id) as (_, run):
         run["evidence"] = original
     root = run_directory(service.settings, run_id) / "evidence"
@@ -467,7 +469,30 @@ def test_review_public_arena_requires_database_digest_and_actual_report_run_iden
         ]["eligible"]
     except CommunityError:
         observations["foreign_report_run_id"] = False
+    classified = service.arena.attempt(selected)
+    assert classified["classification"] == "failed" and not classified["evidence_valid"]
+    report["run_id"] = run_id
+    report["commands"] = ["different-frozen-check"]
+    report["checks"][0]["command"] = "different-frozen-check"
+    report["acceptance_digest"] = hashlib.sha256(
+        canonical(report["commands"])
+    ).hexdigest()
+    encoded = canonical(report)
+    changed = hashlib.sha256(encoded).hexdigest()
+    (root / "report.json").write_bytes(encoded)
+    (root / "report.sha256").write_text(changed + "\n")
+    with service.store.locked(run_id) as (_, run):
+        run["evidence"] = {"report_sha256": changed}
+    try:
+        observations["foreign_report_commands"] = prepare(
+            service, release, skill, batch
+        )["public"]["eligible"]
+    except CommunityError:
+        observations["foreign_report_commands"] = False
+    classified = service.arena.attempt(selected)
+    assert classified["classification"] == "failed" and not classified["evidence_valid"]
     assert observations == {
         "missing_database_report_digest": False,
         "foreign_report_run_id": False,
+        "foreign_report_commands": False,
     }, observations

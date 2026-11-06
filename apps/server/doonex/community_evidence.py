@@ -362,6 +362,14 @@ class CommunityEvidence:
                 "community_evidence_original_run_binding_changed",
             )
             attempt = self.arena.attempt(entry)
+            # A private Arena adapter/classification cannot replace the actual
+            # controller report binding when explicitly publishing evidence.
+            if run["state"] == "completed_verified":
+                require(
+                    self.arena.inspect_run_evidence(run)["verified"],
+                    "community_evidence_source_changed",
+                    409,
+                )
             require(
                 digest(run) == digest(self.store.get(entry["run_id"])),
                 "community_evidence_source_changed",

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
@@ -524,10 +525,51 @@ class Arena:
             current.update(state="running", reason="已确认核查，沿用原预算恢复")
         return self.detail(identifier)
 
-    def attempt(self, entry):
+    def inspect_run_evidence(self, run):
+        """Inspect only a database-bound report belonging to this actual Run.
+
+        Evidence.inspect also supports intentionally unbound local inspections.
+        Arena quality evidence must never fall back to that weaker contract.
+        """
         from doonex.evidence import Evidence
         from doonex.worker import get_workspace, run_directory
 
+        invalid = {"valid": False, "verified": False, "report": None}
+        evidence = run.get("evidence")
+        expected = evidence.get("report_sha256") if isinstance(evidence, dict) else None
+        if (
+            not isinstance(expected, str)
+            or re.fullmatch(r"[a-f0-9]{64}", expected) is None
+        ):
+            return invalid
+        try:
+            binding = run["request"]["arena"]
+            context = {
+                key: binding[key]
+                for key in ("taskset_id", "task_id", "report_sha256", "verifier_digest")
+            }
+            directory = run_directory(self.settings, run["id"])
+            inspection = Evidence.inspect(
+                get_workspace(run, directory),
+                directory,
+                expected,
+                verification_context=context,
+            )
+            report = inspection.get("report") or {}
+            bound = bool(
+                inspection["valid"]
+                and report.get("run_id") == run["id"]
+                and report.get("commands") == run["request"]["checks"]
+            )
+            return {
+                **inspection,
+                "valid": bound,
+                "verified": bound and inspection["verified"],
+            }
+        except (ValueError, OSError, KeyError, TypeError):
+            return invalid
+
+    def attempt(self, entry):
         run = self.store.get(entry["run_id"])
         state = run["state"]
         outcome = run.get("arena_outcome") or {}
@@ -539,46 +581,14 @@ class Arena:
             if outcome.get("classification") == "environment_failure":
                 classification = "environment_failure"
             if state == "completed_verified":
-                directory = run_directory(self.settings, run["id"])
-                binding = run["request"]["arena"]
-                context = {
-                    key: binding[key]
-                    for key in (
-                        "taskset_id",
-                        "task_id",
-                        "report_sha256",
-                        "verifier_digest",
-                    )
-                }
-                inspection = Evidence.inspect(
-                    get_workspace(run, directory),
-                    directory,
-                    (run.get("evidence") or {}).get("report_sha256"),
-                    verification_context=context,
-                )
-                evidence_valid = (
-                    inspection["verified"]
-                    and (inspection.get("report") or {}).get("commands")
-                    == run["request"]["checks"]
-                )
+                evidence_valid = self.inspect_run_evidence(run)["verified"]
                 classification = "passed" if evidence_valid else "failed"
         if (
             state in TERMINAL_RUNS
             and run.get("evidence")
             and state != "completed_verified"
         ):
-            directory = run_directory(self.settings, run["id"])
-            binding = run["request"]["arena"]
-            context = {
-                key: binding[key]
-                for key in ("taskset_id", "task_id", "report_sha256", "verifier_digest")
-            }
-            evidence_valid = Evidence.inspect(
-                get_workspace(run, directory),
-                directory,
-                run["evidence"].get("report_sha256"),
-                verification_context=context,
-            )["valid"]
+            evidence_valid = self.inspect_run_evidence(run)["valid"]
         if state in TERMINAL_RUNS:
             if run.get("arena_observed_failure") or outcome.get("safety_violation"):
                 classification = "failed"
