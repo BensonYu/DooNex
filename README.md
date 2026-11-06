@@ -70,7 +70,7 @@ DooNex 希望提供三个清楚的答案：
 目前可以克隆并阅读文档，**尚无应用安装或启动命令**：
 
 ```bash
-git clone git@github.com:BensonYu/doonex.git
+git clone git@github.com:BensonYu/DooNex.git doonex
 cd doonex
 ```
 
