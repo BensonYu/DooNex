@@ -973,3 +973,21 @@ def test_parent_modes_unsupported_by_controlled_import_are_rejected_before_model
     ):
         service.create(changed)
     assert service.list() == [] and service.store.list_runs() == []
+
+
+def test_legacy_project_without_name_remains_selectable(setup_generation):
+    service, body, _files, _taskset, project = setup_generation
+    with service.store.connect() as connection:
+        connection.execute(
+            "UPDATE projects SET data=data-'name' WHERE id=%s", (project["id"],)
+        )
+    before = service.store.project(project["id"])
+    assert "name" not in before
+    projected = next(
+        p for p in service.inputs()["projects"] if p["id"] == project["id"]
+    )
+    assert projected == {"id": project["id"], "name": Path(project["path"]).name}
+    draft = service.create(body)
+    assert draft["project"] == projected
+    assert service.store.project(project["id"]) == before
+    assert draft["run_id"] is None and service.store.list_runs() == []
