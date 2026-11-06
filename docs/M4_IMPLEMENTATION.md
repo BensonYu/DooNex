@@ -171,6 +171,8 @@
 
 上述私有记录在 `verification/m4-background-live/`：`live-continuation-fixed.log`、`audit-continuation-fixed-failed.json`、`terminated-continuation-fixed.json`、`independent-terminated-continuation-fixed-review.json`、`execution-call-cap.json`、`audit-call-cap.json`、`execution-revoke.json`、`audit-revoke-immediate.json`、`audit-revoke-maintained.json` 和 `browser-readonly-runs/2026-11-06T19-34-59-710Z-95383/`。完整账户响应、密钥和材料不进入 Git。
 
-当前代码已推送功能分支 `codex/m4-controller`；GitHub `main` 仍为 M3 的 `a965d7f`，M4 未作为主分支发布。API 与常驻 worker 均已切至本 M4 源码。`2026-11-06T19:46Z` 恢复 worker 前确认 119 个 Run 全部终态、无启用未消费授权、无 pending 动作或未知容器；恢复后进程运行且持有唯一执行锁，九张历史表的行数与摘要完全一致，没有新增模型动作。证据为私有 `worker-restore-preflight.json`、`worker-restore-before.json`、`worker-restore-launch.json` 和 `worker-restore-after.json`。
+此历史验收时，代码已推送功能分支 `codex/m4-controller`；GitHub `main` 为 M3 的 `a965d7f`，M4 尚未作为主分支发布。API 与常驻 worker 当时均切至本 M4 源码。`2026-11-06T19:46Z` 恢复 worker 前确认 119 个 Run 全部终态、无启用未消费授权、无 pending 动作或未知容器；恢复后进程运行且持有唯一执行锁，九张历史表的行数与摘要完全一致，没有新增模型动作。证据为私有 `worker-restore-preflight.json`、`worker-restore-before.json`、`worker-restore-launch.json` 和 `worker-restore-after.json`。
 
-下一步：保留所有历史，在新 UTC 日用新有限授权完成真实整批、独立账目和最终界面核验。等待期间调整原串行开发顺序：按 [候选发现计划](M4_DISCOVERY_PLAN.md) 在独立工作区实施零模型的公开读取→预览→冻结 pending 导入→审核→可选择流程，保持当前后台运行源码稳定。发现切片已通过独立整合与真实固定来源导入核验，移动端分段视觉复核通过，具体证据见发现记录；模型生成正在独立分支整合，循环试验和 M5 仍未实现。
+下一步：保留所有历史，在新 UTC 日用新有限授权完成真实整批、独立账目和最终界面核验。等待期间调整原串行开发顺序：按 [候选发现计划](M4_DISCOVERY_PLAN.md) 在独立工作区实施零模型的公开读取→预览→冻结 pending 导入→审核→可选择流程，保持当前后台运行源码稳定。发现切片已通过独立整合与真实固定来源导入核验，移动端分段视觉复核通过，具体证据见发现记录；有界生成现已通过 [受控真实验收](M4_GENERATION_PLAN.md)，M5 自托管社区也已通过本机受控验收。两者不改变本后台切片的整批退出条件；循环试验、自动补跑与自动推广未实现。
+
+新的有限批次计划固定在真实 `2026-11-07` UTC 日期执行（纽约 `2026-11-06 19:00` 起），使用原两个批准候选、原五个 tuning 任务及同一实际模型。计划为 15 个后台 Run 和 1 个前台 Run；每 Run 最多 6 calls / 120,000 token / 300s，后台批次最多 90 calls / 2M token / 1800s，新日预算 160 calls / 4M token / 7200s，campaign 全额预留 96 calls / 2.12M token。准备/审计工具在临时 PostgreSQL 的 30 项检查通过，也在 M5 最终代码上通过 30 项检查；尚未在生产创建、启用或调用。旧日 157 calls / 3.8M token / 3600s 的未知预留整行保持，不能提前建新日或释放旧额度。

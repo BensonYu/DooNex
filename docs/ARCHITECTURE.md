@@ -1,10 +1,10 @@
 # DooNex 首版架构
 
-更新：2026-11-06 · 状态：M1–M3 已完成受控验收；当前支持多项目、顺序执行/只读审查和手动私有 Skill Arena。M4 有限后台首片已整合，751 项本机回归通过；SDK 续接缺陷已修复并获真实续接证据，后续供应商超时使整批验收仍未完成，见 [M4 实施记录](M4_IMPLEMENTATION.md)。适用环境与限制见 [M3 实施记录](M3_IMPLEMENTATION.md)，M2 历史见 [M2 实施记录](M2_IMPLEMENTATION.md)，历史证据见 [M1 实施记录](M1_IMPLEMENTATION.md)。
+更新：2026-11-06 · 状态：M1–M3、M4 发现/生成切片和 M5 自托管社区均有受控验收证据；最终整合代码通过 1199 项本机测试。M4 的 SDK 续接缺陷已修复并获真实续接证据，后续供应商超时使整批验收仍未完成，见 [M4 实施记录](M4_IMPLEMENTATION.md)。社区本机验收及未公开部署边界见 [M5 实施记录](M5_IMPLEMENTATION.md)，私有竞技见 [M3 实施记录](M3_IMPLEMENTATION.md)，多项目与单 Agent 历史分别见 [M2](M2_IMPLEMENTATION.md)、[M1](M1_IMPLEMENTATION.md)。
 
 ## 1. 选择与边界
 
-当前采用 React + TypeScript + Vite、Python 3.12 + FastAPI、OpenHands Software Agent SDK 1.60.1、PostgreSQL 和受限 Docker 工具。M2、M3 和 M4 首片继续复用该栈；应用服务与独立 worker 在 Mac mini 宿主机运行，数据库由 Compose 启动；不向任务传入 Docker socket，不引入 Kubernetes、Redis、向量数据库或自研模型网关。
+当前采用 React + TypeScript + Vite、Python 3.12 + FastAPI、OpenHands Software Agent SDK 1.60.1、PostgreSQL 和受限 Docker 工具。M2–M5 继续复用该栈；应用服务与独立 worker 在 Mac mini 宿主机运行，数据库由 Compose 启动；不向任务传入 Docker socket，不引入 Kubernetes、Redis、向量数据库或自研模型网关。
 
 考虑过的路径：
 
@@ -211,10 +211,16 @@ Git 项目读取与采纳预检禁用仓库可配置的内容 filter、外部 di
 
 `discovery.py` 通过专用 GitHub reader 读取固定公开仓库和 Git 对象，不使用模型、宿主 Git 凭据或任务容器。`skill_discoveries` 保存每份回执的请求/字节上限、已消耗槽、阶段截止、固定对象和不可变预览；重启与常量变化不会扩张旧额度。仅完整明确的 MIT/Apache-2.0 候选允许导入，许可未知或冲突只预览。
 
-Library 的组合事务入口将原始版本信任锚、发现关系和导入消费一起绑定；磁盘发布与数据库不假称跨存储原子。scope/permissions 在最终导入意图中绑定，不改写预览摘要。导入保持 pending，重复请求保留原审核，发现不会创建执行或评测。整合回归及未验证限制见[发现记录](M4_DISCOVERY_PLAN.md)；候选生成仍按[独立计划](M4_GENERATION_PLAN.md)实施。
+Library 的组合事务入口将原始版本信任锚、发现关系和导入消费一起绑定；磁盘发布与数据库不假称跨存储原子。scope/permissions 在最终导入意图中绑定，不改写预览摘要。导入保持 pending，重复请求保留原审核，发现不会创建执行或评测。整合回归及未验证限制见[发现记录](M4_DISCOVERY_PLAN.md)；有界候选生成已通过[独立受控验收](M4_GENERATION_PLAN.md)，未验证生成版本的质量提升。
 
-## M5 社区边界（已整合，尚未完成真实验收）
+## M4 有界追加生成（受控流程通过）
+
+`generation.py` 在 `skill_generations` 冻结已批准父版本、1–3 个 tuning 可见任务、完整模型可见输入与有限预算。它仅投影允许字段，不读取任务源码、隐藏检查器或历史评测；SDK 仅注册 finish，不能创建 shell/任务容器。控制器以固定追加指令构造候选，保留父文件、目录、mode 和许可；一次草稿最多一个 Run、一个候选和一次导入。
+
+SDK finish、原始输出、候选及结构报告分别保存并绑定同一角色/会话/事件，恢复前重新核对；未知调用保留原时钟和预留，不能重放。生成产物为 `completed_unverified`，导入为 `pending`，需独立审核，不继承父成绩、不自动创建 Arena 或推广。实际生成、字节审计、浏览器和原入口可选择性见 [生成记录](M4_GENERATION_PLAN.md)。
+
+## M5 社区边界（本机受控验收通过）
 
 用户已选择自托管 Skill 社区，具体需求与验收见 [M5 计划](M5_IMPLEMENTATION.md)。继续使用现有 React/FastAPI/PostgreSQL；新增范围受限的社区路由、独立投稿权限及已审核发布数据投影，管理 API 继续私有。公开请求只能访问明确冻结的公共字段和内容，不能遍历 Library、项目、模型账户、Run 或原始评测工件。
 
-社区默认关闭，本机实施与验收不开放公网。`community.py` 已实现固定来源投稿、独立审核/发布、下架及分发回执，并接入 API 和 schema 初始化；私有使用审核保持独立。`community_evidence.py` 已接入严格公开快照和聚合事实列，条件榜单沿用原评测规则，公开读不查询私有 Run/Arena；管理准备/发布时核验原数据绑定。社区专用 `#community` 页面不挂载私有工作台，默认匿名客户端不携带管理令牌。底层评测报告身份与摘要的补强正在审查和回归。收费规则、项目许可证和对外部署单独确认，不引入多租户 SaaS 或真实支付。实际验证范围以 [M5 记录](M5_IMPLEMENTATION.md) 为准。
+社区默认关闭，本机实施与验收不开放公网。`community.py` 已实现固定来源投稿、独立审核/发布、下架及分发回执，并接入 API 和 schema 初始化；私有使用审核保持独立。`community_evidence.py` 已接入严格公开快照和聚合事实列，条件榜单沿用原评测规则，公开读不查询私有 Run/Arena；管理准备/发布时核验原数据绑定。社区专用 `#community` 页面不挂载私有工作台，默认匿名客户端不携带管理令牌。Arena 和社区均要求数据库绑定的有效报告摘要、确切 Run 身份和检查命令相符；缺证与错绑不取得质量资格。公开投影按原同条件规则比较，不将下载或自报变成核验成绩。最终整合源码通过 1199 项本机测试，实际空榜与零核验使用符合当前公开源版本的证据状态。收费规则、项目许可证和对外部署单独确认，不引入多租户 SaaS 或真实支付。实际验证范围以 [M5 记录](M5_IMPLEMENTATION.md) 为准。
