@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Api, type ArtifactName, type Budget, type Project, type Recovery, type Run, type RunEvent, type Settings } from './api';
+import { Api, type ArtifactName, type Budget, type Project, type Recovery, type Run, type RunEvent, type Settings, type Workflow } from './api';
 import './style.css';
+import { ReviewReport, WorkflowProgress } from './workflow';
 
 const stateNames: Record<string, string> = {
   queued: '等待执行', running: '正在执行', pausing: '正在暂停', paused: '已暂停',
@@ -18,11 +19,36 @@ const money = (value: number | null | undefined) => value == null || !Number.isF
 const json = (value: unknown) => JSON.stringify(value, null, 2) ?? '';
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 
-function readStorage(storage: Storage, key: string): string {
-  try { return storage.getItem(key) ?? ''; } catch { return ''; }
+function readStorage(storage: 'local' | 'session', key: string): string {
+  try { return (storage === 'local' ? localStorage : sessionStorage).getItem(key) ?? ''; } catch { return ''; }
 }
-function writeStorage(storage: Storage, key: string, value: string) {
-  try { value ? storage.setItem(key, value) : storage.removeItem(key); } catch { /* The interface still works without browser storage. */ }
+function writeStorage(storage: 'local' | 'session', key: string, value: string) {
+  try {
+    const target = storage === 'local' ? localStorage : sessionStorage;
+    value ? target.setItem(key, value) : target.removeItem(key);
+  } catch { /* The interface still works without browser storage. */ }
+}
+const selectionKey = (projectId: string) => `doonex.selectedRun.${projectId}`;
+const runPath = (projectId: string, id: string, suffix = '', query: Record<string, string> = {}) =>
+  `/runs/${encodeURIComponent(id)}${suffix ? `/${suffix}` : ''}?${new URLSearchParams({ ...query, project_id: projectId })}`;
+type TaskDraft = { baseRef: string; prompt: string; checks: string; workflow: Workflow; budget?: Budget };
+const emptyDraft: TaskDraft = { baseRef: 'HEAD', prompt: '', checks: '', workflow: 'execute_review' };
+type ActionContext = { signal: AbortSignal; isCurrent: () => boolean };
+function readDrafts(): Record<string, TaskDraft> {
+  try {
+    const value: unknown = JSON.parse(readStorage('local', 'doonex.projectDrafts') || '{}');
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+    return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, TaskDraft] => {
+      const draft = entry[1];
+      if (!draft || typeof draft !== 'object') return false;
+      const item = draft as Record<string, unknown>;
+      if (typeof item.baseRef !== 'string' || typeof item.prompt !== 'string' || typeof item.checks !== 'string' || !['execute', 'execute_review'].includes(String(item.workflow))) return false;
+      if (item.budget == null) return true;
+      const budget = item.budget as Record<string, unknown>;
+      return ['max_calls', 'max_tokens', 'max_seconds'].every((key) => typeof budget[key] === 'number' && Number.isFinite(budget[key]))
+        && (budget.max_cost_usd === null || typeof budget.max_cost_usd === 'number');
+    }));
+  } catch { return {}; }
 }
 
 function Status({ state }: { state: string }) {
@@ -57,12 +83,13 @@ function CheckReport({ evidence, busy, onDownloadLog }: { evidence: Record<strin
 }
 
 function App() {
-  const [token, setToken] = useState(() => readStorage(sessionStorage, 'doonex.token'));
+  const [token, setToken] = useState(() => readStorage('session', 'doonex.token'));
   const [tokenDraft, setTokenDraft] = useState('');
   const [settings, setSettings] = useState<Settings | null>(null);
-  const [project, setProject] = useState<Project | null>(null);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [projectId, setProjectId] = useState(() => readStorage('local', 'doonex.selectedProject'));
   const [runs, setRuns] = useState<Run[]>([]);
-  const [selectedId, setSelectedId] = useState(() => readStorage(localStorage, 'doonex.selectedRun'));
+  const [selectedId, setSelectedId] = useState(() => readStorage('local', selectionKey(readStorage('local', 'doonex.selectedProject'))));
   const [run, setRun] = useState<Run | null>(null);
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [error, setError] = useState('');
@@ -79,79 +106,105 @@ function App() {
   const [acknowledge, setAcknowledge] = useState(false);
   const [adoption, setAdoption] = useState<{ safe: boolean; reason: string } | null>(null);
   const [projectPath, setProjectPath] = useState('');
-  const [baseRef, setBaseRef] = useState('HEAD');
-  const [prompt, setPrompt] = useState('');
-  const [checks, setChecks] = useState('');
-  const [budget, setBudget] = useState<Budget | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, TaskDraft>>(readDrafts);
   const cursor = useRef(0);
+  const active = useRef({ projectId, runId: selectedId });
+  const action = useRef<{ generation: number; controller: AbortController | null }>({ generation: 0, controller: null });
   const api = useMemo(() => new Api(token), [token]);
+  const currentApi = useRef(api);
+  currentApi.current = api;
+  const project = projects.find((item) => item.id === projectId) ?? null;
+  const draft = drafts[projectId] ?? emptyDraft;
+  const { baseRef, prompt, checks, workflow } = draft;
+  const budget = draft.budget ?? settings?.default_budget ?? null;
 
-  const select = useCallback((id: string) => {
-    setSelectedId(id);
-    writeStorage(localStorage, 'doonex.selectedRun', id);
-    setTab('events');
-    setShowCreate(false);
+  const updateDraft = (update: Partial<TaskDraft>, targetProject = projectId) => {
+    if (!targetProject) return;
+    setDrafts((old) => {
+      const next = { ...old, [targetProject]: { ...(old[targetProject] ?? emptyDraft), ...update } };
+      writeStorage('local', 'doonex.projectDrafts', JSON.stringify(next));
+      return next;
+    });
+  };
+
+  const clearView = useCallback(() => {
+    action.current.generation += 1;
+    action.current.controller?.abort();
+    action.current.controller = null;
+    setBusy(false);
+    setRun(null); setEvents([]); setDiff(null); setEvidence(null); setRecovery(null);
+    setAcknowledge(false); setAdoption(null); setPollError(''); setDetailError('');
+    setDetailLoading(false); setError(''); setTab('events'); cursor.current = 0;
   }, []);
 
-  const refresh = useCallback(async (signal?: AbortSignal) => {
-    const [nextSettings, nextProject, nextRuns] = await Promise.all([
-      api.get<Settings>('/settings', signal), api.get<Project | null>('/project', signal), api.get<Run[]>('/runs', signal),
-    ]);
-    setSettings(nextSettings);
-    setProject(nextProject);
-    setRuns(nextRuns);
-    setBudget((old) => old ?? nextSettings.default_budget);
-    setProjectPath((old) => old || nextProject?.path || '');
-    return nextRuns;
-  }, [api]);
+  const select = useCallback((id: string) => {
+    if (active.current.runId === id) { setShowCreate(!id); setTab('events'); return; }
+    clearView();
+    active.current.runId = id;
+    setSelectedId(id);
+    writeStorage('local', selectionKey(active.current.projectId), id);
+    setShowCreate(!id);
+  }, [clearView]);
+
+  const selectProject = useCallback((id: string) => {
+    if (active.current.projectId === id) { setShowCreate(!active.current.runId); return; }
+    clearView();
+    const saved = readStorage('local', selectionKey(id));
+    active.current = { projectId: id, runId: saved };
+    setProjectId(id); setSelectedId(saved); setRuns([]); setShowCreate(!saved);
+    writeStorage('local', 'doonex.selectedProject', id);
+  }, [clearView]);
 
   useEffect(() => {
     if (!token) return;
     const controller = new AbortController();
-    setLoading(true);
-    setError('');
-    void refresh(controller.signal).then((nextRuns) => {
+    setLoading(true); setError('');
+    void Promise.all([
+      api.get<Settings>('/settings', controller.signal), api.get<Project[]>('/projects', controller.signal),
+    ]).then(([nextSettings, nextProjects]) => {
       if (controller.signal.aborted) return;
-      const existing = readStorage(localStorage, 'doonex.selectedRun');
-      if (existing && nextRuns.some((item) => item.id === existing)) select(existing);
-      else if (nextRuns[0]) select(nextRuns[0].id);
-      else { setSelectedId(''); setRun(null); setShowCreate(true); }
+      setSettings(nextSettings); setProjects(nextProjects);
+      const saved = readStorage('local', 'doonex.selectedProject');
+      selectProject(nextProjects.some((item) => item.id === saved) ? saved : nextProjects[0]?.id ?? '');
     }).catch((err: unknown) => {
       if (!controller.signal.aborted) setError(message(err));
     }).finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
-  }, [token, refresh, select]);
+  }, [api, token, selectProject]);
 
   useEffect(() => {
-    setRun(null);
-    setEvents([]);
-    setDiff(null);
-    setEvidence(null);
-    setRecovery(null);
-    setAcknowledge(false);
-    setAdoption(null);
-    setPollError('');
-    setDetailError('');
-    cursor.current = 0;
-    if (!token || !selectedId) return;
+    if (!token || !projectId || !project) return;
+    const controller = new AbortController();
+    setLoading(true);
+    void api.get<Run[]>(`/runs?project_id=${encodeURIComponent(projectId)}`, controller.signal).then((nextRuns) => {
+      if (controller.signal.aborted || active.current.projectId !== projectId) return;
+      setRuns(nextRuns);
+      if (!nextRuns.some((item) => item.id === active.current.runId)) select(nextRuns[0]?.id ?? '');
+    }).catch((err: unknown) => {
+      if (!controller.signal.aborted) setError(message(err));
+    }).finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    return () => controller.abort();
+  }, [api, token, projectId, project?.id, select]);
+
+  useEffect(() => {
+    if (!token || !projectId || !selectedId || !project) return;
     const controller = new AbortController();
     let timeout: ReturnType<typeof setTimeout>;
     const poll = async () => {
       try {
         const [nextRun, nextEvents, nextRuns] = await Promise.all([
-          api.get<Run>(`/runs/${encodeURIComponent(selectedId)}`, controller.signal),
-          api.get<{ events: RunEvent[]; cursor: number }>(`/runs/${encodeURIComponent(selectedId)}/events?after=${cursor.current}`, controller.signal),
-          api.get<Run[]>('/runs', controller.signal),
+          api.get<Run>(runPath(projectId, selectedId), controller.signal),
+          api.get<{ events: RunEvent[]; cursor: number }>(runPath(projectId, selectedId, 'events', { after: String(cursor.current) }), controller.signal),
+          api.get<Run[]>(`/runs?project_id=${encodeURIComponent(projectId)}`, controller.signal),
         ]);
-        if (controller.signal.aborted) return;
-        setRun(nextRun);
-        setRuns(nextRuns);
+        if (controller.signal.aborted || active.current.projectId !== projectId || active.current.runId !== selectedId) return;
+        if (nextRun.request.project_id !== projectId) throw new Error('服务返回的运行不属于当前项目。');
+        setRun(nextRun); setRuns(nextRuns);
         setEvents((old) => {
           const seen = new Set(old.map((item) => item.id));
           return [...old, ...nextEvents.events.filter((item) => !seen.has(item.id))];
         });
-        cursor.current = nextEvents.cursor;
-        setPollError('');
+        cursor.current = nextEvents.cursor; setPollError('');
       } catch (err) {
         if (!controller.signal.aborted) setPollError(message(err));
       } finally {
@@ -160,47 +213,60 @@ function App() {
     };
     void poll();
     return () => { controller.abort(); clearTimeout(timeout); };
-  }, [api, selectedId, token]);
+  }, [api, selectedId, token, projectId, project?.id]);
 
   useEffect(() => {
     setDetailError('');
-    if (!run || tab === 'events') return;
+    if (!run || run.id !== selectedId || run.request.project_id !== projectId || tab === 'events') return;
     const controller = new AbortController();
+    const isCurrent = () => !controller.signal.aborted && active.current.projectId === projectId && active.current.runId === run.id;
     setDetailLoading(true);
-    const path = `/runs/${encodeURIComponent(run.id)}/${tab}`;
+    const path = runPath(projectId, run.id, tab);
     const request = tab === 'diff'
-      ? api.get<{ diff: string }>(path, controller.signal).then((result) => setDiff(result.diff))
-      : api.get<Record<string, unknown>>(path, controller.signal).then(setEvidence);
-    void request.catch((err: unknown) => { if (!controller.signal.aborted) setDetailError(message(err)); })
-      .finally(() => { if (!controller.signal.aborted) setDetailLoading(false); });
+      ? api.get<{ diff: string }>(path, controller.signal).then((result) => { if (isCurrent()) setDiff(result.diff); })
+      : api.get<Record<string, unknown>>(path, controller.signal).then((result) => { if (isCurrent()) setEvidence(result); });
+    void request.catch((err: unknown) => { if (isCurrent()) setDetailError(message(err)); })
+      .finally(() => { if (isCurrent()) setDetailLoading(false); });
     return () => controller.abort();
-  }, [api, run?.id, run?.state, run?.updated_at, tab]);
+  }, [api, projectId, selectedId, run?.id, run?.state, run?.updated_at, tab]);
 
-  const perform = async (operation: () => Promise<void>) => {
-    setBusy(true);
-    setError('');
-    try { await operation(); } catch (err) { setError(message(err)); } finally { setBusy(false); }
+  useEffect(() => () => action.current.controller?.abort(), []);
+
+  const perform = async (operation: (context: ActionContext) => Promise<void>) => {
+    action.current.controller?.abort();
+    const controller = new AbortController();
+    const generation = ++action.current.generation;
+    action.current.controller = controller;
+    const source = { ...active.current };
+    const isCurrent = () => !controller.signal.aborted && action.current.generation === generation && currentApi.current === api
+      && active.current.projectId === source.projectId && active.current.runId === source.runId;
+    setBusy(true); setError('');
+    try { await operation({ signal: controller.signal, isCurrent }); }
+    catch (err) { if (isCurrent()) setError(message(err)); }
+    finally { if (isCurrent()) { setBusy(false); action.current.controller = null; } }
   };
 
-  const control = (action: 'pause' | 'cancel' | 'resume') => {
-    if (!run) return;
-    void perform(async () => {
+  const control = (actionName: 'pause' | 'cancel' | 'resume') => {
+    if (!run || run.id !== selectedId || run.request.project_id !== projectId) return;
+    void perform(async ({ signal, isCurrent }) => {
       let nextRun: Run;
       try {
-        nextRun = await api.post<Run>(`/runs/${encodeURIComponent(run.id)}/${action}`, action === 'resume' ? { acknowledge_unknown: acknowledge } : {});
+        nextRun = await api.post<Run>(runPath(projectId, run.id, actionName), actionName === 'resume' ? { acknowledge_unknown: acknowledge } : {}, signal);
       } catch (err) {
-        if (action === 'resume') {
-          try { setRecovery(await api.get<Recovery>(`/runs/${encodeURIComponent(run.id)}/recovery`)); } catch { /* Keep the original actionable error. */ }
+        if (actionName === 'resume' && isCurrent()) {
+          try {
+            const nextRecovery = await api.get<Recovery>(runPath(projectId, run.id, 'recovery'), signal);
+            if (isCurrent()) setRecovery(nextRecovery);
+          } catch { /* Keep the original actionable error. */ }
         }
         throw err;
       }
-      setRun(nextRun);
-      setRecovery(null);
-      setAcknowledge(false);
-      await refresh();
+      if (!isCurrent()) return;
+      setRun(nextRun); setRecovery(null); setAcknowledge(false);
+      const nextRuns = await api.get<Run[]>(`/runs?project_id=${encodeURIComponent(projectId)}`, signal);
+      if (isCurrent()) setRuns(nextRuns);
     });
   };
-
   if (!token) {
     return <main className="connect-page">
       <div className="connect-panel">
@@ -211,7 +277,7 @@ function App() {
           event.preventDefault();
           const value = tokenDraft.trim();
           if (!value) return;
-          writeStorage(sessionStorage, 'doonex.token', value);
+          writeStorage('session', 'doonex.token', value);
           setToken(value);
           setTokenDraft('');
         }}>
@@ -228,19 +294,20 @@ function App() {
   const isSubscription = settings?.model?.billing_mode === 'subscription';
   const hasPrice = isSubscription || (settings?.model?.input_price_per_million != null && settings?.model?.output_price_per_million != null);
   const canCreate = !!project && hasModel && hasPrice && !!budget && !busy;
-  const selected = run;
+  const selected = run?.id === selectedId && run.request.project_id === projectId ? run : null;
   const selectedSubscription = selected?.request.model.billing_mode === 'subscription';
   const isActive = !!selected && activeStates.has(selected.state);
 
   return <div className="app-shell">
     <header className="app-header">
       <div className="wordmark">DooNex<span>编程工作台</span></div>
-      <div className="header-actions"><span className="local-label">本地 · 单 Agent</span><button className="quiet" onClick={() => {
-        writeStorage(sessionStorage, 'doonex.token', ''); setToken(''); setSettings(null); setProject(null); setRuns([]); setRun(null);
+      <div className="header-actions"><span className="local-label">本地 · 有限协作</span><button className="quiet" onClick={() => {
+        clearView(); active.current = { projectId: '', runId: '' }; writeStorage('session', 'doonex.token', ''); setToken(''); setSettings(null); setProjects([]); setProjectId(''); setSelectedId(''); setRuns([]);
       }}>断开连接</button></div>
     </header>
     <div className="workspace-layout">
       <aside className="sidebar" aria-label="运行列表">
+        <div className="project-picker"><label htmlFor="project-select">项目</label><select id="project-select" value={projectId} onChange={(event) => selectProject(event.target.value)} disabled={!projects.length}><option value="" disabled>尚未注册项目</option>{projects.map((item) => <option key={item.id} value={item.id}>{item.name || item.path}</option>)}</select><button className="quiet compact" onClick={() => { setShowCreate(true); setError(''); requestAnimationFrame(() => document.getElementById('project-path')?.focus()); }}>注册项目</button></div>
         <div className="sidebar-title"><h2>任务记录</h2><button className="primary compact" onClick={() => { setShowCreate(true); setError(''); }}>新任务</button></div>
         {loading && <p className="muted" role="status">正在连接服务…</p>}
         {!loading && !runs.length && <p className="empty-copy">还没有运行记录。注册项目后，开始第一个任务。</p>}
@@ -248,30 +315,33 @@ function App() {
           <button className={`run-item ${item.id === selectedId && !showCreate ? 'selected' : ''}`} aria-current={item.id === selectedId && !showCreate ? 'page' : undefined} onClick={() => select(item.id)}>
             <span className="run-title">{item.request.prompt}</span>
             <Status state={item.state} />
-            <time dateTime={item.created_at}>{fmtTime(item.created_at)}</time>
+            <span className="muted run-project">{item.request.project_name || project?.name || project?.path}</span><time dateTime={item.created_at}>{fmtTime(item.created_at)}</time>
           </button>
         </li>)}</ul>
       </aside>
       <main className="main-content">
         {error && <div className="notice error" role="alert"><span>{error}</span><button className="quiet" aria-label="关闭错误提示" onClick={() => setError('')}>关闭</button></div>}
         <section className="project-strip" aria-label="当前项目">
-          <div><span className="eyebrow">当前项目</span><strong className="path-text">{project?.path ?? '尚未注册'}</strong></div>
+          <div><span className="eyebrow">当前项目{project?.name ? ` · ${project.name}` : ''}</span><strong className="path-text">{project?.path ?? '尚未注册'}</strong>{project && <span className="muted small path-text">{project.id}</span>}</div>
           {project && <span className="muted small">{project.dirty ? '原工作区有未提交改动' : '原工作区干净'}</span>}
         </section>
 
         {showCreate ? <div className="create-view">
           <div className="page-heading"><div><h1>开始一个可信的任务</h1><p className="muted">固定起始版本与验收条件，在隔离工作区中执行。</p></div>{selectedId && <button className="quiet" onClick={() => setShowCreate(false)}>返回运行</button>}</div>
           <section className="section-block">
-            <h2>项目</h2>
+            <h2>注册或重新校验项目</h2>
             <form className="inline-form" onSubmit={(event) => {
               event.preventDefault();
-              void perform(async () => {
-                const result = await api.post<Project>('/project', { path: projectPath.trim() });
-                setProject(result); setProjectPath(result.path); setBaseRef(result.head);
+              void perform(async ({ signal, isCurrent }) => {
+                const result = await api.post<Project>('/projects', { path: projectPath.trim() }, signal);
+                if (!isCurrent()) return;
+                setProjects((old) => [...old.filter((item) => item.id !== result.id), result]);
+                updateDraft({ baseRef: result.head }, result.id);
+                setProjectPath(''); selectProject(result.id); setShowCreate(true);
               });
             }}>
               <div className="grow"><label htmlFor="project-path">本地 Git 仓库路径</label><input id="project-path" value={projectPath} onChange={(event) => setProjectPath(event.target.value)} placeholder="/绝对路径/项目" required spellCheck={false} /></div>
-              <button disabled={busy} type="submit">{project ? '重新校验项目' : '注册项目'}</button>
+              <button disabled={busy} type="submit">注册 / 重新校验</button>
             </form>
             <p className="field-help">只读取选定提交建立独立工作副本，原工作区中的未提交内容不会自动带入。</p>
           </section>
@@ -296,28 +366,32 @@ function App() {
           <form onSubmit={(event) => {
             event.preventDefault();
             if (!canCreate || !budget) return;
-            void perform(async () => {
-              const created = await api.post<Run>('/runs', { prompt: prompt.trim(), base_ref: baseRef.trim(), checks: checks.split('\n').map((line) => line.trim()).filter(Boolean), budget: { ...budget, max_cost_usd: isSubscription ? null : budget.max_cost_usd } });
+            void perform(async ({ signal, isCurrent }) => {
+              const created = await api.post<Run>('/runs', { project_id: projectId, workflow, prompt: prompt.trim(), base_ref: baseRef.trim(), checks: checks.split('\n').map((line) => line.trim()).filter(Boolean), budget: { ...budget, max_cost_usd: isSubscription ? null : budget.max_cost_usd } }, signal);
+              if (!isCurrent()) return;
               setRuns((old) => [created, ...old.filter((item) => item.id !== created.id)]);
-              select(created.id);
-              setPrompt(''); setChecks('');
+              updateDraft({ prompt: '', checks: '' }); select(created.id);
             });
           }}>
             <section className="section-block">
               <h2>需求与验收</h2>
-              <label htmlFor="base-ref">起始提交或引用</label><input className="mono" id="base-ref" value={baseRef} onChange={(event) => setBaseRef(event.target.value)} required spellCheck={false} />
+              <label htmlFor="workflow">执行方式</label><select id="workflow" value={workflow} onChange={(event) => updateDraft({ workflow: event.target.value as Workflow })}>
+                <option value="execute_review">执行后只读审查，再运行检查</option><option value="execute">仅执行，再运行检查</option>
+              </select>
+              <p className="field-help">默认由执行者完成修改，再由审查者读取固定快照。两个角色共享同一预算；没有自动修复、重试或递归委派。</p>
+              <label htmlFor="base-ref">起始提交或引用</label><input className="mono" id="base-ref" value={baseRef} onChange={(event) => updateDraft({ baseRef: event.target.value })} required spellCheck={false} />
               <p className="field-help">启动前解析为固定提交。可输入 HEAD、分支名或提交 SHA。</p>
-              <label htmlFor="task-prompt">希望完成的工作</label><textarea id="task-prompt" rows={4} value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="描述要修改的行为、范围和需要保留的约束。" required />
-              <label htmlFor="checks">验收命令</label><textarea className="mono" id="checks" rows={3} value={checks} onChange={(event) => setChecks(event.target.value)} placeholder="每行一条命令，例如 python -m unittest discover" spellCheck={false} />
+              <label htmlFor="task-prompt">希望完成的工作</label><textarea id="task-prompt" rows={4} value={prompt} onChange={(event) => updateDraft({ prompt: event.target.value })} placeholder="描述要修改的行为、范围和需要保留的约束。" required />
+              <label htmlFor="checks">验收命令</label><textarea className="mono" id="checks" rows={3} value={checks} onChange={(event) => updateDraft({ checks: event.target.value })} placeholder="每行一条命令，例如 python -m unittest discover" spellCheck={false} />
               <p className="field-help">命令在隔离环境中按启动时版本保存并执行。未填写检查时，结果只能标记为待检查。</p>
             </section>
             <section className="section-block">
-              <h2>本次运行预算</h2>
+              <h2>本次运行共享预算</h2>
               {budget ? <div className="budget-inputs">
-                <label>模型调用上限<input type="number" min={1} step={1} required value={budget.max_calls} onChange={(event) => setBudget({ ...budget, max_calls: Number(event.target.value) })} /></label>
-                <label>Token 上限<input type="number" min={1} step={1} required value={budget.max_tokens} onChange={(event) => setBudget({ ...budget, max_tokens: Number(event.target.value) })} /></label>
-                <label>估计费用上限（US$）<input type="number" min={0.0001} step="any" required={!isSubscription} disabled={isSubscription} placeholder={isSubscription ? '包月连接' : ''} value={isSubscription ? '' : budget.max_cost_usd ?? ''} onChange={(event) => setBudget({ ...budget, max_cost_usd: event.target.value === '' ? null : Number(event.target.value) })} /></label>
-                <label>总时长上限（秒）<input type="number" min={1} step={1} required value={budget.max_seconds} onChange={(event) => setBudget({ ...budget, max_seconds: Number(event.target.value) })} /></label>
+                <label>模型调用上限<input type="number" min={1} step={1} required value={budget.max_calls} onChange={(event) => updateDraft({ budget: { ...budget, max_calls: Number(event.target.value) } })} /></label>
+                <label>Token 上限<input type="number" min={1} step={1} required value={budget.max_tokens} onChange={(event) => updateDraft({ budget: { ...budget, max_tokens: Number(event.target.value) } })} /></label>
+                <label>估计费用上限（US$）<input type="number" min={0.0001} step="any" required={!isSubscription} disabled={isSubscription} placeholder={isSubscription ? '包月连接' : ''} value={isSubscription ? '' : budget.max_cost_usd ?? ''} onChange={(event) => updateDraft({ budget: { ...budget, max_cost_usd: event.target.value === '' ? null : Number(event.target.value) } })} /></label>
+                <label>总时长上限（秒）<input type="number" min={1} step={1} required value={budget.max_seconds} onChange={(event) => updateDraft({ budget: { ...budget, max_seconds: Number(event.target.value) } })} /></label>
               </div> : <p className="muted">正在读取预算配置…</p>}
               <p className="field-help">{isSubscription ? '包月连接的货币费用未知。本次运行仍受模型调用、token 和时长上限约束。' : '预算限制后续请求的派发。在途请求仍可能产生费用，预估上限不等于供应商账单的绝对封顶。'}</p>
             </section>
@@ -325,7 +399,7 @@ function App() {
           </form>
         </div> : selected ? <div className="run-view">
           <div className="page-heading"><div><span className="eyebrow">运行 {selected.id}</span><h1 className="task-heading">{selected.request.prompt}</h1></div><Status state={selected.state} /></div>
-          <div className="run-meta"><span>起始提交 <code>{selected.request.base_commit}</code></span><span>创建于 {fmtTime(selected.created_at)}</span></div>
+          <div className="run-meta"><span className="path-text">项目 {selected.request.project_name || project?.name || selected.request.repo_path}</span><span>起始提交 <code>{selected.request.base_commit}</code></span><span>创建于 {fmtTime(selected.created_at)}</span></div>
           {selected.reason && <p className="notice">{selected.reason}</p>}
           {pollError && <p className="notice error" role="alert">{pollError} 当前显示最近一次已记录结果；会自动重连。</p>}
           <div className="run-toolbar">
@@ -333,8 +407,9 @@ function App() {
               {(selected.state === 'running' || selected.state === 'queued') && <button disabled={busy} onClick={() => control('pause')}>暂停</button>}
               {(isActive || selected.state === 'paused' || selected.state === 'interrupted') && <button className="danger" disabled={busy || selected.state === 'cancelling'} onClick={() => control('cancel')}>取消运行</button>}
               {selected.state === 'paused' && <button className="primary" disabled={busy} onClick={() => control('resume')}>继续执行</button>}
-              {selected.state === 'interrupted' && <button disabled={busy} onClick={() => { void perform(async () => {
-                setRecovery(await api.get<Recovery>(`/runs/${encodeURIComponent(selected.id)}/recovery`)); setAcknowledge(false);
+              {selected.state === 'interrupted' && <button disabled={busy} onClick={() => { void perform(async ({ signal, isCurrent }) => {
+                const nextRecovery = await api.get<Recovery>(runPath(projectId, selected.id, 'recovery'), signal);
+                if (isCurrent()) { setRecovery(nextRecovery); setAcknowledge(false); }
               }); }}>核查恢复条件</button>}
             </div>
             <span className="muted small">{isActive ? '每 2 秒同步，关闭页面不停止任务' : `最近更新 ${fmtTime(selected.updated_at)}`}</span>
@@ -348,9 +423,10 @@ function App() {
             <label className="checkbox-label"><input type="checkbox" checked={acknowledge} onChange={(event) => setAcknowledge(event.target.checked)} />我已核对工作区、容器和结果未知的外部动作，确认可以继续。</label>
             <button className="primary" disabled={busy || !acknowledge || !recovery.workspace_ok} onClick={() => control('resume')}>确认核查并恢复</button>
           </section>}
-          <section className="usage-panel" aria-label="预算与用量">
-            <div><span>模型调用</span><strong>{selected.usage.calls ?? 0}<small> / {selected.request.budget.max_calls}</small></strong></div>
-            <div><span>已记录 tokens</span><strong>{(selected.usage.tokens ?? 0).toLocaleString()}<small> / {selected.request.budget.max_tokens.toLocaleString()}</small></strong></div>
+          <WorkflowProgress run={selected} />
+          <section className="usage-panel" aria-label="共享预算与累计用量">
+            <div><span>累计模型调用</span><strong>{selected.usage.calls ?? 0}<small> / {selected.request.budget.max_calls}</small></strong></div>
+            <div><span>累计已记录 tokens</span><strong>{(selected.usage.tokens ?? 0).toLocaleString()}<small> / {selected.request.budget.max_tokens.toLocaleString()}</small></strong></div>
             <div><span>{selectedSubscription ? '货币费用未知' : '已记录估计费用'}</span><strong>{selectedSubscription ? '包月连接' : money(selected.usage.cost_usd)}{!selectedSubscription && <small> / {money(selected.request.budget.max_cost_usd)}</small>}</strong></div>
             <div><span>总时长上限</span><strong>{selected.request.budget.max_seconds}<small> 秒</small></strong></div>
             <p>预留：{(selected.usage.reserved_tokens ?? 0).toLocaleString()} tokens{selectedSubscription ? '。包月连接按调用、token 和时长约束，货币费用未知。' : `，${money(selected.usage.reserved_cost_usd)}。`}{selected.usage.unknown_calls > 0 ? `有 ${selected.usage.unknown_calls} 次调用的实际用量未知，保留预算预留。` : '预留会在供应商返回用量后结算。'}</p>
@@ -371,13 +447,14 @@ function App() {
             </>}
             {tab === 'diff' && <>{detailLoading && diff === null ? <p role="status" className="muted">正在读取代码变更…</p> : diff ? <pre className="diff-output">{diff}</pre> : !detailError && <p className="empty-copy">目前没有可显示的代码差异。</p>}</>}
             {tab === 'evidence' && <>
+              <ReviewReport run={selected} />
               <div className="evidence-intro"><h2>与代码快照绑定的交付证据</h2><p className="muted">检查命令、退出码、日志和时间以服务保存的报告为准。失败、缺失或过期证据不能证明当前代码已通过验收。</p></div>
-              <div className="button-row artifact-actions">{(['patch', 'snapshot', 'report'] as const).map((name) => <button key={name} disabled={busy} onClick={() => { void perform(() => api.download(selected.id, name)); }}>下载{({ patch: '补丁', snapshot: '代码快照', report: '检查报告' })[name]}</button>)}<button disabled={busy || isActive} onClick={() => { void perform(async () => setAdoption(await api.post<{ safe: boolean; reason: string }>(`/runs/${encodeURIComponent(selected.id)}/adoption-check`))); }}>检查采纳条件</button></div>
+              <div className="button-row artifact-actions">{(['patch', 'snapshot', 'report'] as const).map((name) => <button key={name} disabled={busy} onClick={() => { void perform(({ signal }) => api.download(projectId, selected.id, name, signal)); }}>下载{({ patch: '补丁', snapshot: '代码快照', report: '检查报告' })[name]}</button>)}<button disabled={busy || isActive} onClick={() => { void perform(async ({ signal, isCurrent }) => { const result = await api.post<{ safe: boolean; reason: string }>(runPath(projectId, selected.id, 'adoption-check'), {}, signal); if (isCurrent()) setAdoption(result); }); }}>检查采纳条件</button></div>
               {adoption && <div className={`notice ${adoption.safe ? '' : 'error'}`} role="status"><strong>{adoption.safe ? '采纳预检通过' : '采纳预检未通过'}</strong><p>{adoption.reason}</p><p>请保留补丁并人工检查后整合。预检不会修改原项目，也不会推送或部署。</p></div>}
-              {detailLoading && evidence === null ? <p className="muted" role="status">正在读取证据…</p> : evidence ? <CheckReport evidence={evidence} busy={busy} onDownloadLog={(name) => { void perform(() => api.download(selected.id, name)); }} /> : !detailError && <p className="empty-copy">尚无验证报告。</p>}
+              {detailLoading && evidence === null ? <p className="muted" role="status">正在读取证据…</p> : evidence ? <CheckReport evidence={evidence} busy={busy} onDownloadLog={(name) => { void perform(({ signal }) => api.download(projectId, selected.id, name, signal)); }} /> : !detailError && <p className="empty-copy">尚无验证报告。</p>}
             </>}
           </section>
-        </div> : <div className="empty-state"><h1>{selectedId ? '正在读取运行…' : '准备开始'}</h1><p className="muted">{selectedId ? '从已保存的记录恢复视图。' : '注册一个项目，创建第一个任务。'}</p><button onClick={() => setShowCreate(true)}>创建任务</button></div>}
+        </div> : <div className="empty-state"><h1>{selectedId ? '正在读取运行…' : '准备开始'}</h1>{pollError && <p className="notice error" role="alert">{pollError} 会自动重试读取。</p>}<p className="muted">{selectedId ? '从已保存的记录恢复视图。' : '注册一个项目，创建第一个任务。'}</p><button onClick={() => setShowCreate(true)}>创建任务</button></div>}
       </main>
     </div>
   </div>;

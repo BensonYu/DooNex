@@ -27,7 +27,35 @@ export type Settings = {
   default_budget: Budget;
 };
 
-export type Project = { id: string; path: string; head: string; dirty: boolean };
+export type Project = { id: string; path: string; head: string; dirty: boolean; name?: string };
+export type Role = 'executor' | 'reviewer';
+export type Workflow = 'execute' | 'execute_review';
+export type Usage = {
+  calls: number;
+  tokens: number;
+  cost_usd: number | null;
+  reserved_tokens: number;
+  reserved_cost_usd: number | null;
+  unknown_calls: number;
+};
+export type Assignment = {
+  id: string;
+  role: Role;
+  state: string;
+  started_at?: string | null;
+  ended_at?: string | null;
+  session_generation?: number;
+  resume_session?: boolean;
+  usage?: Usage;
+};
+export type Review = {
+  status: 'approved' | 'changes_requested';
+  summary: string;
+  valid?: boolean;
+  errors?: string[];
+  findings: { path: string | null; line?: number | null; severity: 'high' | 'medium' | 'low'; message: string }[];
+  snapshot_digest: string;
+};
 
 export type Run = {
   id: string;
@@ -35,7 +63,17 @@ export type Run = {
   reason: string | null;
   created_at: string;
   updated_at: string;
+  phase?: 'execution' | 'review' | 'verification';
+  active_assignment?: Role;
+  assignments?: Partial<Record<Role, Assignment>>;
+  role_usage?: Partial<Record<Role, Usage>>;
+  handoff?: { snapshot_digest: string } | null;
+  review?: Review | null;
+  review_integrity?: { valid: boolean; errors: string[] };
   request: {
+    project_id: string;
+    project_name?: string;
+    workflow?: Workflow;
     prompt: string;
     base_commit: string;
     repo_path: string;
@@ -43,14 +81,7 @@ export type Run = {
     budget: Budget;
     model: ModelConfig;
   };
-  usage: {
-    calls: number;
-    tokens: number;
-    cost_usd: number | null;
-    reserved_tokens: number;
-    reserved_cost_usd: number | null;
-    unknown_calls: number;
-  };
+  usage: Usage;
   evidence?: Record<string, unknown> | null;
 };
 
@@ -120,13 +151,14 @@ export class Api {
     return (await this.response(path, { signal })).json() as Promise<T>;
   }
 
-  async post<T>(path: string, body: unknown = {}): Promise<T> {
-    return (await this.response(path, { method: 'POST', body: JSON.stringify(body) })).json() as Promise<T>;
+  async post<T>(path: string, body: unknown = {}, signal?: AbortSignal): Promise<T> {
+    return (await this.response(path, { method: 'POST', body: JSON.stringify(body), signal })).json() as Promise<T>;
   }
 
-  async download(runId: string, name: ArtifactName): Promise<void> {
-    const response = await this.response(`/runs/${encodeURIComponent(runId)}/artifact?name=${encodeURIComponent(name)}`);
+  async download(projectId: string, runId: string, name: ArtifactName, signal?: AbortSignal): Promise<void> {
+    const response = await this.response(`/runs/${encodeURIComponent(runId)}/artifact?name=${encodeURIComponent(name)}&project_id=${encodeURIComponent(projectId)}`, { signal });
     const blob = await response.blob();
+    if (signal?.aborted) return;
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;

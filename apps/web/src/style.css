@@ -11,7 +11,7 @@
 }
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; }
-button, input, textarea { font: inherit; }
+button, input, textarea, select { font: inherit; }
 button { background: #fff; color: #283246; border: 1px solid #cbd2dd; border-radius: 6px; padding: 9px 14px; cursor: pointer; font-size: 13px; line-height: 1.5; white-space: nowrap; }
 button:hover:not(:disabled) { background: #f0f3f8; border-color: #acb7c8; }
 button:disabled { cursor: not-allowed; opacity: .5; }
@@ -20,8 +20,8 @@ button.primary:hover:not(:disabled) { background: #1c3f9e; }
 button.quiet { background: transparent; border-color: transparent; }
 button.danger { color: #a52d2d; border-color: #dcbbbb; }
 button.compact { padding: 6px 10px; font-size: 12px; }
-button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 3px solid #8daaf0; outline-offset: 3px; }
-input, textarea { width: 100%; border: 1px solid #bfc8d6; border-radius: 6px; background: #fff; color: #202735; padding: 10px 12px; font-size: 14px; line-height: 1.5; }
+button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, summary:focus-visible { outline: 3px solid #8daaf0; outline-offset: 3px; }
+input, textarea, select { width: 100%; border: 1px solid #bfc8d6; border-radius: 6px; background: #fff; color: #202735; padding: 10px 12px; font-size: 14px; line-height: 1.5; }
 textarea { resize: vertical; min-height: 80px; }
 input::placeholder, textarea::placeholder { color: #747e8e; }
 label { display: block; font-size: 13px; font-weight: 600; margin: 18px 0 8px; }
@@ -174,4 +174,37 @@ div.notice:has(> button) { display: flex; justify-content: space-between; align-
   .config-list > div { grid-template-columns: 1fr; gap: 3px; }
   .page-heading { flex-wrap: wrap; }
   .tabs { gap: 17px; }
+}
+
+.project-picker { border-bottom: 1px solid var(--line); padding: 0 5px 18px; margin-bottom: 20px; }
+.project-picker label { margin: 0 0 8px; color: #515b6b; }
+.project-picker select { min-width: 0; max-width: 100%; font-size: 12px; }
+.project-picker .quiet { margin-top: 7px; padding-left: 0; }
+.run-project { font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; }
+.workflow-panel { margin: 10px 0 20px; padding: 20px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.workflow-panel h2 { margin-bottom: 0; }
+.workflow-panel .section-heading { align-items: baseline; flex-wrap: wrap; gap: 8px 20px; }
+.role-table-wrap { overflow-x: auto; }
+.role-table { width: 100%; border-collapse: collapse; margin: 16px 0; text-align: left; font-size: 12px; }
+.role-table th, .role-table td { padding: 10px 16px 10px 0; border-bottom: 1px solid #e7eaf0; vertical-align: top; }
+.role-table thead th { color: var(--muted); font-size: 11px; font-weight: 450; white-space: nowrap; }
+.role-table tbody th { font-weight: 450; }
+.role-table th strong, .role-table th span, .role-table small { display: block; }
+.role-table th span, .role-table small { color: var(--muted); font-size: 10px; margin-top: 4px; }
+.role-table th small { max-width: 280px; }
+.review-panel { margin-bottom: 28px; padding-bottom: 24px; border-bottom: 1px solid var(--line); }
+.review-panel > p { margin: 12px 0; }
+.review-panel .notice { margin-top: 18px; }
+.review-findings { padding-left: 22px; margin: 20px 0 0; }
+.review-findings li { margin-top: 16px; }
+.review-findings li > div { display: flex; gap: 8px; align-items: baseline; }
+.review-findings li p { font-size: 13px; margin: 8px 0 0; }
+.severity { font-size: 10px; padding: 2px 5px; border: 1px solid #d3d9e3; border-radius: 3px; }
+.severity-high { background: #fff0ee; color: #a13030; border-color: #ebc6c0; }
+.severity-medium { background: #fff5e7; color: #8a550b; border-color: #e6cfaa; }
+@media (max-width: 800px) {
+  .project-picker { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: center; margin-bottom: 14px; padding: 0 0 14px; }
+  .project-picker label, .project-picker .quiet { margin: 0; }
+  .project-picker .quiet { padding: 6px; }
+  .role-table th small { max-width: 155px; }
 }
