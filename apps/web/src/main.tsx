@@ -148,8 +148,8 @@ function App() {
     setDetailLoading(false); setError(''); setTab('events'); cursor.current = 0;
   }, []);
 
-  const select = useCallback((id: string) => {
-    setView('workbench');
+  const select = useCallback((id: string, navigate = true) => {
+    if (navigate) setView('workbench');
     if (active.current.runId === id) { setShowCreate(!id); setTab('events'); return; }
     clearView();
     active.current.runId = id;
@@ -158,8 +158,8 @@ function App() {
     setShowCreate(!id);
   }, [clearView]);
 
-  const selectProject = useCallback((id: string) => {
-    setView('workbench');
+  const selectProject = useCallback((id: string, navigate = true) => {
+    if (navigate) setView('workbench');
     if (active.current.projectId === id) { setShowCreate(!active.current.runId); return; }
     clearView();
     const saved = readStorage('local', selectionKey(id));
@@ -178,7 +178,7 @@ function App() {
       if (controller.signal.aborted) return;
       setSettings(nextSettings); setProjects(nextProjects); setRegistry(nextRegistry);
       const saved = readStorage('local', 'doonex.selectedProject');
-      selectProject(nextProjects.some((item) => item.id === saved) ? saved : nextProjects[0]?.id ?? '');
+      selectProject(nextProjects.some((item) => item.id === saved) ? saved : nextProjects[0]?.id ?? '', false);
     }).catch((err: unknown) => {
       if (!controller.signal.aborted) setError(message(err));
     }).finally(() => { if (!controller.signal.aborted) setLoading(false); });
@@ -192,7 +192,7 @@ function App() {
     void api.get<Run[]>(`/runs?project_id=${encodeURIComponent(projectId)}`, controller.signal).then((nextRuns) => {
       if (controller.signal.aborted || active.current.projectId !== projectId) return;
       setRuns(nextRuns);
-      if (!nextRuns.some((item) => item.id === active.current.runId)) select(nextRuns[0]?.id ?? '');
+      if (!nextRuns.some((item) => item.id === active.current.runId)) select(nextRuns[0]?.id ?? '', false);
     }).catch((err: unknown) => {
       if (!controller.signal.aborted) setError(message(err));
     }).finally(() => { if (!controller.signal.aborted) setLoading(false); });
