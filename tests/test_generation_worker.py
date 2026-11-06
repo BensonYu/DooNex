@@ -66,7 +66,10 @@ def test_generation_actual_worker_api_import_preserves_assets(
     calls = transport(monkeypatch)
     with TestClient(create_app(service.settings)) as client:
         client.headers["Authorization"] = "Bearer " + service.settings.token
-        assert client.get("/api/skills/generations/inputs").status_code == 200
+        inputs = client.get("/api/skills/generations/inputs")
+        assert inputs.status_code == 200
+        profiles = client.get("/api/model-profiles").json()["profiles"]
+        assert inputs.json()["models"] == profiles
         created = client.post("/api/skills/generations", json=body.model_dump())
         assert created.status_code == 200, created.text
         draft = created.json()

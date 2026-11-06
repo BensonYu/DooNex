@@ -991,3 +991,22 @@ def test_legacy_project_without_name_remains_selectable(setup_generation):
     assert draft["project"] == projected
     assert service.store.project(project["id"]) == before
     assert draft["run_id"] is None and service.store.list_runs() == []
+
+
+def test_input_profiles_report_credential_availability_without_secrets(
+    setup_generation, monkeypatch
+):
+    service, _body, _files, _taskset, _project = setup_generation
+    monkeypatch.setattr(
+        type(service.settings), "credential", lambda *args: "private-input-test-key"
+    )
+    present = service.inputs()["models"]
+    assert present and all(p["credential_available"] is True for p in present)
+    assert "private-input-test-key" not in json.dumps(present)
+    monkeypatch.setattr(type(service.settings), "credential", lambda *args: None)
+    missing = service.inputs()["models"]
+    assert all(p["credential_available"] is False for p in missing)
+    for before, after in zip(present, missing, strict=True):
+        assert {k: v for k, v in before.items() if k != "credential_available"} == {
+            k: v for k, v in after.items() if k != "credential_available"
+        }
