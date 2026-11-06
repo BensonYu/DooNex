@@ -368,7 +368,13 @@ class Generation:
                 {**row, "split": "tuning", "tasks": row["tasks"] or []} for row in rows
             ],
             "models": [
-                profile.model_dump() for profile in ModelRegistry(self.settings).list()
+                {
+                    **profile.model_dump(),
+                    "credential_available": bool(
+                        self.settings.credential(profile.model.model_dump())
+                    ),
+                }
+                for profile in ModelRegistry(self.settings).list()
             ],
             "projects": [
                 {"id": p["id"], "name": p.get("name", Path(p["path"]).name)}
