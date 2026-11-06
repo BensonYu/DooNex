@@ -342,6 +342,24 @@ class SkillContext:
     metadata: dict
 
 
+def prepare_bytes(
+    files: dict[str, FileContent], directories: tuple[str, ...], metadata: dict
+) -> PreparedSkill:
+    """Prepare controller-supplied bytes with the ordinary local content rules."""
+    normalized = _metadata(metadata)
+    _validate_content(files, directories)
+    if any(content.mode not in {0o644, 0o755} for content in files.values()):
+        raise SkillError("Prepared bytes require regular Git file modes")
+    identity = _identity(normalized, files, directories)
+    return PreparedSkill(
+        _sha(_json(identity)),
+        identity["content_digest"],
+        normalized,
+        dict(files),
+        directories,
+    )
+
+
 def prepare_import(path: Path, metadata: dict, *, protected_roots=()) -> PreparedSkill:
     """Read a bounded directory without executing scripts, Git or frontmatter."""
     try:

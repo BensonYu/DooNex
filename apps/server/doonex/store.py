@@ -29,6 +29,9 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE TABLE IF NOT EXISTS library_versions (
  kind text NOT NULL, id text NOT NULL, data jsonb NOT NULL, PRIMARY KEY(kind,id)
 );
+CREATE TABLE IF NOT EXISTS skill_discoveries (
+ id uuid PRIMARY KEY, data jsonb NOT NULL
+);
 CREATE TABLE IF NOT EXISTS arena_evaluations (
  id uuid PRIMARY KEY, state text NOT NULL, data jsonb NOT NULL
 );

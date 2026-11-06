@@ -693,6 +693,9 @@ def create_app(settings=None):
             else "补丁存在冲突，禁止自动覆盖",
         }
 
+    from doonex.discovery import install_discovery_routes
+
+    install_discovery_routes(app, settings, store, auth)
     from doonex.library import install_library_routes
 
     install_library_routes(app, settings, store, auth)

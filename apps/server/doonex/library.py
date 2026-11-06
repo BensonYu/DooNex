@@ -56,15 +56,17 @@ class Library:
                 )
             ]
 
-    def bind(self, kind, identifier, record):
+    def bind(self, kind, identifier, record, connection=None):
         # The original database receipt is the trust anchor, including metadata
         # excluded from content identity. Reimport must never rebind it.
-        with self.store.connect() as c:
-            c.execute(
-                "INSERT INTO library_versions VALUES(%s,%s,%s) ON CONFLICT DO NOTHING",
-                (kind, identifier, Jsonb(record)),
-            )
-            return self.get(kind, identifier, c)
+        if connection is None:
+            with self.store.connect() as c:
+                return self.bind(kind, identifier, record, c)
+        connection.execute(
+            "INSERT INTO library_versions VALUES(%s,%s,%s) ON CONFLICT DO NOTHING",
+            (kind, identifier, Jsonb(record)),
+        )
+        return self.get(kind, identifier, connection)
 
     def import_skill(self, path, metadata):
         record = self.skills.import_local(Path(path).expanduser(), metadata)
