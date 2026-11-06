@@ -491,3 +491,155 @@ def test_queued_and_incomplete_results_cannot_create_recommendation(
     assert detail["metrics"]["counts"]["pending"] == 45
     assert m3_client.post("/api/arena/recommendations", json=body).status_code == 400
     assert m3_client.get("/api/arena/recommendations").json() == {"history": [], "current": []}
+
+
+@pytest.fixture
+def synthetic_eligible_evaluation(m3_client, m3_library, monkeypatch):
+    """Stub only eligibility to exercise recommendation APIs, never real scoring.
+
+    The persisted plan remains queued and no worker or model runs. These
+    deliberately synthetic complete metrics are not model acceptance evidence.
+    Real evidence eligibility is covered separately without this monkeypatch.
+    """
+    queued = create_evaluation(m3_client, m3_library, repeats=3)
+    synthetic = copy.deepcopy(queued)
+    synthetic["state"] = "complete"
+    synthetic["metrics"]["state"] = "complete"
+    synthetic["metrics"]["complete"] = True
+    synthetic["metrics"]["recommendations"] = {
+        "reliable": synthetic["skill_version_ids"], "cost": [], "speed": []
+    }
+    synthetic["metrics"]["counts"].update(completed=45, valid=45, passed=45, pending=0)
+    for arm in synthetic["metrics"]["arms"]:
+        arm["counts"].update(completed=15, valid=15, passed=15, pending=0)
+        arm["eligibility"] = {"eligible": True, "reasons": []}
+        arm.update(pass_rate=1.0, stability="all_passed")
+
+    def synthetic_detail(self, identifier):
+        assert identifier == queued["id"]
+        return copy.deepcopy(synthetic)
+
+    monkeypatch.setattr(Arena, "detail", synthetic_detail)
+    return synthetic
+
+
+def synthetic_promote(client, evaluation, arm):
+    response = client.post(
+        "/api/arena/recommendations",
+        json={"evaluation_id": evaluation["id"], "position": "reliable", "arm_id": arm},
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def recommendation_run_body(client, sources, recommendation):
+    response = client.post("/api/projects", json={"path": str(sources["repository"])})
+    assert response.status_code == 200, response.text
+    return {
+        "project_id": response.json()["id"],
+        "prompt": "Synthetic recommendation application fixture; no model execution",
+        "model_profile_id": "legacy",
+        "recommendation_id": recommendation["id"],
+        "skill_version_id": recommendation["arm_id"],
+    }
+
+
+def test_synthetic_recommendation_history_rollback_and_run_binding_are_explicit(
+    m3_client, settings, store, m3_sources, synthetic_eligible_evaluation
+):
+    synthetic = synthetic_eligible_evaluation
+    arm_a, arm_b = synthetic["skill_version_ids"]
+    recommendation_a = synthetic_promote(m3_client, synthetic, arm_a)
+    assert recommendation_a["previous_id"] is None
+    assert recommendation_a["category"] == synthetic["category"]
+    assert recommendation_a["model"] == settings.model.model_dump()
+    assert m3_client.get("/api/arena/recommendations").json() == {
+        "history": [recommendation_a], "current": [recommendation_a]
+    }
+    body = recommendation_run_body(m3_client, m3_sources, recommendation_a)
+    first = m3_client.post("/api/runs", json=body)
+    assert first.status_code == 200, first.text
+    first = first.json()
+    frozen = copy.deepcopy(first["request"])
+    assert frozen["recommendation"] == recommendation_a
+    assert frozen["skill"] == synthetic["skills"][arm_a]
+    assert frozen["skill_version_id"] == arm_a
+    assert frozen["model"] == recommendation_a["model"]
+
+    recommendation_b = synthetic_promote(m3_client, synthetic, arm_b)
+    assert recommendation_b["previous_id"] == recommendation_a["id"]
+    history = m3_client.get("/api/arena/recommendations").json()
+    assert history == {
+        "history": [recommendation_b, recommendation_a], "current": [recommendation_b]
+    }
+    response = m3_client.post(
+        "/api/arena/recommendations/rollback",
+        json={"recommendation_id": recommendation_a["id"]},
+    )
+    assert response.status_code == 200, response.text
+    rolled_back = response.json()
+    assert rolled_back["id"] not in {recommendation_a["id"], recommendation_b["id"]}
+    assert rolled_back["arm_id"] == arm_a
+    assert rolled_back["previous_id"] == recommendation_b["id"]
+    assert rolled_back["rollback_of"] == recommendation_a["id"]
+    assert m3_client.get("/api/arena/recommendations").json() == {
+        "history": [rolled_back, recommendation_b, recommendation_a],
+        "current": [rolled_back],
+    }
+    assert store.get(first["id"])["request"] == frozen
+    assert m3_client.get(f"/api/runs/{first['id']}").json()["request"] == frozen
+
+    for superseded in (recommendation_a, recommendation_b):
+        response = m3_client.post(
+            "/api/runs", json={**body, "recommendation_id": superseded["id"], "skill_version_id": superseded["arm_id"]}
+        )
+        assert response.status_code == 400 and "推荐已变更" in response.json()["detail"]
+    current_body = {**body, "recommendation_id": rolled_back["id"]}
+    conflict = m3_client.post("/api/runs", json={**current_body, "skill_version_id": arm_b})
+    assert conflict.status_code == 400 and "不一致" in conflict.json()["detail"]
+    registry = ModelRegistry(settings)
+    for identifier, update in (
+        ("different-timeout", {"timeout_seconds": settings.model.timeout_seconds + 1}),
+        ("different-model", {"model_id": "synthetic/another-offline-model"}),
+    ):
+        registry.save(identifier, "Synthetic mismatch", settings.model.model_copy(update=update))
+        response = m3_client.post("/api/runs", json={**current_body, "model_profile_id": identifier})
+        assert response.status_code == 400 and "模型配置" in response.json()["detail"]
+    assert len(store.list_runs()) == 46
+    response = m3_client.post("/api/runs", json=current_body)
+    assert response.status_code == 200, response.text
+    assert response.json()["request"]["recommendation"] == rolled_back
+    assert response.json()["request"]["skill"] == frozen["skill"]
+    assert store.get(first["id"])["request"] == frozen
+    # Eligibility was synthetic; the actual evaluation and attempts never ran.
+    assert Arena(settings, store).get(synthetic["id"])["state"] == "queued"
+    assert all(store.get(item["run_id"])["usage"]["calls"] == 0 for item in synthetic["attempts"])
+
+
+@pytest.mark.parametrize("invalidated", ["approval_revoked", "snapshot_tampered", "metrics_ineligible"])
+def test_synthetic_current_recommendation_revalidates_before_new_run(
+    m3_client, settings, store, m3_sources, synthetic_eligible_evaluation, invalidated
+):
+    synthetic = synthetic_eligible_evaluation
+    arm = synthetic["skill_version_ids"][0]
+    recommendation = synthetic_promote(m3_client, synthetic, arm)
+    body = recommendation_run_body(m3_client, m3_sources, recommendation)
+    if invalidated == "approval_revoked":
+        response = m3_client.post(
+            f"/api/skills/{arm}/review",
+            json={"status": "rejected", "note": "Synthetic approval revocation fixture"},
+        )
+        assert response.status_code == 200, response.text
+    elif invalidated == "snapshot_tampered":
+        binding = Library(settings, store).get("skill", arm)
+        (Path(binding["context_path"]) / "SKILL.md").write_text("Synthetic snapshot tampering fixture\n")
+    else:
+        synthetic["metrics"]["recommendations"]["reliable"] = []
+        synthetic["metrics"]["arms"][1]["eligibility"] = {
+            "eligible": False, "reasons": ["synthetic_ineligible_fixture"]
+        }
+    before = len(store.list_runs())
+    response = m3_client.post("/api/runs", json=body)
+    assert response.status_code == 400, response.text
+    assert len(store.list_runs()) == before
+    assert m3_client.get("/api/arena/recommendations").json()["current"] == [recommendation]
