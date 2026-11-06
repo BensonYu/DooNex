@@ -1,6 +1,6 @@
 # DooNex 首版架构
 
-更新：2026-11-06 · 状态：M1、M2 已完成受控验收；当前支持多项目及顺序执行/只读审查。适用环境与限制见 [M2 实施记录](M2_IMPLEMENTATION.md)，历史证据见 [M1 实施记录](M1_IMPLEMENTATION.md)。
+更新：2026-11-06 · 状态：M1–M3 已完成受控验收；当前支持多项目、顺序执行/只读审查和手动私有 Skill Arena。适用环境与限制见 [M3 实施记录](M3_IMPLEMENTATION.md)，M2 历史见 [M2 实施记录](M2_IMPLEMENTATION.md)，历史证据见 [M1 实施记录](M1_IMPLEMENTATION.md)。
 
 ## 1. 选择与边界
 

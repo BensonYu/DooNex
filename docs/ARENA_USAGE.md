@@ -1,6 +1,6 @@
 # 私有 Skill Arena 使用说明
 
-更新：2026-11-06。本文描述当前已实现接口及限制，**不表示 M3 已通过验收**。至少 45 个有效尝试的真实评测尚未开始。进度见 [M3 实施记录](M3_IMPLEMENTATION.md)，质量分母和推广门槛见 [竞技规范](SKILL_ARENA.md)。安装、API 与独立 worker 的启动命令仍见 [README](../README.md)。
+更新：2026-11-06。本文描述当前已实现接口及限制；M3 已完成 45 个有效尝试的受控验收，不代表任意模型或 Skill 普遍适用。进度见 [M3 实施记录](M3_IMPLEMENTATION.md)，质量分母和推广门槛见 [竞技规范](SKILL_ARENA.md)。安装、API 与独立 worker 的启动命令仍见 [README](../README.md)。
 
 ## 1. 本地导入与审核
 
