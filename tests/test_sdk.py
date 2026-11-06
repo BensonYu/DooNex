@@ -19,6 +19,131 @@ MODEL = {
 SECRET = "DOONEX_FAKE_SECRET_73a9"
 
 
+def test_review_role_has_trusted_prompt_and_persisted_finish_callback(
+    tmp_path, monkeypatch
+):
+    finishes, requests = [], []
+    report = {"status": "approved", "summary": f"Reviewed {SECRET}", "findings": []}
+
+    def transport(self, **kwargs):
+        requests.append(kwargs)
+        system = kwargs["messages"][0]["content"]
+        assert "read-only code reviewer" in str(system)
+        shell_tool = next(
+            tool
+            for tool in kwargs["tools"]
+            if tool["function"]["name"] == "doonex_shell"
+        )
+        assert "mount is read-only" in shell_tool["function"]["description"]
+        return answer("finish", {"message": json.dumps(report)})
+
+    monkeypatch.setattr(GuardedLLM, "_transport_call", transport)
+    kwargs, *_ = harness(tmp_path, role="reviewer", on_finish=finishes.append)
+    assert run_session(**kwargs) == "finished"
+    assert len(finishes) == 1 and SECRET not in finishes[0]
+    kwargs.update(prompt=None, resume=True)
+    assert run_session(**kwargs) == "finished"
+    assert len(requests) == 1
+    assert finishes[1] == finishes[0]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"status": "approved", "summary": "Looks good", "findings": []},
+        {
+            "status": "changes_requested",
+            "summary": "A fix is needed",
+            "findings": [
+                {
+                    "path": "src/main.py",
+                    "line": 2,
+                    "severity": "high",
+                    "message": "Wrong return value",
+                }
+            ],
+        },
+        {
+            "status": "changes_requested",
+            "summary": "Cannot assess",
+            "findings": [
+                {
+                    "path": None,
+                    "severity": "low",
+                    "message": "Missing acceptance criteria",
+                }
+            ],
+        },
+    ],
+)
+def test_bounded_review_report_schema(payload):
+    from doonex.sdk import parse_review_report
+
+    assert parse_review_report(json.dumps(payload)) == payload
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        [],
+        {"status": [], "summary": "ok", "findings": []},
+        {
+            "status": "approved",
+            "summary": "ok",
+            "findings": [],
+            "snapshot_digest": "forged",
+        },
+        {
+            "status": "approved",
+            "summary": "ok",
+            "findings": [{"path": "x.py", "severity": "low", "message": "issue"}],
+        },
+        {
+            "status": "changes_requested",
+            "summary": "ok",
+            "findings": [{"path": "../x.py", "severity": "high", "message": "issue"}],
+        },
+        {
+            "status": "changes_requested",
+            "summary": "ok",
+            "findings": [
+                {"path": "/etc/passwd", "severity": "high", "message": "issue"}
+            ],
+        },
+        {
+            "status": "changes_requested",
+            "summary": "ok",
+            "findings": [{"path": "C:\\x", "severity": "high", "message": "issue"}],
+        },
+        {
+            "status": "changes_requested",
+            "summary": "ok",
+            "findings": [
+                {"path": None, "line": 1, "severity": "high", "message": "issue"}
+            ],
+        },
+        {
+            "status": "changes_requested",
+            "summary": "ok",
+            "findings": [
+                {"path": "x.py", "line": True, "severity": "high", "message": "issue"}
+            ],
+        },
+        {
+            "status": "changes_requested",
+            "summary": "ok",
+            "findings": [{"path": "x.py", "severity": [], "message": "issue"}],
+        },
+    ],
+)
+def test_invalid_review_report_cannot_approve(payload):
+    from doonex.sdk import ReviewReportError, parse_review_report
+
+    with pytest.raises(ReviewReportError):
+        parse_review_report(json.dumps(payload))
+
+
 def answer(tool, arguments, *, sequence=1, usage=True):
     data = {
         "id": f"response-{sequence}",

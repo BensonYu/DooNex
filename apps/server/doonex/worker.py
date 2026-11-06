@@ -46,6 +46,8 @@ def get_workspace(run, directory):
         path=directory / "workspace",
         repository=Path(run["request"]["repo_path"]),
         base_commit=run["request"]["base_commit"],
+        baseline_path=directory / "baseline" if run.get("baseline_digest") else None,
+        baseline_digest=run.get("baseline_digest"),
     )
 
 
@@ -94,19 +96,30 @@ class Worker:
                     reason="执行服务中断；已保留变更，恢复前须核对未决动作",
                     recovery=result,
                 )
+                assignment = current.get("assignments", {}).get(
+                    current.get("active_assignment")
+                )
+                if assignment and assignment["state"] != "completed":
+                    assignment["state"] = "interrupted"
                 self.store.event(
                     run["id"], "interrupted", {"container_reconciliation": result}, c
                 )
 
     def execute(self, run_id):
         from doonex.evidence import Evidence
+        from doonex.review import Review
         from doonex.sandbox import Sandbox
-        from doonex.sdk import SessionRecoveryRequired, run_session
-        from doonex.workspace import Workspace
+        from doonex.sdk import (
+            ReviewReportError,
+            SessionRecoveryRequired,
+            parse_review_report,
+            run_session,
+        )
+        from doonex.workspace import Workspace, read_files
 
         directory = run_directory(self.settings, run_id)
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        sandbox, ledger = Sandbox(), Ledger(self.store, run_id, self.owner)
+        sandbox = Sandbox()
         run = self.store.get(run_id)
         request = run["request"]
         key = self.settings.credential(request["model"])
@@ -133,56 +146,117 @@ class Worker:
                     Path(request["repo_path"]),
                     request["base_commit"],
                     directory / "workspace",
+                    baseline_path=directory / "baseline",
                 )
+                with self.store.locked(run_id, self.owner) as (_, current):
+                    current["baseline_digest"] = workspace.baseline_digest
             else:
-                workspace = get_workspace(run, directory)
+                workspace = get_workspace(self.store.get(run_id), directory)
                 Workspace.scan(workspace.path)
+                if run.get("assignments") and workspace.baseline_digest is None:
+                    raise ValueError("持久化基线尚未绑定，须核对后重新创建任务")
 
-            def before_model(input_tokens, output_tokens):
-                self.fence()
-                return ledger.reserve(input_tokens, output_tokens)
-
-            def after_model(reservation, usage):
-                self.lease()
-                ledger.settle(reservation, usage)
-
-            def shell(command):
-                self.fence()
-                action_id = ledger.tool_intent(command)
-                current = self.store.get(run_id)
-                remaining = max(
-                    0.1, request["budget"]["max_seconds"] - elapsed(current)
-                )
-                try:
-                    result = sandbox.run(
-                        workspace.path,
-                        command,
-                        min(60, remaining),
-                        run_id,
-                        should_stop=lambda: self.stop_requested(run_id),
+            def execute_role(role, shell_path, *, read_only=False):
+                with self.store.locked(run_id, self.owner) as (c, current):
+                    guard(current)
+                    assignment = current.get("assignments", {}).get(role)
+                    if assignment:
+                        if current.get("active_assignment") != role:
+                            raise Halt("角色分配已改变")
+                        if assignment["state"] == "completed":
+                            raise RuntimeError("已完成的角色不能再次执行")
+                        assignment["state"] = "running"
+                        assignment["started_at"] = assignment.get("started_at") or now()
+                        self.store.event(
+                            run_id,
+                            "assignment_started",
+                            {"assignment_id": assignment["id"], "role": role},
+                            c,
+                        )
+                    generation = (assignment or current).get("session_generation", 0)
+                    session_dir = directory / (
+                        f"session-{role}-{generation}"
+                        if assignment
+                        else f"session-{generation}"
                     )
-                    result = redact(result, secrets)
+                    resume = (assignment or current).get("resume_session", False)
+                    resume = resume and session_dir.exists()
+                ledger = Ledger(self.store, run_id, self.owner)
+                attribution = ledger.attribution()
+
+                def role_stop():
+                    if self.stop_requested(run_id):
+                        return True
+                    current = self.store.get(run_id)
+                    if assignment:
+                        active = current.get("assignments", {}).get(role, {})
+                        return (
+                            current.get("active_assignment") != role
+                            or active.get("id") != assignment["id"]
+                            or active.get("state") != "running"
+                        )
+                    return False
+
+                def role_event(kind, payload):
+                    event(kind, {**payload, **attribution})
+
+                def before_model(input_tokens, output_tokens):
+                    self.fence()
+                    if role_stop():
+                        raise Halt("运行或角色已停止派发新动作")
+                    return ledger.reserve(input_tokens, output_tokens)
+
+                def after_model(reservation, usage):
                     self.lease()
-                    self.store.finish_action(
-                        action_id, "completed", result, owner=self.owner
-                    )
-                    event("tool_finished", {"action_id": action_id, **result})
-                    Workspace.scan(workspace.path)
-                    return result
-                except BaseException:
-                    self.lease()
-                    self.store.finish_action(
-                        action_id,
-                        "unknown",
-                        {"reason": "工具结果未完整记录"},
-                        owner=self.owner,
-                    )
-                    raise
+                    ledger.settle(reservation, usage)
 
-            if run.get("phase") != "verification":
-                generation = run.get("session_generation", 0)
-                session_dir = directory / f"session-{generation}"
-                resume = run.get("resume_session", False) and session_dir.exists()
+                def shell(command):
+                    self.fence()
+                    if role_stop():
+                        raise Halt("运行或角色已停止派发新动作")
+                    action_id = ledger.tool_intent(command)
+                    remaining = max(
+                        0.1,
+                        request["budget"]["max_seconds"]
+                        - elapsed(self.store.get(run_id)),
+                    )
+                    try:
+                        options = {"read_only": True} if read_only else {}
+                        result = sandbox.run(
+                            shell_path,
+                            command,
+                            min(60, remaining),
+                            run_id,
+                            should_stop=role_stop,
+                            **options,
+                        )
+                        result = redact(result, secrets)
+                        self.lease()
+                        self.store.finish_action(
+                            action_id, "completed", result, owner=self.owner
+                        )
+                        role_event("tool_finished", {"action_id": action_id, **result})
+                        if read_only:
+                            saved_handoff = self.store.get(run_id).get("handoff")
+                            if not Review.inspect(workspace, directory, saved_handoff)[
+                                "valid"
+                            ]:
+                                raise RuntimeError(
+                                    "审查工具结束时交接材料或代码快照发生变化"
+                                )
+                        else:
+                            Workspace.scan(shell_path)
+                        return result
+                    except BaseException:
+                        self.lease()
+                        self.store.finish_action(
+                            action_id,
+                            "unknown",
+                            {"reason": "工具结果未完整记录"},
+                            owner=self.owner,
+                        )
+                        raise
+
                 prompt = (
                     None
                     if resume
@@ -190,12 +264,23 @@ class Worker:
                     + "\n预先约定的验收命令：\n"
                     + "\n".join(request["checks"])
                 )
-                if generation:
+                if role == "reviewer" and not resume:
+                    prompt = (
+                        "只读审查执行者的固定代码快照。原始任务：\n"
+                        + request["prompt"]
+                        + "\n预先约定的验收命令（审查结论不替代实际验证）：\n"
+                        + "\n".join(request["checks"])
+                        + "\n上下文：/workspace/before、/workspace/after、"
+                        "/workspace/diff.patch、/workspace/handoff.json。"
+                        "依照系统格式用 finish 返回结构化审查，不做修改。"
+                    )
+                if generation and not resume:
                     prompt = (
                         (prompt or request["prompt"])
-                        + "\n这是经用户确认后的中断续接。工作区已保留上次改动。先检查现有文件状态，勿盲目重放上次动作。验收条件：\n"
+                        + "\n这是经用户确认后的中断续接。上下文已保留。先检查现有状态，勿盲目重放上次动作。验收条件：\n"
                         + "\n".join(request["checks"])
                     )
+                finishes = []
                 result = run_session(
                     run_id=run_id,
                     state_dir=session_dir,
@@ -217,15 +302,116 @@ class Worker:
                     before_model=before_model,
                     after_model=after_model,
                     shell=shell,
-                    on_event=lambda payload: event("sdk", payload),
-                    should_stop=lambda: self.stop_requested(run_id),
+                    on_event=lambda payload: role_event("sdk", payload),
+                    should_stop=role_stop,
                     resume=resume,
+                    role=role,
+                    on_finish=finishes.append,
                 )
-                current = self.store.get(run_id)
-                if self.stop_requested(run_id):
+                if role_stop():
                     raise Halt("运行已停止或时长用尽")
                 if result != "finished":
                     raise RuntimeError("SDK 未确认任务完成：" + str(result))
+                return finishes[-1] if finishes else None
+
+            def complete_role(role, **updates):
+                with self.store.locked(run_id, self.owner) as (c, current):
+                    guard(current)
+                    assignment = current.get("assignments", {}).get(role)
+                    if assignment:
+                        if current.get("active_assignment") != role:
+                            raise Halt("角色分配已改变")
+                        assignment.update(state="completed", ended_at=now())
+                        self.store.event(
+                            run_id,
+                            "assignment_completed",
+                            {"assignment_id": assignment["id"], "role": role},
+                            c,
+                        )
+                    current.update(updates)
+
+            run = self.store.get(run_id)
+            review_required = request.get("workflow", "execute") == "execute_review"
+            if run.get("phase", "execution") == "execution":
+                executor = run.get("assignments", {}).get("executor", {})
+                if executor.get("state") != "completed":
+                    execute_role("executor", workspace.path)
+                    # Persist completion before preparing another role. A crash
+                    # here must not rerun a completed executor.
+                    complete_role("executor")
+                if review_required:
+                    handoff = Review.prepare(workspace, directory, run_id)
+                    if not Review.inspect(workspace, directory, handoff)["valid"]:
+                        raise RuntimeError("审查交接材料完整性检查失败")
+                    with self.store.locked(run_id, self.owner) as (c, current):
+                        guard(current)
+                        if "reviewer" not in current.get("assignments", {}):
+                            raise ValueError("缺少审查角色分配")
+                        current.update(
+                            handoff=handoff,
+                            phase="review",
+                            active_assignment="reviewer",
+                            reason="只读审查固定代码快照",
+                        )
+                        self.store.event(run_id, "review_prepared", handoff, c)
+                else:
+                    with self.store.locked(run_id, self.owner) as (_, current):
+                        guard(current)
+                        current["phase"] = "verification"
+
+            run = self.store.get(run_id)
+            if run.get("phase") == "review":
+                handoff = run.get("handoff")
+                if (
+                    not handoff
+                    or not Review.inspect(workspace, directory, handoff)["valid"]
+                ):
+                    raise RuntimeError("已保存的审查交接材料完整性检查失败")
+                message = execute_role(
+                    "reviewer", Path(handoff["context_path"]), read_only=True
+                )
+                if not Review.inspect(workspace, directory, handoff)["valid"]:
+                    raise RuntimeError("审查期间固定快照或交接材料发生变化")
+                try:
+                    review = parse_review_report(message)
+                    after = read_files(Path(handoff["context_path"]) / "after")
+                    before = read_files(Path(handoff["context_path"]) / "before")
+                    for finding in review["findings"]:
+                        path = finding["path"]
+                        if not path:
+                            continue
+                        if path not in after and path not in before:
+                            raise ReviewReportError(
+                                "审查问题引用了固定快照中不存在的文件"
+                            )
+                        if path not in after:
+                            finding["side"] = "before"
+                        content = (after[path] if path in after else before[path]).data
+                        lines = max(
+                            1, content.count(b"\n") + (not content.endswith(b"\n"))
+                        )
+                        line = finding.get("line")
+                        if line is not None and line > lines:
+                            raise ReviewReportError("审查问题行号超出固定文件范围")
+                    review["valid"] = True
+                except ReviewReportError as error:
+                    review = {
+                        "status": "changes_requested",
+                        "summary": "审查未提供有效结构化结果",
+                        "findings": [],
+                        "valid": False,
+                        "errors": [str(error)],
+                    }
+                review.update(
+                    assignment_id=run["assignments"]["reviewer"]["id"],
+                    snapshot_digest=handoff["snapshot_digest"],
+                )
+                complete_role("reviewer", review=review, phase="verification")
+                event("review_completed", {**review, "role": "reviewer"})
+
+            run = self.store.get(run_id)
+            if run.get("phase") != "verification":
+                raise RuntimeError("执行阶段未知，拒绝自动重放")
             with self.store.locked(run_id, self.owner) as (c, current):
                 guard(current)
                 current.update(
@@ -283,6 +469,20 @@ class Worker:
                 and inspection.get("verified", False)
                 and report.get("commands") == request["checks"]
             )
+            if review_required:
+                review, handoff = current.get("review", {}), current.get("handoff")
+                reviewer = current.get("assignments", {}).get("reviewer", {})
+                verified = bool(
+                    verified
+                    and handoff
+                    and Review.inspect(workspace, directory, handoff)["valid"]
+                    and review.get("valid") is True
+                    and review.get("status") == "approved"
+                    and reviewer.get("state") == "completed"
+                    and review.get("assignment_id") == reviewer.get("id")
+                    and review.get("snapshot_digest") == handoff["snapshot_digest"]
+                    and report.get("snapshot_digest") == handoff["snapshot_digest"]
+                )
             state = (
                 "completed_verified"
                 if verified
@@ -295,6 +495,8 @@ class Worker:
                     state=state,
                     reason="固定快照通过全部检查"
                     if verified
+                    else "检查通过，但审查要求修改或审查证据无效"
+                    if passed and review_required
                     else "检查未通过或证据尚不完整",
                     evidence=report,
                 )
@@ -331,6 +533,11 @@ class Worker:
                 else:
                     state = "failed"
                 self.store.mark_pending_unknown(run_id, c, current)
+                assignment = current.get("assignments", {}).get(
+                    current.get("active_assignment")
+                )
+                if assignment and assignment["state"] != "completed":
+                    assignment["state"] = state
                 current.update(state=state, reason=reason, recovery=cleanup)
                 self.store.event(run_id, state, {"reason": reason}, c)
                 self.store.event(run_id, "cleanup", cleanup, c)

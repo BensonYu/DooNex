@@ -26,13 +26,48 @@ def guard(run):
 
 
 class Ledger:
-    def __init__(self, store, run_id, owner=None):
+    def __init__(self, store, run_id, owner=None, *, assignment_id=None, role=None):
         self.store, self.run_id = store, run_id
         self.owner = owner
+        if (assignment_id is None) != (role is None):
+            raise ValueError("角色与分配标识必须同时提供")
+        if role is None:
+            # Existing callers can bind the current role once. Never look it up
+            # again at dispatch time: an old callback must not act as a new role.
+            run = store.get(run_id)
+            active = run.get("active_assignment")
+            assignment = run.get("assignments", {}).get(active)
+            if assignment:
+                role, assignment_id = active, assignment["id"]
+        self.assignment_id, self.role = assignment_id, role
+
+    def attribution(self):
+        return (
+            {"assignment_id": self.assignment_id, "role": self.role}
+            if self.role is not None
+            else {}
+        )
+
+    def usages(self, run, *, dispatch=False):
+        if self.role is None:
+            if run.get("assignments"):
+                raise Halt("角色分配已改变，旧回调不得继续派发或结算")
+            return [run["usage"]]
+        assignment = run.get("assignments", {}).get(self.role)
+        if (
+            not assignment
+            or assignment["id"] != self.assignment_id
+            or assignment["role"] != self.role
+            or run.get("active_assignment") != self.role
+            or (dispatch and assignment["state"] == "completed")
+        ):
+            raise Halt("角色分配已改变，旧回调不得继续派发或结算")
+        return [run["usage"], assignment["usage"]]
 
     def reserve(self, input_tokens, output_tokens):
         with self.store.locked(self.run_id, self.owner) as (c, run):
             guard(run)
+            usages = self.usages(run, dispatch=True)
             model, limits, usage = (
                 run["request"]["model"],
                 run["request"]["budget"],
@@ -80,12 +115,14 @@ class Ledger:
                 "output_tokens": output_tokens,
                 "tokens": tokens,
                 "cost": cost,
+                **self.attribution(),
             }
             action_id = self.store.action(self.run_id, "model", reservation, c)
-            usage["calls"] += 1
-            usage["reserved_tokens"] += tokens
-            if cost is not None:
-                usage["reserved_cost_usd"] += cost
+            for item in usages:
+                item["calls"] += 1
+                item["reserved_tokens"] += tokens
+                if cost is not None:
+                    item["reserved_cost_usd"] += cost
             self.store.event(
                 self.run_id,
                 "model_reserved",
@@ -97,12 +134,28 @@ class Ledger:
     def settle(self, reservation, actual):
         with self.store.locked(self.run_id, self.owner) as (c, run):
             existing = c.execute(
-                "SELECT status FROM actions WHERE id=%s FOR UPDATE",
+                "SELECT run_id,kind,status,data FROM actions WHERE id=%s FOR UPDATE",
                 (reservation["id"],),
             ).fetchone()
+            if (
+                not existing
+                or str(existing["run_id"]) != self.run_id
+                or existing["kind"] != "model"
+                or any(
+                    existing["data"].get(key) != value
+                    for key, value in self.attribution().items()
+                )
+                or (
+                    self.role is None
+                    and existing["data"].get("assignment_id") is not None
+                )
+            ):
+                raise ValueError("模型请求不属于当前运行与角色")
             if existing["status"] != "pending":
                 raise ValueError("模型请求已结算")
-            usage, model = run["usage"], run["request"]["model"]
+            # The persisted reservation is authoritative, not callback data.
+            reservation = {**existing["data"], "id": reservation["id"]}
+            usages, model = self.usages(run), run["request"]["model"]
             valid = actual is not None and all(
                 isinstance(actual.get(k), int)
                 and not isinstance(actual[k], bool)
@@ -110,7 +163,8 @@ class Ledger:
                 for k in ("input_tokens", "output_tokens")
             )
             if not valid:
-                usage["unknown_calls"] += 1
+                for usage in usages:
+                    usage["unknown_calls"] += 1
                 self.store.finish_action(
                     reservation["id"],
                     "unknown",
@@ -120,43 +174,63 @@ class Ledger:
                 self.store.event(
                     self.run_id,
                     "model_usage_unknown",
-                    {"action_id": reservation["id"]},
+                    {"action_id": reservation["id"], **self.attribution()},
                     c,
                 )
                 return
-            usage["reserved_tokens"] -= reservation["tokens"]
-            usage["tokens"] += actual["input_tokens"] + actual["output_tokens"]
             cost = None
             if reservation["cost"] is not None:
-                usage["reserved_cost_usd"] = max(
-                    0, usage["reserved_cost_usd"] - reservation["cost"]
-                )
                 cost = (
                     actual["input_tokens"] * model["input_price_per_million"]
                     + actual["output_tokens"] * model["output_price_per_million"]
                 ) / 1_000_000
-                usage["cost_usd"] += cost
+            for usage in usages:
+                usage["reserved_tokens"] -= reservation["tokens"]
+                usage["tokens"] += actual["input_tokens"] + actual["output_tokens"]
+                if cost is not None:
+                    usage["reserved_cost_usd"] = max(
+                        0, usage["reserved_cost_usd"] - reservation["cost"]
+                    )
+                    usage["cost_usd"] += cost
             self.store.finish_action(
                 reservation["id"],
                 "completed",
-                {"usage": actual, "estimated_cost_usd": cost},
+                {
+                    "action_id": reservation["id"],
+                    "usage": actual,
+                    "estimated_cost_usd": cost,
+                    **self.attribution(),
+                },
                 c,
             )
             self.store.event(
                 self.run_id,
                 "model_settled",
-                {"usage": actual, "estimated_cost_usd": cost},
+                {
+                    "action_id": reservation["id"],
+                    "usage": actual,
+                    "estimated_cost_usd": cost,
+                    **self.attribution(),
+                },
                 c,
             )
 
     def tool_intent(self, command):
         with self.store.locked(self.run_id, self.owner) as (c, run):
             guard(run)
-            action_id = self.store.action(self.run_id, "shell", {"command": command}, c)
+            self.usages(run, dispatch=True)
+            action_id = self.store.action(
+                self.run_id, "shell", {"command": command, **self.attribution()}, c
+            )
             self.store.event(
                 self.run_id,
                 "tool_started",
-                {"action_id": action_id, "command": command, "started_at": now()},
+                {
+                    "action_id": action_id,
+                    "command": command,
+                    "started_at": now(),
+                    **self.attribution(),
+                },
                 c,
             )
         return action_id
