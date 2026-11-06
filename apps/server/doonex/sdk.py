@@ -1,0 +1,380 @@
+"""Pinned OpenHands integration; task code only runs through the shell callback.
+
+The small private overrides below disable SDK 1.60.1's ambient discovery and
+tool bootstrap. They do not replace its model protocol, agent loop or event log.
+Upgrade the SDK only after running the boundary and recovery contract tests.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import threading
+import uuid
+from collections.abc import Callable
+from contextlib import contextmanager
+from importlib.metadata import version
+from pathlib import Path
+from typing import Any, ClassVar
+
+from openhands.sdk import LLM, Agent
+from openhands.sdk.context import AgentContext
+from openhands.sdk.conversation.impl.local_conversation import LocalConversation
+from openhands.sdk.conversation.state import (
+    ConversationExecutionStatus,
+    ConversationState,
+)
+from openhands.sdk.tool import Tool, ToolDefinition, ToolExecutor
+from openhands.sdk.tool.builtins import FinishTool
+from openhands.sdk.tool.schema import Action, Observation
+from pydantic import Field, PrivateAttr, SecretStr
+
+SDK_VERSION = "1.60.1"
+_RUN_LOCK = threading.Lock()
+_CALLBACKS: dict[str, tuple[Callable[[str], dict], Callable[[], bool]]] = {}
+
+
+class SessionStopped(Exception):
+    """A user stop request prevented a new model or tool action."""
+
+
+class SessionRecoveryRequired(RuntimeError):
+    """An action without a recorded outcome needs explicit reconciliation."""
+
+
+class ModelCallError(RuntimeError):
+    """A provider failed; the raw exception may contain credentials."""
+
+
+def _redact(value: Any, secret: str) -> Any:
+    if isinstance(value, str):
+        return value.replace(secret, "[REDACTED]") if secret else value
+    if isinstance(value, dict):
+        return {
+            _redact(key, secret): _redact(item, secret) for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact(item, secret) for item in value]
+    return value
+
+
+class _SecretFilter(logging.Filter):
+    def __init__(self, secret: str):
+        super().__init__()
+        self.secret = secret
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = _redact(record.getMessage(), self.secret)
+        record.args = ()
+        if record.exc_info:
+            import traceback
+
+            record.exc_text = _redact(
+                "".join(traceback.format_exception(*record.exc_info)), self.secret
+            )
+            record.exc_info = None
+        if record.exc_text:
+            record.exc_text = _redact(record.exc_text, self.secret)
+        return True
+
+
+@contextmanager
+def _filtered_logs(secret: str):
+    redactor = _SecretFilter(secret)
+    loggers = [logging.getLogger()]
+    loggers.extend(
+        item
+        for item in logging.Logger.manager.loggerDict.values()
+        if isinstance(item, logging.Logger)
+    )
+    handlers = {handler for logger in loggers for handler in logger.handlers}
+    for handler in handlers:
+        handler.addFilter(redactor)
+    try:
+        yield
+    finally:
+        for handler in handlers:
+            handler.removeFilter(redactor)
+
+
+class GuardedLLM(LLM):
+    """Reserve before each request; never treat unknown usage as zero."""
+
+    _before: Callable[[int, int], object] = PrivateAttr()
+    _after: Callable[[object, dict | None], None] = PrivateAttr()
+    _stop: Callable[[], bool] = PrivateAttr()
+
+    def bind(self, before, after, should_stop) -> None:
+        self._before, self._after, self._stop = before, after, should_stop
+
+    def completion(self, messages, tools=None, **kwargs):
+        if self._stop():
+            raise SessionStopped("Execution stopped before a model request")
+        # Bytes plus framing overhead is deliberately conservative, not a claim
+        # of an exact provider tokenizer. Tool schemas and system text count.
+        payload = {
+            "messages": [message.model_dump(mode="json") for message in messages],
+            "tools": [tool.to_openai_tool() for tool in tools or []],
+        }
+        estimate = len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) + 1024
+        if estimate > self.max_input_tokens:
+            raise ValueError("Conversation exceeds the configured input token bound")
+        reservation = self._before(estimate, self.max_output_tokens)
+        try:
+            response = super().completion(messages, tools, **kwargs)
+        except Exception as error:  # noqa: BLE001 -- providers expose heterogeneous exceptions
+            self._after(reservation, None)
+            raise ModelCallError(
+                f"Model request failed ({type(error).__name__})"
+            ) from None
+        usage = getattr(response.raw_response, "usage", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        measured = None
+        if (
+            type(prompt_tokens) is int
+            and type(completion_tokens) is int
+            and prompt_tokens >= 0
+            and completion_tokens >= 0
+        ):
+            measured = {
+                "input_tokens": prompt_tokens,
+                "output_tokens": completion_tokens,
+            }
+        self._after(reservation, measured)
+        response.message = type(response.message).model_validate(
+            _redact(
+                response.message.model_dump(mode="json"),
+                self.api_key.get_secret_value(),
+            )
+        )
+        return response
+
+    def responses(self, *args, **kwargs):
+        raise ValueError("M1 currently supports the chat completion API only")
+
+    async def acompletion(self, *args, **kwargs):
+        raise ValueError("M1 uses a synchronous worker with bounded requests")
+
+    async def aresponses(self, *args, **kwargs):
+        raise ValueError("M1 currently supports the chat completion API only")
+
+
+class ShellAction(Action):
+    command: str = Field(min_length=1, max_length=65536)
+
+
+class ShellObservation(Observation):
+    exit_code: int | None = None
+
+
+class _ShellExecutor(ToolExecutor):
+    def __init__(self, callback, stop):
+        self.callback, self.stop = callback, stop
+
+    def __call__(self, action, conversation=None):
+        if self.stop():
+            raise SessionStopped("Execution stopped before a shell action")
+        result = self.callback(action.command)
+        return ShellObservation.from_text(
+            json.dumps(result, ensure_ascii=False),
+            exit_code=result.get("exit_code"),
+            is_error=result.get("exit_code") != 0,
+        )
+
+
+class ShellTool(ToolDefinition[ShellAction, ShellObservation]):
+    name: ClassVar[str] = "doonex_shell"
+
+    @classmethod
+    def create(cls, conv_state=None, *, run_id: str):
+        callback, stop = _CALLBACKS[run_id]
+        return [
+            cls(
+                action_type=ShellAction,
+                observation_type=ShellObservation,
+                executor=_ShellExecutor(callback, stop),
+                description=(
+                    "Execute one bounded shell command in the isolated task container. "
+                    "The current directory is /workspace. Each call starts a fresh shell. "
+                    "No network is available. Use python to inspect or edit project files. "
+                    "Only /workspace is writable and retained. Do not background processes."
+                ),
+            )
+        ]
+
+
+class _M1Agent(Agent):
+    def _initialize(self, state):
+        # SDK's ordinary bootstrap can add host-backed vision/profile tools.
+        # Materialize only these two known definitions instead.
+        if not self._initialized:
+            tools = [*ShellTool.create(state, run_id=self.tools[0].params["run_id"])]
+            tools.extend(FinishTool.create(state))
+            self._tools = {tool.name: tool for tool in tools}
+            self._initialized = True
+
+    def get_all_llms(self):
+        # Upstream's default excludes LLM subclasses, including GuardedLLM.
+        yield self.llm
+
+
+class _M1Conversation(LocalConversation):
+    def _ensure_plugins_loaded(self):
+        self._plugins_loaded = True
+
+    def _register_file_based_agents(self):
+        return None
+
+    def _runtime_mcp_tools_for_agent(self):
+        return []
+
+    def _maybe_inject_path_rules(self, event):
+        return event
+
+
+def run_session(
+    *,
+    run_id: str,
+    state_dir: Path,
+    prompt: str | None,
+    model: dict,
+    api_key: str,
+    before_model: Callable[[int, int], object],
+    after_model: Callable[[object, dict | None], None],
+    shell: Callable[[str], dict],
+    on_event: Callable[[dict], None],
+    should_stop: Callable[[], bool],
+    resume: bool = False,
+) -> str:
+    """Run/resume one SDK conversation; model credentials remain in this process.
+
+    The caller owns container isolation, action timeouts, persistent budget
+    reservations, process ownership and crash reconciliation. A recorded action
+    without its observation blocks SDK resume to prevent automatic replay.
+    """
+    if version("openhands-sdk") != SDK_VERSION:
+        raise RuntimeError(f"OpenHands SDK must be pinned to {SDK_VERSION}")
+    if model.get("api_mode", "chat") != "chat":
+        raise ValueError("M1 currently supports the chat completion API only")
+    if not api_key:
+        raise ValueError("Model API credential is missing")
+    state_dir = Path(state_dir).resolve()
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    control_dir = state_dir / "control"
+    control_dir.mkdir(exist_ok=True, mode=0o700)
+    if any(control_dir.iterdir()):
+        raise ValueError("The SDK control directory must remain empty")
+    conversation_id = uuid.uuid5(uuid.NAMESPACE_URL, f"doonex:{run_id}")
+    saved_path = Path(LocalConversation.get_persistence_dir(state_dir, conversation_id))
+    exists = (saved_path / "base_state.json").is_file()
+    if resume != exists:
+        raise ValueError("SDK resume flag does not match persisted conversation state")
+    if not resume and not prompt:
+        raise ValueError("A new conversation requires a prompt")
+
+    model_id = model["model_id"]
+    provider = model.get("provider")
+    if provider and not model_id.startswith(f"{provider}/"):
+        model_id = f"{provider}/{model_id}"
+    llm = GuardedLLM(
+        model=model_id,
+        api_mode="chat",
+        api_key=SecretStr(api_key),
+        base_url=model.get("base_url"),
+        usage_id="doonex-agent",
+        num_retries=0,
+        caching_prompt=False,
+        fallback_strategy=None,
+        log_completions=False,
+        stream=False,
+        timeout=model["timeout_seconds"],
+        max_input_tokens=model["max_input_tokens"],
+        max_output_tokens=model["max_output_tokens"],
+    )
+    llm.bind(before_model, after_model, should_stop)
+    agent = _M1Agent(
+        llm=llm,
+        tools=[Tool(name=ShellTool.name, params={"run_id": run_id})],
+        include_default_tools=["FinishTool"],
+        condenser=None,
+        critic=None,
+        mcp_config={},
+        tool_concurrency_limit=1,
+        system_prompt=(
+            "You are DooNex's single coding agent. Complete the authorized task using "
+            "only doonex_shell, then call finish. The shell runs in /workspace in an "
+            "isolated container; your local SDK directory is not the project. Use "
+            "relative paths or /workspace. Each shell call is stateless and bounded. "
+            "There is no network or access to host credentials. Follow the supplied "
+            "acceptance criteria. Report limitations honestly. Your finish message "
+            "does not establish verification; DooNex runs the acceptance checks."
+        ),
+        system_prompt_kwargs={"soul_content": "DooNex single-agent worker"},
+        agent_context=AgentContext(
+            skills=[],
+            load_user_skills=False,
+            load_public_skills=False,
+            load_project_skills=False,
+            load_memory=False,
+            registered_marketplaces=[],
+        ),
+    )
+
+    # One SDK session per worker process; callback references never serialize.
+    with _RUN_LOCK, _filtered_logs(api_key):
+        _CALLBACKS[run_id] = (shell, should_stop)
+        conversation = None
+        try:
+            conversation = _M1Conversation(
+                agent=agent,
+                workspace=control_dir,
+                persistence_dir=state_dir,
+                conversation_id=conversation_id,
+                callbacks=[
+                    lambda event: on_event(
+                        _redact(event.model_dump(mode="json"), api_key)
+                    )
+                ],
+                visualizer=None,
+                plugins=[],
+                hook_config=None,
+                profile_store_dir=state_dir / "profiles",
+                delete_on_close=False,
+                max_iteration_per_run=10000,
+            )
+            # The default callback persists before user callbacks. Scrub at its
+            # input boundary so an echoed key cannot enter SDK event files.
+            original_on_event = conversation._on_event
+
+            def safe_event(event):
+                cleaned = _redact(event.model_dump(mode="json"), api_key)
+                original_on_event(type(event).model_validate(cleaned))
+
+            conversation._on_event = safe_event
+            if resume and ConversationState.get_unmatched_actions(
+                conversation.state.active_branch()
+            ):
+                raise SessionRecoveryRequired(
+                    "An SDK action has no recorded outcome; reconcile it before resuming"
+                )
+            if prompt:
+                conversation.send_message(prompt)
+            if should_stop():
+                conversation.pause()
+                return "paused"
+            try:
+                conversation.run()
+            except Exception:
+                if should_stop():
+                    with conversation._state:
+                        conversation._state.execution_status = (
+                            ConversationExecutionStatus.PAUSED
+                        )
+                    return "paused"
+                raise
+            return conversation.state.execution_status.value
+        finally:
+            if conversation is not None:
+                conversation.close()
+            _CALLBACKS.pop(run_id, None)
