@@ -1,11 +1,32 @@
 """One worker, finite authorizations and provable foreground dispatch priority."""
 
+from copy import deepcopy
+
 from doonex.budget import BatchHalt, elapsed
 from doonex.store import dispatch_lock, now, termination_unknown
 
 
 class Yielded(BaseException):
     """The SDK or verifier has persisted a safe scheduling checkpoint."""
+
+
+def ledger_checkpoint(run):
+    """Only fields that must remain fixed while a scheduling yield is dormant."""
+    return deepcopy(
+        {
+            "usage": run["usage"],
+            "active_assignment": run.get("active_assignment"),
+            "phase": run.get("phase"),
+            "first_started_at": run.get("first_started_at"),
+            "assignments": {
+                role: {
+                    key: value.get(key)
+                    for key in ("id", "role", "session_generation", "usage")
+                }
+                for role, value in run.get("assignments", {}).items()
+            },
+        }
+    )
 
 
 def queued_work(connection, *, foreground=False):
@@ -83,6 +104,7 @@ class Scheduler:
                 raise ValueError("存在未决用量或动作，不能自动续接")
             run["scheduling"] = {
                 "receipt": receipt,
+                "ledger": ledger_checkpoint(run),
                 "workspace_digest": workspace_digest,
                 "at": now(),
                 "reason": "前台任务优先，后台已安全让出",
@@ -116,6 +138,7 @@ class Scheduler:
             if (
                 saved.get("receipt") != receipt
                 or saved.get("workspace_digest") != workspace_digest
+                or saved.get("ledger") != ledger_checkpoint(run)
             ):
                 return False
             if run["usage"]["reserved_tokens"] or run["usage"]["unknown_calls"]:
@@ -154,6 +177,8 @@ class Scheduler:
                 self.preflight(c, current)
                 if current["state"] != "yielded" or current.get("scheduling") != saved:
                     return False
+                if saved.get("ledger") != ledger_checkpoint(current):
+                    raise ValueError("后台账本或会话归属已变化，不能自动续接")
                 if elapsed(current) >= current["request"]["budget"]["max_seconds"]:
                     raise BatchHalt(
                         "原后台运行时长已达上限",

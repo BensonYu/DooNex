@@ -310,7 +310,19 @@ def test_sdk_and_verifier_yield_resume_without_replaying_completed_actions(
 
 
 @pytest.mark.docker
-@pytest.mark.parametrize("tamper", ["workspace", "receipt", "unknown", "clock"])
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "workspace",
+        "receipt",
+        "unknown",
+        "clock",
+        "usage",
+        "role_usage",
+        "generation",
+        "assignment",
+    ],
+)
 def test_no_automatic_resume_for_drift_missing_receipt_unknown_or_expired_clock(
     tuning, store, request_data, monkeypatch, tamper
 ):
@@ -342,6 +354,14 @@ def test_no_automatic_resume_for_drift_missing_receipt_unknown_or_expired_clock(
                 current["first_started_at"] = (
                     datetime.now(UTC) - timedelta(hours=1)
                 ).isoformat()
+            elif tamper == "usage":
+                current["usage"]["calls"] -= 1
+            elif tamper == "role_usage":
+                current["assignments"]["executor"]["usage"]["tokens"] -= 1
+            elif tamper == "generation":
+                current["assignments"]["executor"]["session_generation"] += 1
+            elif tamper == "assignment":
+                current["assignments"]["executor"]["id"] = "changed-assignment"
             else:
                 store.action(run_id, "shell", {"command": "unknown effect"}, c)
     Worker(settings).run(once=True)
