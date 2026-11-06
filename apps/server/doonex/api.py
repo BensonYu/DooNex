@@ -18,26 +18,23 @@ from doonex.worker import get_workspace, run_directory
 
 
 def git(repository, *args):
-    # Disable user/repository hooks, fsmonitor and external diff/filter helpers.
-    result = subprocess.run(
-        [
-            "git",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            "-C",
-            str(repository),
-            *args,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
-    if result.returncode:
-        raise ValueError("Git 操作失败：" + result.stderr[:500])
-    return result.stdout.strip()
+    from doonex.workspace import _git
+
+    return _git(Path(repository), *args).stdout.decode(errors="replace").strip()
+
+
+def branch(repository):
+    from doonex.workspace import _git
+
+    result = _git(Path(repository), "symbolic-ref", "--quiet", "HEAD", check=False)
+    return result.stdout.decode().strip() if result.returncode == 0 else None
+
+
+def identifier(value):
+    try:
+        return str(UUID(value))
+    except ValueError:
+        raise HTTPException(404, "记录不存在")
 
 
 def create_app(settings=None):
@@ -79,9 +76,22 @@ def create_app(settings=None):
         )
         return response
 
-    def authenticated(authorization: str = Header(default="")):
+    def authenticated(request: Request, authorization: str = Header(default="")):
         if not hmac.compare_digest(authorization, "Bearer " + settings.token):
             raise HTTPException(401, "请输入本机访问令牌")
+        # Project context is supplied by each browser request, never stored as a
+        # mutable server-wide selection. Reject a stale/wrong context before any
+        # run read, control action or artifact access.
+        project_id = request.query_params.get("project_id")
+        if project_id is not None:
+            project_id = identifier(project_id)
+            store.project(project_id)
+            run_id = request.path_params.get("run_id")
+            if (
+                run_id
+                and store.get(identifier(run_id))["request"]["project_id"] != project_id
+            ):
+                raise HTTPException(404, "运行不属于所选项目")
 
     auth = [Depends(authenticated)]
 
@@ -102,11 +112,16 @@ def create_app(settings=None):
         return JSONResponse({"detail": "记录不存在"}, status_code=404)
 
     def load_run(run_id):
-        try:
-            run_id = str(UUID(run_id))
-        except ValueError:
-            raise HTTPException(404, "记录不存在")
+        run_id = identifier(run_id)
         run = store.get(run_id)
+        review_integrity = None
+        if run.get("handoff"):
+            from doonex.review import Review
+
+            directory = run_directory(settings, run_id)
+            review_integrity = Review.inspect(
+                get_workspace(run, directory), directory, run["handoff"]
+            )
         if run["state"] == "completed_verified":
             from doonex.evidence import Evidence
 
@@ -121,6 +136,16 @@ def create_app(settings=None):
                 or not (run.get("evidence") or {}).get("report_sha256")
                 or (result.get("report") or {}).get("commands")
                 != run["request"]["checks"]
+                or (
+                    run["request"].get("workflow") == "execute_review"
+                    and (
+                        not review_integrity
+                        or not review_integrity.get("valid")
+                        or (run.get("review") or {}).get("status") != "approved"
+                        or (run.get("review") or {}).get("snapshot_digest")
+                        != (run.get("evidence") or {}).get("snapshot_digest")
+                    )
+                )
             ):
                 run = store.transition(
                     run_id,
@@ -128,6 +153,8 @@ def create_app(settings=None):
                     "代码或证据已变化，旧验证失效",
                     allowed={"completed_verified"},
                 )
+        if review_integrity is not None:
+            run["review_integrity"] = review_integrity
         return run
 
     @app.get("/api/settings", dependencies=auth)
@@ -146,6 +173,15 @@ def create_app(settings=None):
     def project():
         return store.project()
 
+    @app.get("/api/projects", dependencies=auth)
+    def projects():
+        return store.list_projects()
+
+    @app.get("/api/projects/{project_id}", dependencies=auth)
+    def selected_project(project_id: str):
+        return store.project(identifier(project_id))
+
+    @app.post("/api/projects", dependencies=auth)
     @app.post("/api/project", dependencies=auth)
     def register(body: ProjectInput):
         from doonex.workspace import Workspace, WorkspaceError
@@ -157,7 +193,8 @@ def create_app(settings=None):
                 "无法注册项目：路径不存在、不可访问或不是受支持的 Git 仓库"
             ) from error
         data = {
-            "id": (store.project() or {}).get("id", str(uuid4())),
+            "id": str(uuid4()),
+            "name": repository.name,
             "path": str(repository),
             "head": git(repository, "rev-parse", "HEAD"),
             "dirty": bool(
@@ -167,14 +204,24 @@ def create_app(settings=None):
         return store.set_project(data)
 
     @app.get("/api/runs", dependencies=auth)
-    def runs():
-        return [load_run(r["id"]) for r in store.list_runs()]
+    def runs(project_id: str | None = None):
+        if project_id is not None:
+            project_id = identifier(project_id)
+            store.project(project_id)
+        elif len(store.list_projects()) > 1:
+            raise ValueError("存在多个项目，请明确选择项目")
+        return [load_run(r["id"]) for r in store.list_runs(project_id=project_id)]
 
     @app.post("/api/runs", dependencies=auth)
-    def start(body: RunInput):
-        registered = store.project()
+    def start(body: RunInput, http_request: Request):
+        registered = store.project(
+            identifier(body.project_id) if body.project_id else None
+        )
         if not registered:
             raise ValueError("请先注册项目")
+        context = http_request.query_params.get("project_id")
+        if context and identifier(context) != registered["id"]:
+            raise ValueError("创建请求的项目与当前项目上下文不一致")
         if not settings.model or not settings.credential():
             raise ValueError("请先在服务端配置模型和凭据；模型 API 预算需单独授权")
         model = settings.model
@@ -193,8 +240,10 @@ def create_app(settings=None):
         request = {
             **body.model_dump(),
             "project_id": registered["id"],
+            "project_name": registered.get("name", Path(registered["path"]).name),
             "repo_path": registered["path"],
             "base_commit": commit,
+            "base_branch": branch(registered["path"]),
             "model": model.model_dump(),
             "acceptance_version": 1,
         }
@@ -347,6 +396,18 @@ def create_app(settings=None):
                 )
             else:
                 current["resume_session"] = bool(current["first_started_at"])
+            active = current.get("assignments", {}).get(
+                current.get("active_assignment")
+            )
+            if active and active.get("state") != "completed":
+                if uncertain:
+                    active["session_generation"] = (
+                        active.get("session_generation", 0) + 1
+                    )
+                    active["resume_session"] = False
+                else:
+                    active["resume_session"] = bool(active.get("started_at"))
+                active["state"] = "pending"
             current.update(
                 state="queued", requested_action=None, reason="已核查，等待续接"
             )
@@ -433,21 +494,48 @@ def create_app(settings=None):
         target = run["request"]["repo_path"]
         if git(target, "rev-parse", "HEAD") != run["request"]["base_commit"]:
             return {"safe": False, "reason": "目标分支已变化，请手动比较与整合"}
+        if (
+            "base_branch" in run["request"]
+            and branch(target) != run["request"]["base_branch"]
+        ):
+            return {"safe": False, "reason": "目标分支名称已变化，请手动比较与整合"}
         if git(target, "status", "--porcelain=v1", "--untracked-files=normal"):
             return {
                 "safe": False,
                 "reason": "目标工作区有未提交修改，请先保存并手动整合",
             }
-        path = run_directory(settings, run["id"]) / "evidence" / "diff.patch"
-        if not path.is_file():
+        if not run.get("evidence"):
             return {"safe": False, "reason": "尚无可采纳差异"}
-        result = subprocess.run(
-            ["git", "-C", target, "apply", "--check", str(path)],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
+        import hashlib
+        import tempfile
+
+        from doonex.evidence import Evidence, _read_artifact
+        from doonex.workspace import _git
+
+        directory = run_directory(settings, run["id"])
+        integrity = Evidence.inspect(
+            get_workspace(run, directory),
+            directory,
+            expected_report_sha256=run["evidence"].get("report_sha256"),
         )
+        if not integrity["valid"] or (
+            run.get("review_integrity") and not run["review_integrity"]["valid"]
+        ):
+            return {"safe": False, "reason": "代码或交付证据已变化，请先重新核验"}
+        patch = _read_artifact(directory / "evidence", "diff.patch")
+        if (
+            hashlib.sha256(patch).hexdigest()
+            != run["evidence"]["artifacts"]["diff.patch"]
+        ):
+            return {"safe": False, "reason": "补丁内容已变化，禁止采纳"}
+        # Check the exact verified bytes, not a path that can change into a link
+        # between inspection and Git reading it.
+        with tempfile.NamedTemporaryFile(prefix="doonex-adoption-") as temporary:
+            temporary.write(patch)
+            temporary.flush()
+            result = _git(
+                Path(target), "apply", "--check", "--", temporary.name, check=False
+            )
         return {
             "safe": result.returncode == 0,
             "reason": "可下载补丁后人工采纳；预检不会修改、提交或推送目标"

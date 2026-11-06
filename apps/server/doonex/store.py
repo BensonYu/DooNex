@@ -21,6 +21,9 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS project (
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton), data jsonb NOT NULL
 );
+CREATE TABLE IF NOT EXISTS projects (
+ id uuid PRIMARY KEY, path text UNIQUE NOT NULL, data jsonb NOT NULL
+);
 CREATE TABLE IF NOT EXISTS runs (
  id uuid PRIMARY KEY, state text NOT NULL, data jsonb NOT NULL
 );
@@ -46,24 +49,51 @@ class Store:
 
     def initialize(self):
         with self.connect() as connection:
+            connection.execute("SELECT pg_advisory_xact_lock(%s)", (4142061107,))
             connection.execute(SCHEMA)
+            # Keep the M1 source row intact. Repeated startup never overwrites
+            # updated M2 metadata, identities, runs or their private artifacts.
+            connection.execute(
+                """INSERT INTO projects(id,path,data)
+                SELECT (data->>'id')::uuid,data->>'path',data
+                FROM project WHERE singleton ON CONFLICT DO NOTHING"""
+            )
 
-    def project(self):
+    def project(self, project_id=None):
         with self.connect() as c:
-            row = c.execute("SELECT data FROM project WHERE singleton").fetchone()
-        return row["data"] if row else None
+            if project_id is not None:
+                row = c.execute(
+                    "SELECT data FROM projects WHERE id=%s", (project_id,)
+                ).fetchone()
+                if not row:
+                    raise KeyError("找不到项目")
+                return row["data"]
+            rows = c.execute("SELECT data FROM projects LIMIT 2").fetchall()
+        if len(rows) > 1:
+            raise ValueError("存在多个项目，请明确选择项目")
+        return rows[0]["data"] if rows else None
+
+    def list_projects(self):
+        with self.connect() as c:
+            return [
+                row["data"]
+                for row in c.execute("SELECT data FROM projects ORDER BY path,id")
+            ]
 
     def set_project(self, data):
         with self.connect() as c:
-            c.execute("LOCK TABLE project IN EXCLUSIVE MODE")
-            existing = c.execute("SELECT data FROM project WHERE singleton").fetchone()
-            if existing and existing["data"]["path"] != data["path"]:
-                raise ValueError(
-                    "M1 仅管理一个项目；请使用独立的数据目录和数据库注册其他项目"
-                )
+            c.execute("LOCK TABLE projects IN EXCLUSIVE MODE")
+            existing = c.execute(
+                "SELECT data FROM projects WHERE path=%s", (data["path"],)
+            ).fetchone()
+            data = {
+                **data,
+                "id": existing["data"]["id"] if existing else data["id"],
+            }
             c.execute(
-                "INSERT INTO project(data) VALUES(%s) ON CONFLICT(singleton) DO UPDATE SET data=EXCLUDED.data",
-                (Jsonb(data),),
+                """INSERT INTO projects(id,path,data) VALUES(%s,%s,%s)
+                ON CONFLICT(path) DO UPDATE SET data=EXCLUDED.data""",
+                (data["id"], data["path"], Jsonb(data)),
             )
         return data
 
@@ -90,6 +120,26 @@ class Store:
             },
             "first_started_at": None,
             "evidence": None,
+            "phase": "execution",
+            "active_assignment": "executor",
+            "review": None,
+        }
+        roles = ["executor"]
+        if request.get("workflow") == "execute_review":
+            roles.append("reviewer")
+        data["assignments"] = {
+            role: {
+                "id": str(uuid.uuid4()),
+                "role": role,
+                "parent_run_id": run_id,
+                "state": "pending",
+                "started_at": None,
+                "ended_at": None,
+                "session_generation": 0,
+                "resume_session": False,
+                "usage": dict(data["usage"]),
+            }
+            for role in roles
         }
         with self.connect() as c:
             c.execute(
@@ -105,12 +155,18 @@ class Store:
             raise KeyError("找不到运行")
         return row["data"]
 
-    def list_runs(self, limit=100):
+    def list_runs(self, limit=100, project_id=None):
         with self.connect() as c:
-            query = "SELECT data FROM runs ORDER BY data->>'created_at' DESC"
+            query = "SELECT data FROM runs"
+            values = []
+            if project_id is not None:
+                query += " WHERE data->'request'->>'project_id'=%s"
+                values.append(project_id)
+            query += " ORDER BY data->>'created_at' DESC"
             if limit is not None:
-                return [r["data"] for r in c.execute(query + " LIMIT %s", (limit,))]
-            return [r["data"] for r in c.execute(query)]
+                query += " LIMIT %s"
+                values.append(limit)
+            return [r["data"] for r in c.execute(query, values)]
 
     @contextmanager
     def locked(self, run_id, owner=None):
@@ -195,11 +251,16 @@ class Store:
         )
 
     def mark_pending_unknown(self, run_id, connection, run):
-        count = connection.execute(
-            "SELECT count(*) AS n FROM actions WHERE run_id=%s AND kind='model' AND status='pending'",
+        pending = connection.execute(
+            "SELECT data FROM actions WHERE run_id=%s AND kind='model' AND status='pending'",
             (run_id,),
-        ).fetchone()["n"]
-        run["usage"]["unknown_calls"] += count
+        ).fetchall()
+        run["usage"]["unknown_calls"] += len(pending)
+        assignments = {item["id"]: item for item in run.get("assignments", {}).values()}
+        for row in pending:
+            assignment = assignments.get(row["data"].get("assignment_id"))
+            if assignment:
+                assignment["usage"]["unknown_calls"] += 1
         connection.execute(
             "UPDATE actions SET status='unknown' WHERE run_id=%s AND status='pending'",
             (run_id,),
