@@ -109,6 +109,49 @@ export type SkillDiscovery = {
   error: { code: string } | null;
   source_rate_limit: { remaining: number | null; reset: number | null } | null;
 };
+export type GenerationParent = { version_id: string; content_digest: string; report_sha256: string; metadata: SkillMetadata };
+export type GenerationInputs = {
+  parents: GenerationParent[];
+  tasksets: { taskset_id: string; name: string; split: 'tuning'; tasks: { id: string; title: string }[] }[];
+  models: ModelProfile[];
+  projects: { id: string; name: string }[];
+};
+export type GenerationLicense = {
+  status: 'supported' | 'preview_only';
+  spdx: 'MIT' | 'Apache-2.0' | null;
+  files: { path: string; text: string; sha256: string; blob_sha: string | null }[];
+  reasons: string[];
+};
+export type GenerationReport = { valid: boolean; errors: string[]; [key: string]: unknown };
+export type SkillGeneration = {
+  id: string;
+  revision: string;
+  state: string;
+  run_id: string | null;
+  run_state: string | null;
+  usage: Usage | null;
+  input: { project_id: string; parent_version_id: string; taskset_id: string; task_ids: string[]; model_profile_id: string; budget: Budget };
+  parent: GenerationParent;
+  license: GenerationLicense;
+  visible_tasks: { id: string; title: string; prompt: string; visible_checks: string[] }[];
+  projection_sha256: string;
+  model: ModelConfig;
+  model_profile: { id: string; name: string; revision: string };
+  prompt: string;
+  prompt_sha256: string;
+  policy: 'append_instructions_v1';
+  budget: Budget;
+  candidate: (GenerationReport & { output_sha256: string; report_sha256: string; manifest_sha256: string | null; archive_sha256: string | null; content_digest: string | null }) | null;
+  preview: {
+    sha256: string; instructions: string; diff: string; license: GenerationLicense;
+    metadata: SkillMetadata; provenance: Record<string, unknown>;
+    structural_report: GenerationReport; evidence: Record<string, unknown>;
+  } | null;
+  imported: { version_id: string; report_sha256: string; content_digest: string; at: string } | null;
+  created_at: string;
+  updated_at: string;
+  error: { code: string } | null;
+};
 export type ArenaTaskset = {
   id: string;
   name: string;
@@ -289,12 +332,14 @@ export type Run = {
   review?: Review | null;
   review_integrity?: { valid: boolean; errors: string[] };
   request: {
+    purpose?: 'skill_generation';
+    generation?: { id: string; [key: string]: unknown };
     project_id: string;
     project_name?: string;
     workflow?: Workflow;
     prompt: string;
-    base_commit: string;
-    repo_path: string;
+    base_commit: string | null;
+    repo_path: string | null;
     checks: string[];
     budget: Budget;
     model: ModelConfig;
@@ -341,7 +386,7 @@ function errorMessage(value: unknown): string | null {
 }
 
 export class ApiError extends Error {
-  constructor(message: string, readonly status: number, readonly code: string | null = null, readonly discoveryId: string | null = null) { super(message); }
+  constructor(message: string, readonly status: number, readonly code: string | null = null, readonly discoveryId: string | null = null, readonly generationId: string | null = null) { super(message); }
 }
 
 export class Api {
@@ -369,7 +414,7 @@ export class Api {
       }
       const text = await response.text();
       let detail: string | null = null;
-      let code: string | null = null, discoveryId: string | null = null;
+      let code: string | null = null, discoveryId: string | null = null, generationId: string | null = null;
       try {
         const payload: unknown = JSON.parse(text);
         detail = errorMessage(payload);
@@ -377,12 +422,14 @@ export class Api {
           const value = payload.detail as Record<string, unknown>;
           if (typeof value.code === 'string' && /^[a-zA-Z0-9_]{1,100}$/.test(value.code)) code = value.code;
           if (typeof value.discovery_id === 'string' && /^[a-fA-F0-9-]{36}$/.test(value.discovery_id)) discoveryId = value.discovery_id;
+          if (typeof value.generation_id === 'string' && /^[a-fA-F0-9-]{36}$/.test(value.generation_id)) generationId = value.generation_id;
         }
       } catch { /* Non-JSON errors use a bounded fallback. */ }
-      const fallback = path.startsWith('/skills/discoveries')
-        ? `发现操作未完成（HTTP ${response.status}${code ? ` · ${code}` : ''}）。请读取保存回执核对。`
+      const boundedOperation = path.startsWith('/skills/discoveries') || path.startsWith('/skills/generations');
+      const fallback = boundedOperation
+        ? `${path.startsWith('/skills/generations') ? '生成' : '发现'}操作未完成（HTTP ${response.status}${code ? ` · ${code}` : ''}）。请读取保存回执核对。`
         : `请求失败（HTTP ${response.status}）${text ? `：${text.slice(0, 300)}` : ''}`;
-      throw new ApiError(path.startsWith('/skills/discoveries') ? fallback : detail ?? fallback, response.status, code, discoveryId);
+      throw new ApiError(boundedOperation ? fallback : detail ?? fallback, response.status, code, discoveryId, generationId);
     }
     return response;
   }
@@ -400,7 +447,16 @@ export class Api {
   }
 
   async download(projectId: string, runId: string, name: ArtifactName, signal?: AbortSignal): Promise<void> {
-    const response = await this.response(`/runs/${encodeURIComponent(runId)}/artifact?name=${encodeURIComponent(name)}&project_id=${encodeURIComponent(projectId)}`, { signal });
+    const extension = name === 'patch' ? '.patch' : name === 'report' ? '.json' : name === 'snapshot' ? '.tar.gz' : '';
+    return this.downloadFile(`/runs/${encodeURIComponent(runId)}/artifact?name=${encodeURIComponent(name)}&project_id=${encodeURIComponent(projectId)}`, `doonex-${runId}-${name}${extension}`, signal);
+  }
+
+  async downloadGeneration(id: string, name: 'candidate' | 'report' | 'output', signal?: AbortSignal): Promise<void> {
+    return this.downloadFile(`/skills/generations/${encodeURIComponent(id)}/artifact?name=${name}`, `doonex-generation-${id}-${name}${name === 'candidate' ? '.tar.gz' : '.json'}`, signal);
+  }
+
+  private async downloadFile(path: string, fallback: string, signal?: AbortSignal): Promise<void> {
+    const response = await this.response(path, { signal });
     const blob = await response.blob();
     if (signal?.aborted) return;
     const url = URL.createObjectURL(blob);
@@ -413,8 +469,7 @@ export class Api {
     if (encodedName) {
       try { filename = decodeURIComponent(encodedName); } catch { /* Use the plain name or fallback. */ }
     }
-    const extension = name === 'patch' ? '.patch' : name === 'report' ? '.json' : name === 'snapshot' ? '.tar.gz' : '';
-    anchor.download = filename?.replace(/[\\/\x00-\x1f]/g, '_') || `doonex-${runId}-${name}${extension}`;
+    anchor.download = filename?.replace(/[\\/\x00-\x1f]/g, '_') || fallback;
     document.body.appendChild(anchor);
     anchor.click();
     anchor.remove();

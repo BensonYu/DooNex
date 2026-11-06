@@ -349,4 +349,19 @@ div.notice:has(> button) { display: flex; justify-content: space-between; align-
 .background-skill-id { display: block; margin-top: 5px; }
 .background-detail .section-heading { align-items: flex-start; flex-wrap: wrap; }
 .background-detail .section-block { margin-top: 22px; }
+.generation-draft { border-top: 1px solid var(--line); padding-top: 24px; margin: 24px 0 36px; }
+.generation-layout { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 24px; margin-top: 20px; }
+.generation-records { min-width: 0; border-right: 1px solid var(--line); padding-right: 16px; max-height: 640px; overflow-y: auto; }
+.generation-detail, .generation-detail dd { min-width: 0; overflow-wrap: anywhere; }
+.generation-detail h2 { margin-top: 0; }
+.generation-detail .section-block, .generation-license, .generation-preview, .generation-confirm { border-top: 1px solid var(--line); margin-top: 24px; padding-top: 20px; }
+.generation-tasks { margin-top: 18px; border: 0; padding: 0; min-width: 0; }
+.generation-tasks legend { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+.generation-tasks .checkbox-label, .generation-confirm .checkbox-label { margin: 14px 0; }
+.generation-tasks .checkbox-label span, .generation-confirm .checkbox-label span { min-width: 0; overflow-wrap: anywhere; }
+.generation-detail pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.generation-prompt { max-height: 420px; overflow-y: auto; }
+.generation-license details { margin-top: 14px; }
+.generation-view > .section-heading { align-items: center; flex-wrap: wrap; }
+@media (max-width: 800px) { .generation-layout { grid-template-columns: 1fr; } .generation-records { border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 16px; max-height: 280px; } .generation-view > .page-heading { flex-wrap: wrap; } }
 @media (max-width: 800px) { .background-window { grid-template-columns: 1fr; } .background-view > .page-heading { flex-wrap: wrap; } }

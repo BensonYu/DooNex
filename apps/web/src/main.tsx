@@ -7,6 +7,7 @@ import { FrozenModels, ModelSettings, RoleModelChoices } from './model-settings'
 import { FrozenSkill, RecommendationChoice, SkillChoice, SkillsView, sameModelConfig, skillReady } from './skills';
 import { ArenaView } from './arena';
 import { BackgroundView } from './background';
+import { GenerationView } from './generation';
 
 const stateNames: Record<string, string> = {
   queued: '等待执行', running: '正在执行', pausing: '正在暂停', paused: '已暂停', yielded: '已安全让出',
@@ -92,7 +93,7 @@ function App() {
   const [tokenDraft, setTokenDraft] = useState('');
   const [settings, setSettings] = useState<Settings | null>(null);
   const [registry, setRegistry] = useState<ModelProfiles | null>(null);
-  const [view, setView] = useState<'workbench' | 'models' | 'skills' | 'arena' | 'background'>('workbench');
+  const [view, setView] = useState<'workbench' | 'models' | 'skills' | 'arena' | 'background' | 'generation'>('workbench');
   const [skills, setSkills] = useState<SkillVersion[]>([]);
   const [recommendations, setRecommendations] = useState<ArenaRecommendation[]>([]);
   const [recommendationLoading, setRecommendationLoading] = useState(false);
@@ -301,6 +302,11 @@ function App() {
       if (isCurrent()) setRuns(nextRuns);
     });
   };
+  const openRun = (targetProject: string, id: string) => { void perform(async ({ signal, isCurrent }) => {
+    const next = await api.get<Project[]>('/projects', signal);
+    if (!isCurrent()) return;
+    setProjects(next); selectProject(targetProject); select(id);
+  }); };
   if (!token) {
     return <main className="connect-page">
       <div className="connect-panel">
@@ -333,6 +339,7 @@ function App() {
   const hasRecommendation = !draft.recommendationId || !recommendationLoading && matchingRecommendations.some((item) => item.id === draft.recommendationId && item.arm_id === draft.skillVersionId);
   const canCreate = !!project && hasModel && hasPrice && hasSkill && hasRecommendation && !!budget && !busy;
   const selected = run?.id === selectedId && run.request.project_id === projectId ? run : null;
+  const isGeneration = selected?.request.purpose === 'skill_generation';
   const selectedModels = selected ? selected.request.workflow === 'execute_review'
     ? [selected.request.role_models?.executor ?? selected.request.model, selected.request.role_models?.reviewer ?? selected.request.model]
     : [selected.request.role_models?.executor ?? selected.request.model] : [];
@@ -347,7 +354,7 @@ function App() {
         clearView(); active.current = { projectId: '', runId: '' }; writeStorage('session', 'doonex.token', ''); setToken(''); setSettings(null); setRegistry(null); setSkills([]); setRecommendations([]); setArenaEvaluationId(''); setView('workbench'); setProjects([]); setProjectId(''); setSelectedId(''); setRuns([]);
       }}>断开连接</button></div>
     </header>
-    <nav className="app-nav" aria-label="工作区页面">{([['workbench', '工作台'], ['skills', 'Skills'], ['arena', 'Skill Arena'], ['background', '后台调优'], ['models', '模型设置']] as const).map(([id, label]) => <button key={id} aria-current={view === id ? 'page' : undefined} onClick={() => { setView(id); setError(''); }}>{label}</button>)}</nav>
+    <nav className="app-nav" aria-label="工作区页面">{([['workbench', '工作台'], ['skills', 'Skills'], ['generation', '候选生成'], ['arena', 'Skill Arena'], ['background', '后台调优'], ['models', '模型设置']] as const).map(([id, label]) => <button key={id} aria-current={view === id ? 'page' : undefined} onClick={() => { setView(id); setError(''); }}>{label}</button>)}</nav>
     <div className="workspace-layout">
       <aside className="sidebar" aria-label="运行列表">
         <div className="project-picker"><label htmlFor="project-select">项目</label><select id="project-select" value={projectId} onChange={(event) => selectProject(event.target.value)} disabled={!projects.length}><option value="" disabled>尚未注册项目</option>{projects.map((item) => <option key={item.id} value={item.id}>{item.name || item.path}</option>)}</select><button className="quiet compact" onClick={() => { setView('workbench'); setShowCreate(true); setError(''); requestAnimationFrame(() => document.getElementById('project-path')?.focus()); }}>注册项目</button></div>
@@ -356,7 +363,7 @@ function App() {
         {!loading && !runs.length && <p className="empty-copy">还没有运行记录。注册项目后，开始第一个任务。</p>}
         <ul className="run-list">{runs.map((item) => <li key={item.id}>
           <button className={`run-item ${item.id === selectedId && !showCreate ? 'selected' : ''}`} aria-current={item.id === selectedId && !showCreate ? 'page' : undefined} onClick={() => select(item.id)}>
-            <span className="run-title">{item.request.prompt}</span>
+            <span className="run-title">{item.request.purpose === 'skill_generation' ? 'Skill 候选生成' : item.request.prompt}</span>
             <Status state={item.state} />
             <span className="muted run-project">{item.request.project_name || project?.name || project?.path}</span><time dateTime={item.created_at}>{fmtTime(item.created_at)}</time>
           </button>
@@ -369,11 +376,7 @@ function App() {
           {project && <span className="muted small">{project.dirty ? '原工作区有未提交改动' : '原工作区干净'}</span>}
         </section>}
 
-        {view === 'background' && settings ? <BackgroundView api={api} skills={skills} registry={registry} defaultBudget={settings.default_budget} onEvaluation={(id) => { setArenaEvaluationId(id); setView('arena'); }} /> : view === 'models' && registry ? <ModelSettings api={api} registry={registry} onRegistry={setRegistry} onClose={() => setView('workbench')} /> : view === 'skills' ? <SkillsView api={api} skills={skills} onSkills={setSkills} onEvaluation={(id) => { setArenaEvaluationId(id); setView('arena'); }} /> : view === 'arena' && settings ? <ArenaView api={api} skills={skills} registry={registry} defaultBudget={settings.default_budget} initialEvaluationId={arenaEvaluationId} onOpenRun={(targetProject, id) => { void perform(async ({ signal, isCurrent }) => {
-          const next = await api.get<Project[]>('/projects', signal);
-          if (!isCurrent()) return;
-          setProjects(next); selectProject(targetProject); select(id);
-        }); }} /> : showCreate ? <div className="create-view">
+        {view === 'generation' && settings ? <GenerationView api={api} projectId={projectId} defaultBudget={settings.default_budget} onOpenRun={openRun} onImported={(skill) => { setSkills((old) => [skill, ...old.filter((item) => item.version_id !== skill.version_id)]); setView('skills'); }} /> : view === 'background' && settings ? <BackgroundView api={api} skills={skills} registry={registry} defaultBudget={settings.default_budget} onEvaluation={(id) => { setArenaEvaluationId(id); setView('arena'); }} /> : view === 'models' && registry ? <ModelSettings api={api} registry={registry} onRegistry={setRegistry} onClose={() => setView('workbench')} /> : view === 'skills' ? <SkillsView api={api} skills={skills} onSkills={setSkills} onEvaluation={(id) => { setArenaEvaluationId(id); setView('arena'); }} /> : view === 'arena' && settings ? <ArenaView api={api} skills={skills} registry={registry} defaultBudget={settings.default_budget} initialEvaluationId={arenaEvaluationId} onOpenRun={openRun} /> : showCreate ? <div className="create-view">
           <div className="page-heading"><div><h1>开始一个可信的任务</h1><p className="muted">固定起始版本与验收条件，在隔离工作区中执行。</p></div>{selectedId && <button className="quiet" onClick={() => setShowCreate(false)}>返回运行</button>}</div>
           <section className="section-block">
             <h2>注册或重新校验项目</h2>
@@ -432,10 +435,10 @@ function App() {
             <div className="form-footer"><span className="muted small">需求、验收和预算将随本次运行保存。</span><button className="primary" type="submit" disabled={!canCreate}>{busy ? '正在创建…' : '创建并开始运行'}</button></div>
           </form>
         </div> : selected ? <div className="run-view">
-          <div className="page-heading"><div><span className="eyebrow">运行 {selected.id}</span><h1 className="task-heading">{selected.request.prompt}</h1></div><Status state={selected.state} /></div>
-          <div className="run-meta"><span className="path-text">项目 {selected.request.project_name || project?.name || selected.request.repo_path}</span><span>起始提交 <code>{selected.request.base_commit}</code></span><span>创建于 {fmtTime(selected.created_at)}</span></div>
+          <div className="page-heading"><div><span className="eyebrow">运行 {selected.id}</span><h1 className="task-heading">{isGeneration ? 'Skill 候选生成' : selected.request.prompt}</h1></div><Status state={selected.state} /></div>
+          <div className="run-meta"><span className="path-text">{isGeneration ? '归属项目' : '项目'} {selected.request.project_name || project?.name || selected.request.repo_path}</span><span>{isGeneration ? '基线为父 Skill，Git 起始提交不适用' : <>起始提交 <code>{selected.request.base_commit ?? '未提供'}</code></>}</span><span>用途：{isGeneration ? 'Skill 候选生成' : '项目编程'}</span><span>创建于 {fmtTime(selected.created_at)}</span></div>
           <FrozenModels run={selected} />
-          <FrozenSkill run={selected} />
+          {isGeneration ? <div className="notice"><p>本次仅生成追加指令，不读取归属项目代码、不执行 Skill 脚本。结果仍待检查，结构通过不建立质量成绩。</p><button type="button" onClick={() => { if (selected.request.generation?.id) writeStorage('local', 'doonex.selectedGeneration', selected.request.generation.id); setView('generation'); }}>查看固定候选与导入</button></div> : <FrozenSkill run={selected} />}
           {selected.reason && <p className="notice">{selected.reason}</p>}
           {pollError && <p className="notice error" role="alert">{pollError} 当前显示最近一次已记录结果；会自动重连。</p>}
           <div className="run-toolbar">
@@ -459,7 +462,7 @@ function App() {
             <label className="checkbox-label"><input type="checkbox" checked={acknowledge} onChange={(event) => setAcknowledge(event.target.checked)} />我已核对工作区、容器和结果未知的外部动作，确认可以继续。</label>
             <button className="primary" disabled={busy || !acknowledge || !recovery.workspace_ok} onClick={() => control('resume')}>确认核查并恢复</button>
           </section>}
-          <WorkflowProgress run={selected} />
+          {isGeneration ? <section className="workflow-panel" aria-label="生成流程与共享预算"><h2>生成 → 候选结构检查 → 人工审核</h2><p className="field-help">仅一个执行角色，通过 finish 返回文本。原 Run 的调用、token、未知预留和首次启动时钟持续保留。</p></section> : <WorkflowProgress run={selected} />}
           <section className="usage-panel" aria-label="共享预算与累计用量">
             <div><span>累计模型调用</span><strong>{selected.usage.calls ?? 0}<small> / {selected.request.budget.max_calls}</small></strong></div>
             <div><span>累计已记录 tokens</span><strong>{(selected.usage.tokens ?? 0).toLocaleString()}<small> / {selected.request.budget.max_tokens.toLocaleString()}</small></strong></div>
@@ -477,16 +480,16 @@ function App() {
           <section className="detail-panel" role="tabpanel" id={`panel-${tab}`} aria-labelledby={`tab-${tab}`}>
             {detailError && <p className="notice error" role="alert">{detailError}</p>}
             {tab === 'events' && <>
-              <details className="requirements"><summary>本次需求与验收条件</summary><p className="preserve-text">{selected.request.prompt}</p><h3>固定验收命令</h3>{selected.request.checks.length ? <pre>{selected.request.checks.join('\n')}</pre> : <p className="muted">没有设置自动验收命令，产物需要人工检查。</p>}<p className="muted small">项目：{selected.request.repo_path}</p><p className="muted small">模型：{selected.request.model.model_id}</p></details>
+              <details className="requirements"><summary>本次需求与验收条件</summary><p className="preserve-text">{selected.request.prompt}</p><h3>{isGeneration ? '候选检查范围' : '固定验收命令'}</h3>{selected.request.checks.length ? <pre>{selected.request.checks.join('\n')}</pre> : <p className="muted">{isGeneration ? '只检查固定候选的追加结构与交付绑定，未运行质量回归。' : '没有设置自动验收命令，产物需要人工检查。'}</p>}<p className="muted small">项目代码路径：{selected.request.repo_path ?? '不适用（Skill 候选生成）'}</p><p className="muted small">模型：{selected.request.model.model_id}</p></details>
               {!events.length && <p className="empty-copy">尚无已记录事件。运行启动后会在这里显示进展。</p>}
               <ol className="event-list">{events.map((event) => <li key={event.id}><div className="event-heading"><strong>{event.kind}</strong><time dateTime={event.created_at}>{fmtTime(event.created_at)}</time><span>#{event.id}</span></div><pre>{typeof event.payload === 'string' ? event.payload : json(event.payload)}</pre></li>)}</ol>
             </>}
             {tab === 'diff' && <>{diff?.source === 'review_handoff' && <div className="notice" role="status"><strong>审查交接快照，尚未完成验收</strong><p>以下修改来自执行者交给审查者的固定快照。{diff.snapshot_digest && <code>{diff.snapshot_digest}</code>}</p></div>}{detailLoading && diff === null ? <p role="status" className="muted">正在读取代码变更…</p> : diff?.source !== 'unavailable' && diff?.diff ? <pre className="diff-output">{diff.diff}</pre> : !detailError && <p className="empty-copy">目前没有可显示的代码差异。</p>}</>}
             {tab === 'evidence' && <>
               <ReviewReport run={selected} />
-              <div className="evidence-intro"><h2>与代码快照绑定的交付证据</h2><p className="muted">检查命令、退出码、日志和时间以服务保存的报告为准。失败、缺失或过期证据不能证明当前代码已通过验收。</p></div>
-              <div className="button-row artifact-actions">{(['patch', 'snapshot', 'report'] as const).map((name) => <button key={name} disabled={busy} onClick={() => { void perform(({ signal }) => api.download(projectId, selected.id, name, signal)); }}>下载{({ patch: '补丁', snapshot: '代码快照', report: '检查报告' })[name]}</button>)}<button disabled={busy || isActive} onClick={() => { void perform(async ({ signal, isCurrent }) => { const result = await api.post<{ safe: boolean; reason: string }>(runPath(projectId, selected.id, 'adoption-check'), {}, signal); if (isCurrent()) setAdoption(result); }); }}>检查采纳条件</button></div>
-              {adoption && <div className={`notice ${adoption.safe ? '' : 'error'}`} role="status"><strong>{adoption.safe ? '采纳预检通过' : '采纳预检未通过'}</strong><p>{adoption.reason}</p><p>请保留补丁并人工检查后整合。预检不会修改原项目，也不会推送或部署。</p></div>}
+              <div className="evidence-intro"><h2>{isGeneration ? '与固定候选绑定的交付证据' : '与代码快照绑定的交付证据'}</h2><p className="muted">{isGeneration ? '追加差异和通用快照用于核对交付。完整候选、原始输出与结构报告请在候选生成页查看；结构通过不代表质量通过。' : '检查命令、退出码、日志和时间以服务保存的报告为准。失败、缺失或过期证据不能证明当前代码已通过验收。'}</p></div>
+              <div className="button-row artifact-actions">{(['patch', 'snapshot', 'report'] as const).map((name) => <button key={name} disabled={busy} onClick={() => { void perform(({ signal }) => api.download(projectId, selected.id, name, signal)); }}>下载{(isGeneration ? { patch: '追加差异', snapshot: '通用快照', report: '交付报告' } : { patch: '补丁', snapshot: '代码快照', report: '检查报告' })[name]}</button>)}{!isGeneration && <button disabled={busy || isActive} onClick={() => { void perform(async ({ signal, isCurrent }) => { const result = await api.post<{ safe: boolean; reason: string }>(runPath(projectId, selected.id, 'adoption-check'), {}, signal); if (isCurrent()) setAdoption(result); }); }}>检查采纳条件</button>}</div>
+              {!isGeneration && adoption && <div className={`notice ${adoption.safe ? '' : 'error'}`} role="status"><strong>{adoption.safe ? '采纳预检通过' : '采纳预检未通过'}</strong><p>{adoption.reason}</p><p>请保留补丁并人工检查后整合。预检不会修改原项目，也不会推送或部署。</p></div>}
               {detailLoading && evidence === null ? <p className="muted" role="status">正在读取证据…</p> : evidence ? <CheckReport evidence={evidence} busy={busy} onDownloadLog={(name) => { void perform(({ signal }) => api.download(projectId, selected.id, name, signal)); }} /> : !detailError && <p className="empty-copy">尚无验证报告。</p>}
             </>}
           </section>
