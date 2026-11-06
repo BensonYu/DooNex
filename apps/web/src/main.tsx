@@ -8,6 +8,8 @@ import { FrozenSkill, RecommendationChoice, SkillChoice, SkillsView, sameModelCo
 import { ArenaView } from './arena';
 import { BackgroundView } from './background';
 import { GenerationView } from './generation';
+import { CommunityAdmin } from './community-admin';
+import { PublicCommunity } from './community-public';
 
 const stateNames: Record<string, string> = {
   queued: '等待执行', running: '正在执行', pausing: '正在暂停', paused: '已暂停', yielded: '已安全让出',
@@ -93,7 +95,7 @@ function App() {
   const [tokenDraft, setTokenDraft] = useState('');
   const [settings, setSettings] = useState<Settings | null>(null);
   const [registry, setRegistry] = useState<ModelProfiles | null>(null);
-  const [view, setView] = useState<'workbench' | 'models' | 'skills' | 'arena' | 'background' | 'generation'>('workbench');
+  const [view, setView] = useState<'workbench' | 'models' | 'skills' | 'arena' | 'background' | 'generation' | 'community'>('workbench');
   const [skills, setSkills] = useState<SkillVersion[]>([]);
   const [recommendations, setRecommendations] = useState<ArenaRecommendation[]>([]);
   const [recommendationLoading, setRecommendationLoading] = useState(false);
@@ -310,6 +312,7 @@ function App() {
   if (!token) {
     return <main className="connect-page">
       <div className="connect-panel">
+        <a className="community-link" href="#community">浏览公开 Skill 社区</a>
         <div className="wordmark">DooNex<span>本地编程工作台</span></div>
         <h1>连接你的工作台</h1>
         <p className="muted">输入本地服务生成的访问令牌，查看任务与运行证据。</p>
@@ -354,7 +357,7 @@ function App() {
         clearView(); active.current = { projectId: '', runId: '' }; writeStorage('session', 'doonex.token', ''); setToken(''); setSettings(null); setRegistry(null); setSkills([]); setRecommendations([]); setArenaEvaluationId(''); setView('workbench'); setProjects([]); setProjectId(''); setSelectedId(''); setRuns([]);
       }}>断开连接</button></div>
     </header>
-    <nav className="app-nav" aria-label="工作区页面">{([['workbench', '工作台'], ['skills', 'Skills'], ['generation', '候选生成'], ['arena', 'Skill Arena'], ['background', '后台调优'], ['models', '模型设置']] as const).map(([id, label]) => <button key={id} aria-current={view === id ? 'page' : undefined} onClick={() => { setView(id); setError(''); }}>{label}</button>)}</nav>
+    <nav className="app-nav" aria-label="工作区页面">{([['workbench', '工作台'], ['community', '社区管理'], ['skills', 'Skills'], ['generation', '候选生成'], ['arena', 'Skill Arena'], ['background', '后台调优'], ['models', '模型设置']] as const).map(([id, label]) => <button key={id} aria-current={view === id ? 'page' : undefined} onClick={() => { setView(id); setError(''); }}>{label}</button>)}</nav>
     <div className="workspace-layout">
       <aside className="sidebar" aria-label="运行列表">
         <div className="project-picker"><label htmlFor="project-select">项目</label><select id="project-select" value={projectId} onChange={(event) => selectProject(event.target.value)} disabled={!projects.length}><option value="" disabled>尚未注册项目</option>{projects.map((item) => <option key={item.id} value={item.id}>{item.name || item.path}</option>)}</select><button className="quiet compact" onClick={() => { setView('workbench'); setShowCreate(true); setError(''); requestAnimationFrame(() => document.getElementById('project-path')?.focus()); }}>注册项目</button></div>
@@ -376,7 +379,7 @@ function App() {
           {project && <span className="muted small">{project.dirty ? '原工作区有未提交改动' : '原工作区干净'}</span>}
         </section>}
 
-        {view === 'generation' && settings ? <GenerationView api={api} projectId={projectId} defaultBudget={settings.default_budget} onOpenRun={openRun} onImported={(skill) => { setSkills((old) => [skill, ...old.filter((item) => item.version_id !== skill.version_id)]); setView('skills'); }} /> : view === 'background' && settings ? <BackgroundView api={api} skills={skills} registry={registry} defaultBudget={settings.default_budget} onEvaluation={(id) => { setArenaEvaluationId(id); setView('arena'); }} /> : view === 'models' && registry ? <ModelSettings api={api} registry={registry} onRegistry={setRegistry} onClose={() => setView('workbench')} /> : view === 'skills' ? <SkillsView api={api} skills={skills} onSkills={setSkills} onEvaluation={(id) => { setArenaEvaluationId(id); setView('arena'); }} /> : view === 'arena' && settings ? <ArenaView api={api} skills={skills} registry={registry} defaultBudget={settings.default_budget} initialEvaluationId={arenaEvaluationId} onOpenRun={openRun} /> : showCreate ? <div className="create-view">
+        {view === 'community' ? <CommunityAdmin token={token} /> : view === 'generation' && settings ? <GenerationView api={api} projectId={projectId} defaultBudget={settings.default_budget} onOpenRun={openRun} onImported={(skill) => { setSkills((old) => [skill, ...old.filter((item) => item.version_id !== skill.version_id)]); setView('skills'); }} /> : view === 'background' && settings ? <BackgroundView api={api} skills={skills} registry={registry} defaultBudget={settings.default_budget} onEvaluation={(id) => { setArenaEvaluationId(id); setView('arena'); }} /> : view === 'models' && registry ? <ModelSettings api={api} registry={registry} onRegistry={setRegistry} onClose={() => setView('workbench')} /> : view === 'skills' ? <SkillsView api={api} skills={skills} onSkills={setSkills} onEvaluation={(id) => { setArenaEvaluationId(id); setView('arena'); }} /> : view === 'arena' && settings ? <ArenaView api={api} skills={skills} registry={registry} defaultBudget={settings.default_budget} initialEvaluationId={arenaEvaluationId} onOpenRun={openRun} /> : showCreate ? <div className="create-view">
           <div className="page-heading"><div><h1>开始一个可信的任务</h1><p className="muted">固定起始版本与验收条件，在隔离工作区中执行。</p></div>{selectedId && <button className="quiet" onClick={() => setShowCreate(false)}>返回运行</button>}</div>
           <section className="section-block">
             <h2>注册或重新校验项目</h2>
@@ -499,4 +502,10 @@ function App() {
   </div>;
 }
 
-createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>);
+function Entry() {
+  const [publicView, setPublicView] = useState(() => window.location.hash === '#community');
+  useEffect(() => { const update = () => setPublicView(window.location.hash === '#community'); window.addEventListener('hashchange', update); return () => window.removeEventListener('hashchange', update); }, []);
+  return publicView ? <PublicCommunity /> : <App />;
+}
+
+createRoot(document.getElementById('root')!).render(<React.StrictMode><Entry /></React.StrictMode>);

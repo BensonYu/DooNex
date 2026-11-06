@@ -365,3 +365,30 @@ div.notice:has(> button) { display: flex; justify-content: space-between; align-
 .generation-view > .section-heading { align-items: center; flex-wrap: wrap; }
 @media (max-width: 800px) { .generation-layout { grid-template-columns: 1fr; } .generation-records { border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 16px; max-height: 280px; } .generation-view > .page-heading { flex-wrap: wrap; } }
 @media (max-width: 800px) { .background-window { grid-template-columns: 1fr; } .background-view > .page-heading { flex-wrap: wrap; } }
+.community-link { color: var(--blue); font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
+.community-section { border-top: 1px solid var(--line); margin-top: 28px; padding-top: 24px; }
+.community-admin, .community-detail, .community-snapshot, .community-evidence-entry { min-width: 0; overflow-wrap: anywhere; }
+.community-form-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-bottom: 18px; }
+.community-record-list { padding: 0; list-style: none; }
+.community-record-list li { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 18px 0; border-bottom: 1px solid var(--line); }
+.community-record-list li > div, .community-record-nav button { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; min-width: 0; text-align: left; overflow-wrap: anywhere; white-space: normal; }
+.community-record-list span { font-size: 12px; color: var(--muted); }
+.community-detail-layout { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 24px; }
+.community-record-nav { min-width: 0; display: flex; flex-direction: column; gap: 10px; align-self: start; }
+.community-record-nav button[aria-current="page"] { border-color: var(--blue); background: #f0f3f9; }
+.community-long-text { margin: 20px 0; }
+.community-long-text pre { max-height: 480px; overflow-y: auto; border: 1px solid var(--line); background: white; padding: 16px; }
+.community-secret { display: block; padding: 14px 0; overflow-wrap: anywhere; user-select: all; }
+.community-public { min-height: 100dvh; }
+.community-public-header { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 24px max(24px, calc((100vw - 1160px) / 2)); border-bottom: 1px solid var(--line); background: white; }
+.community-public-body { max-width: 1160px; margin: 0 auto; padding: 36px 28px 64px; }
+.community-public-nav { display: flex; gap: 10px; flex-wrap: wrap; margin: 28px 0 14px; }
+.community-public-nav [aria-current="page"] { color: var(--blue); border-color: var(--blue); }
+.community-catalog { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 32px; }
+.community-catalog article { min-width: 0; padding: 22px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.community-catalog p { font-size: 13px; }
+.community-public-fields > div { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.community-public-fields dt { font-family: monospace; font-size: 12px; overflow-wrap: anywhere; margin-bottom: 6px; }
+.community-evidence-entry { padding: 22px 0; border-bottom: 1px solid var(--line); }
+.community-inline-id { display: block; margin-bottom: 6px; }
+@media (max-width: 800px) { .community-form-grid, .community-detail-layout, .community-catalog { grid-template-columns: 1fr; } .community-record-nav { max-height: 300px; overflow-y: auto; } .community-public-header { padding: 22px 20px; align-items: flex-start; } .community-public-header .wordmark { flex-direction: column; align-items: flex-start; gap: 5px; } .community-public-body { padding: 28px 20px 48px; } .community-public .page-heading, .community-admin .page-heading, .community-admin .section-heading { flex-wrap: wrap; } .community-record-list li { flex-wrap: wrap; } }
