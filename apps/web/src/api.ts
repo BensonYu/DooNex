@@ -53,7 +53,7 @@ export type Review = {
   summary: string;
   valid?: boolean;
   errors?: string[];
-  findings: { path: string | null; line?: number | null; severity: 'high' | 'medium' | 'low'; message: string }[];
+  findings: { path: string | null; side?: 'before' | 'after'; line?: number | null; severity: 'high' | 'medium' | 'low'; message: string }[];
   snapshot_digest: string;
 };
 

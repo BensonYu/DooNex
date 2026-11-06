@@ -49,7 +49,7 @@ export function ReviewReport({ run }: { run: Run }) {
       <p className="muted small path-text">审查快照：<code>{review.snapshot_digest}</code></p>
       {finalDigest && <p className="muted small path-text">检查快照：<code>{finalDigest}</code></p>}
       {review.findings.length > 0 && <ol className="review-findings">{review.findings.map((finding, index) => <li key={index}>
-        <div><span className={`severity severity-${finding.severity}`}>{({ high: '高', medium: '中', low: '低' })[finding.severity]}</span><code>{finding.path || '总体问题'}{finding.line != null ? `:${finding.line}` : ''}</code></div>
+        <div><span className={`severity severity-${finding.severity}`}>{({ high: '高', medium: '中', low: '低' })[finding.severity]}</span><code>{finding.path || '总体问题'}{finding.line != null ? `:${finding.line}` : ''}</code>{finding.side === 'before' && <span className="muted small">删除前版本</span>}</div>
         <p className="preserve-text">{finding.message}</p>
       </li>)}</ol>}
     </>}
