@@ -314,8 +314,8 @@ def test_resume_and_control_directory_fail_closed(tmp_path):
 
 
 def test_unsupported_api_mode_is_rejected_before_state_creation(tmp_path):
-    kwargs, *_ = harness(tmp_path / "state", model={**MODEL, "api_mode": "responses"})
-    with pytest.raises(ValueError, match="chat completion"):
+    kwargs, *_ = harness(tmp_path / "state", model={**MODEL, "api_mode": "auto"})
+    with pytest.raises(ValueError, match="explicit chat or responses"):
         run_session(**kwargs)
     assert not Path(kwargs["state_dir"]).exists()
 
@@ -532,3 +532,251 @@ def test_reusing_instrumented_process_is_rejected(tmp_path, monkeypatch, state):
         run_session(**kwargs)
     assert reservations == settlements == []
     assert not Path(kwargs["state_dir"]).exists()
+
+
+def responses_answer(tool, arguments, *, sequence=1, usage=True):
+    from litellm.types.llms.openai import ResponsesAPIResponse
+
+    return ResponsesAPIResponse(
+        id=f"resp_{sequence}",
+        created_at=1,
+        model="gateway-model",
+        object="response",
+        status="completed",
+        output=[
+            {
+                "id": f"fc_{sequence}",
+                "call_id": f"call_{sequence}",
+                "type": "function_call",
+                "name": tool,
+                "arguments": json.dumps(arguments),
+                "status": "completed",
+            }
+        ],
+        usage=(
+            {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "total_tokens": 120,
+                "input_tokens_details": {"cached_tokens": 80},
+            }
+            if usage
+            else None
+        ),
+    )
+
+
+def response_harness(tmp_path, monkeypatch, transport, **overrides):
+    import openhands.sdk.llm.llm as upstream
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Responses must never fall back to chat")
+
+    monkeypatch.setattr(upstream, "litellm_responses", transport)
+    monkeypatch.setattr(GuardedLLM, "_transport_call", forbidden)
+    return harness(tmp_path, model={**MODEL, "api_mode": "responses"}, **overrides)
+
+
+def test_real_sdk_responses_shell_finish_redacts_and_counts_full_input(
+    tmp_path, monkeypatch
+):
+    responses = iter(
+        [
+            responses_answer("doonex_shell", {"command": f"echo {SECRET}"}),
+            responses_answer("finish", {"message": f"done {SECRET}"}, sequence=2),
+        ]
+    )
+    transports = []
+
+    def transport(**kwargs):
+        transports.append(kwargs)
+        assert kwargs["api_key"] == SECRET
+        assert kwargs["max_retries"] == kwargs["num_retries"] == 0
+        assert kwargs["max_output_tokens"] == MODEL["max_output_tokens"]
+        assert kwargs["custom_llm_provider"] == "openai"
+        assert kwargs["store"] is False
+        assert kwargs["stream"] is False
+        assert kwargs["use_chat_completions_api"] is False
+        assert {tool["name"] for tool in kwargs["tools"]} == {
+            "doonex_shell",
+            "finish",
+        }
+        assert all(tool["type"] == "function" for tool in kwargs["tools"])
+        return next(responses)
+
+    kwargs, reservations, settlements, commands, events = response_harness(
+        tmp_path, monkeypatch, transport
+    )
+    assert run_session(**kwargs) == "finished"
+    assert commands == ["echo [REDACTED]"]
+    assert len(transports) == len(reservations) == len(settlements) == 2
+    assert all(
+        usage == {"input_tokens": 100, "output_tokens": 20} for _, usage in settlements
+    )
+    assert any(
+        item["type"] == "function_call_output" for item in transports[1]["input"]
+    )
+    assert SECRET not in json.dumps(events)
+    assert SECRET not in "".join(path.read_text() for path in tmp_path.rglob("*.json"))
+
+
+def test_responses_budget_rejection_sends_no_request(tmp_path, monkeypatch):
+    def reject(*args):
+        raise ValueError("budget exhausted")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("budget rejection must prevent Responses transport")
+
+    kwargs, _, settlements, commands, _ = response_harness(
+        tmp_path, monkeypatch, forbidden, before_model=reject
+    )
+    with pytest.raises(Exception, match="budget exhausted"):
+        run_session(**kwargs)
+    assert settlements == commands == []
+
+
+def test_responses_unknown_usage_preserves_reservation(tmp_path, monkeypatch):
+    kwargs, reservations, settlements, _, _ = response_harness(
+        tmp_path,
+        monkeypatch,
+        lambda **kwargs: responses_answer("finish", {"message": "done"}, usage=False),
+    )
+    assert run_session(**kwargs) == "finished"
+    assert len(reservations) == len(settlements) == 1
+    assert settlements[0][1] is None
+
+
+def test_responses_provider_error_is_not_retried_and_is_redacted(
+    tmp_path, monkeypatch, caplog
+):
+    calls = []
+
+    def transport(**kwargs):
+        calls.append(1)
+        raise RateLimitError(
+            message=f"Responses diagnostic echoed {SECRET}",
+            model="gateway-model",
+            llm_provider="openai",
+        )
+
+    kwargs, _, settlements, _, events = response_harness(
+        tmp_path, monkeypatch, transport
+    )
+    with caplog.at_level(logging.ERROR), pytest.raises(Exception) as error:
+        run_session(**kwargs)
+    assert calls == [1]
+    assert settlements[0][1] is None
+    assert SECRET not in str(error.value)
+    assert SECRET not in caplog.text
+    assert SECRET not in json.dumps(events)
+    assert SECRET not in "".join(path.read_text() for path in tmp_path.rglob("*.json"))
+
+
+def test_responses_pause_resume_does_not_replay_shell(tmp_path, monkeypatch):
+    stopped = False
+    calls = []
+
+    def transport(**kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            return responses_answer("doonex_shell", {"command": "create-once"})
+        assert kwargs["api_key"] == "replacement-secret"
+        return responses_answer("finish", {"message": "done"}, sequence=2)
+
+    def shell(command):
+        nonlocal stopped
+        stopped = True
+        return {"output": "created", "exit_code": 0}
+
+    kwargs, *_ = response_harness(
+        tmp_path, monkeypatch, transport, shell=shell, should_stop=lambda: stopped
+    )
+    assert run_session(**kwargs) == "paused"
+    resumed, _, _, commands, _ = response_harness(
+        tmp_path,
+        monkeypatch,
+        transport,
+        prompt=None,
+        resume=True,
+        api_key="replacement-secret",
+    )
+    assert run_session(**resumed) == "finished"
+    assert len(calls) == 2
+    assert commands == []
+
+
+def test_anthropic_responses_is_rejected_before_state_creation(tmp_path):
+    kwargs, *_ = harness(
+        tmp_path / "state",
+        model={**MODEL, "provider": "anthropic", "api_mode": "responses"},
+    )
+    with pytest.raises(ValueError, match="Responses only through the openai"):
+        run_session(**kwargs)
+    assert not Path(kwargs["state_dir"]).exists()
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_responses_real_litellm_http_boundary_has_no_fallback_or_retry(
+    tmp_path, monkeypatch, caplog, failure
+):
+    import httpx
+
+    calls = []
+
+    def transport(self, request, *args, **kwargs):
+        calls.append(request)
+        assert request.method == "POST"
+        assert str(request.url) == "https://responses-gateway.invalid/v1/responses"
+        body = json.loads(request.content)
+        assert body["max_output_tokens"] == MODEL["max_output_tokens"]
+        assert body["store"] is False
+        if failure:
+            return httpx.Response(
+                429,
+                request=request,
+                json={
+                    "error": {
+                        "message": f"rate limited {SECRET}",
+                        "type": "rate_limit_error",
+                    }
+                },
+            )
+        tool = "doonex_shell" if len(calls) == 1 else "finish"
+        arguments = (
+            {"command": "create-once"} if len(calls) == 1 else {"message": "done"}
+        )
+        return httpx.Response(
+            200,
+            request=request,
+            json=responses_answer(tool, arguments, sequence=len(calls)).model_dump(
+                mode="json"
+            ),
+        )
+
+    def forbidden_chat(*args, **kwargs):
+        pytest.fail("native Responses must not fall back to chat")
+
+    monkeypatch.setattr(httpx.Client, "send", transport)
+    monkeypatch.setattr(GuardedLLM, "_transport_call", forbidden_chat)
+    kwargs, reservations, settlements, commands, events = harness(
+        tmp_path,
+        model={
+            **MODEL,
+            "api_mode": "responses",
+            "model_id": "gateway-model",
+            "base_url": "https://responses-gateway.invalid/v1",
+        },
+    )
+    with caplog.at_level(logging.ERROR):
+        if failure:
+            with pytest.raises(Exception, match="Model request failed"):
+                run_session(**kwargs)
+        else:
+            assert run_session(**kwargs) == "finished"
+    assert len(calls) == len(reservations) == len(settlements) == (1 if failure else 2)
+    assert commands == ([] if failure else ["create-once"])
+    assert settlements[0][1] == (
+        None if failure else {"input_tokens": 100, "output_tokens": 20}
+    )
+    assert SECRET not in caplog.text
+    assert SECRET not in json.dumps(events)

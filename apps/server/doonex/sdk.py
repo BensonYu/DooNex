@@ -191,40 +191,48 @@ class GuardedLLM(LLM):
     def bind(self, before, after, should_stop) -> None:
         self._before, self._after, self._stop = before, after, should_stop
 
-    def completion(self, messages, tools=None, **kwargs):
+    def _guarded_request(self, call, mode, messages, tools, kwargs):
         if self._stop():
             raise SessionStopped("Execution stopped before a model request")
         # Bytes plus framing overhead is deliberately conservative, not a claim
         # of an exact provider tokenizer. Tool schemas and system text count.
         payload = {
             "messages": [message.model_dump(mode="json") for message in messages],
-            "tools": [tool.to_openai_tool() for tool in tools or []],
+            "tools": [
+                tool.to_responses_tool()
+                if mode == "responses"
+                else tool.to_openai_tool()
+                for tool in tools or []
+            ],
         }
         estimate = len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) + 1024
         if estimate > self.max_input_tokens:
             raise ValueError("Conversation exceeds the configured input token bound")
         reservation = self._before(estimate, self.max_output_tokens)
         try:
-            response = super().completion(messages, tools, **kwargs)
+            response = call(messages=messages, tools=tools, **kwargs)
         except Exception as error:  # noqa: BLE001 -- providers expose heterogeneous exceptions
             self._after(reservation, None)
             raise ModelCallError(
                 f"Model request failed ({type(error).__name__})"
             ) from None
         usage = getattr(response.raw_response, "usage", None)
-        prompt_tokens = getattr(usage, "prompt_tokens", None)
-        completion_tokens = getattr(usage, "completion_tokens", None)
+        names = (
+            ("input_tokens", "output_tokens")
+            if mode == "responses"
+            else ("prompt_tokens", "completion_tokens")
+        )
+        input_tokens, output_tokens = (getattr(usage, name, None) for name in names)
         measured = None
         if (
-            type(prompt_tokens) is int
-            and type(completion_tokens) is int
-            and prompt_tokens >= 0
-            and completion_tokens >= 0
+            type(input_tokens) is int
+            and type(output_tokens) is int
+            and input_tokens >= 0
+            and output_tokens >= 0
         ):
-            measured = {
-                "input_tokens": prompt_tokens,
-                "output_tokens": completion_tokens,
-            }
+            # Cached input remains part of the full input total; M1 does not
+            # subtract it or assume a provider's cache discount.
+            measured = {"input_tokens": input_tokens, "output_tokens": output_tokens}
         self._after(reservation, measured)
         response.message = type(response.message).model_validate(
             _redact(
@@ -234,14 +242,31 @@ class GuardedLLM(LLM):
         )
         return response
 
-    def responses(self, *args, **kwargs):
-        raise ValueError("M1 currently supports the chat completion API only")
+    def completion(self, messages, tools=None, **kwargs):
+        return self._guarded_request(
+            super().completion, "chat", messages, tools, kwargs
+        )
+
+    def responses(self, messages, tools=None, **kwargs):
+        # The pinned SDK disables transport retries for chat but omits that
+        # transport flag on Responses. Set both SDK/LiteLLM retry controls and
+        # require the native API; no implicit bridge back to chat is allowed.
+        kwargs.update(
+            store=False,
+            stream=False,
+            max_retries=0,
+            num_retries=0,
+            use_chat_completions_api=False,
+        )
+        return self._guarded_request(
+            super().responses, "responses", messages, tools, kwargs
+        )
 
     async def acompletion(self, *args, **kwargs):
         raise ValueError("M1 uses a synchronous worker with bounded requests")
 
     async def aresponses(self, *args, **kwargs):
-        raise ValueError("M1 currently supports the chat completion API only")
+        raise ValueError("M1 uses a synchronous worker with bounded requests")
 
 
 class ShellAction(Action):
@@ -339,8 +364,11 @@ def run_session(
     """
     if version("openhands-sdk") != SDK_VERSION:
         raise RuntimeError(f"OpenHands SDK must be pinned to {SDK_VERSION}")
-    if model.get("api_mode", "chat") != "chat":
-        raise ValueError("M1 currently supports the chat completion API only")
+    api_mode = model.get("api_mode", "chat")
+    if api_mode not in {"chat", "responses"}:
+        raise ValueError("M1 supports explicit chat or responses API mode only")
+    if api_mode == "responses" and model.get("provider") != "openai":
+        raise ValueError("M1 supports Responses only through the openai adapter")
     if not api_key:
         raise ValueError("Model API credential is missing")
     if model.get("provider") not in _SUPPORTED_PROVIDERS:
@@ -369,7 +397,7 @@ def run_session(
             model_id = f"{provider}/{model_id}"
         llm = GuardedLLM(
             model=model_id,
-            api_mode="chat",
+            api_mode=api_mode,
             api_key=SecretStr(api_key),
             base_url=model.get("base_url"),
             usage_id="doonex-agent",
