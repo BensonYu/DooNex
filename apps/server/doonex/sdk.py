@@ -556,6 +556,7 @@ class GuardedLLM(LLM):
     _after: Callable[[object, dict | None], None] = PrivateAttr()
     _stop: Callable[[], bool] = PrivateAttr()
     _scheduling: _SchedulingRuntime | None = PrivateAttr(default=None)
+    _execution_policy: str = PrivateAttr(default="workspace")
 
     def _model_name_for_capabilities(self) -> str:
         model = super()._model_name_for_capabilities()
@@ -591,9 +592,44 @@ class GuardedLLM(LLM):
     async def aresolve_runtime_metadata(self, *, force: bool = False):
         return None
 
-    def bind(self, before, after, should_stop, scheduling=None) -> None:
+    def bind(
+        self, before, after, should_stop, scheduling=None, execution_policy="workspace"
+    ) -> None:
         self._before, self._after, self._stop = before, after, should_stop
         self._scheduling = scheduling
+        self._execution_policy = execution_policy
+
+    def _validate_finish_response(self, message, tools):
+        # Validate before Agent's response dispatch: empty/reasoning/content
+        # responses and invalid arguments otherwise enter its repair loop.
+        calls = message.tool_calls or []
+        error = "finish_only accepts only the finish tool, exactly once with valid arguments"
+        if len(calls) != 1 or calls[0].name != FinishTool.name:
+            raise SessionContractError(error)
+
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError
+                result[key] = value
+            return result
+
+        try:
+            arguments = json.loads(calls[0].arguments, object_pairs_hook=unique_object)
+            if not isinstance(arguments, dict):
+                raise TypeError
+            # These optional fields belong to the SDK's tool wire schema and
+            # are removed before FinishAction validation by its normal handler.
+            for name in ("summary", "security_risk"):
+                if name in arguments and not isinstance(arguments.pop(name), str):
+                    raise ValueError
+            finish = next(tool for tool in tools if tool.name == FinishTool.name)
+            action = finish.action_type.model_validate(arguments, strict=True)
+            if not action.message.strip():
+                raise ValueError
+        except (ValueError, TypeError, StopIteration):
+            raise SessionContractError(error) from None
 
     def _guarded_request(self, call, mode, messages, tools, kwargs):
         if self._stop():
@@ -652,6 +688,8 @@ class GuardedLLM(LLM):
                 self.api_key.get_secret_value(),
             )
         )
+        if self._execution_policy == "finish_only":
+            self._validate_finish_response(response.message, tools or [])
         return response
 
     def completion(self, messages, tools=None, **kwargs):
@@ -975,7 +1013,13 @@ def run_session(
             max_input_tokens=model["max_input_tokens"],
             max_output_tokens=model["max_output_tokens"],
         )
-        llm.bind(before_model, after_model, should_stop, scheduling_runtime)
+        llm.bind(
+            before_model,
+            after_model,
+            should_stop,
+            scheduling_runtime,
+            execution_policy=execution_policy,
+        )
         agent = _M1Agent(
             llm=llm,
             doonex_run_id=run_id,

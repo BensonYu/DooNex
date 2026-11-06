@@ -141,6 +141,137 @@ def test_generation_rejects_whole_disallowed_tool_batch_without_retry(
     assert saved_state(tmp_path)[1]["execution_status"] == "error"
 
 
+@pytest.mark.parametrize("mode", ["chat", "responses"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "empty",
+        "reasoning_only",
+        "content_only",
+        "invalid_json",
+        "missing_message",
+        "invalid_message",
+        "empty_message",
+        "extra_argument",
+        "duplicate_argument",
+        "invalid_summary",
+        "duplicate_finish",
+    ],
+)
+def test_generation_never_repairs_incomplete_or_malformed_finish(
+    tmp_path, monkeypatch, mode, kind
+):
+    factory = answer if mode == "chat" else responses_answer
+
+    def response():
+        result = factory("finish", {"message": "proposal"})
+        data = result.model_dump(mode="json")
+        if kind in {"empty", "reasoning_only", "content_only"}:
+            if mode == "chat":
+                message = data["choices"][0]["message"]
+                message["tool_calls"] = []
+                message["content"] = "Not a finish" if kind == "content_only" else None
+                if kind == "reasoning_only":
+                    message["reasoning_content"] = "Synthetic reasoning"
+            else:
+                data["output"] = []
+                if kind == "reasoning_only":
+                    data["output"] = [
+                        {
+                            "id": "rs_synthetic",
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": "Reasoning"}],
+                        }
+                    ]
+                elif kind == "content_only":
+                    data["output"] = [
+                        {
+                            "id": "msg_synthetic",
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "No finish",
+                                    "annotations": [],
+                                }
+                            ],
+                        }
+                    ]
+        elif kind == "duplicate_finish":
+            other = factory("finish", {"message": "another"}, sequence=2)
+            other = other.model_dump(mode="json")
+            if mode == "chat":
+                data["choices"][0]["message"]["tool_calls"].extend(
+                    other["choices"][0]["message"]["tool_calls"]
+                )
+            else:
+                data["output"].extend(other["output"])
+        else:
+            arguments = {
+                "invalid_json": "{",
+                "missing_message": "{}",
+                "invalid_message": '{"message":[]}',
+                "empty_message": '{"message":" "}',
+                "extra_argument": '{"message":"text","command":"forbidden"}',
+                "duplicate_argument": '{"message":"first","message":"second"}',
+                "invalid_summary": '{"message":"text","summary":[]}',
+            }[kind]
+            if mode == "chat":
+                data["choices"][0]["message"]["tool_calls"][0]["function"][
+                    "arguments"
+                ] = arguments
+            else:
+                data["output"][0]["arguments"] = arguments
+        return type(result).model_validate(data)
+
+    requests = provider(monkeypatch, mode, response)
+    finishes = []
+    arguments, reservations, settlements, commands, events = harness(
+        tmp_path,
+        execution_policy="finish_only",
+        model={**MODEL, "api_mode": mode},
+        on_finish=finishes.append,
+    )
+    with pytest.raises(
+        sdk.SessionContractError, match="exactly once with valid arguments"
+    ):
+        sdk.run_session(**arguments)
+    assert len(requests) == len(reservations) == len(settlements) == 1
+    assert settlements[0][1] == {"input_tokens": 100, "output_tokens": 20}
+    assert commands == finishes == []
+    assert not any(event.get("tool_name") for event in events)
+    assert any(event.get("code") == "SessionContractError" for event in events)
+    assert saved_state(tmp_path)[1]["execution_status"] == "error"
+
+
+@pytest.mark.parametrize("mode", ["chat", "responses"])
+def test_generation_accepts_optional_sdk_finish_metadata(tmp_path, monkeypatch, mode):
+    factory = answer if mode == "chat" else responses_answer
+    provider(
+        monkeypatch,
+        mode,
+        lambda: factory(
+            "finish",
+            {
+                "message": "proposal",
+                "summary": "Return the proposal",
+                "security_risk": "LOW",
+            },
+        ),
+    )
+    finishes = []
+    arguments, *_ = harness(
+        tmp_path,
+        execution_policy="finish_only",
+        model={**MODEL, "api_mode": mode},
+        on_finish=finishes.append,
+    )
+    assert sdk.run_session(**arguments) == "finished"
+    assert finishes == ["proposal"]
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
