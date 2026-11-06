@@ -12,6 +12,9 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .skills import _check_name, _no_links
+from .tasksets import _overlaps, _snapshot
+
 TASK_IMAGE = "python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0fde4134606dd40d8dd8dbcade98e669c"
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 
@@ -28,6 +31,28 @@ def _run_id(value: str) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value):
         raise SandboxError("Invalid run identifier")
     return value
+
+
+def _mount_path(value: Path, *, extra: bool = False) -> Path:
+    try:
+        path = Path(value).expanduser().absolute()
+        _no_links(path)
+        if not path.is_dir():
+            raise SandboxError("A mount must be a real directory")
+        path = path.resolve(strict=True)
+        if any(char in str(path) for char in (",", '"')) or any(
+            ord(char) < 32 or ord(char) == 127 for char in str(path)
+        ):
+            raise SandboxError("Unsupported mount path")
+        if extra:
+            info, _ = _snapshot(path, "verifier")
+            for entry in info["verifier_files"]:
+                _check_name(entry["path"])
+            for name in info["verifier_directories"]:
+                _check_name(name)
+        return path
+    except (OSError, ValueError, TypeError) as error:
+        raise SandboxError("Unsafe sandbox mount: " + str(error)) from error
 
 
 class Sandbox:
@@ -89,14 +114,18 @@ class Sandbox:
         should_stop: Callable[[], bool] = lambda: False,
         *,
         read_only: bool = False,
+        skill_path: Path | None = None,
+        verifier_path: Path | None = None,
     ) -> dict:
         run_id = _run_id(run_id)
-        workspace = Path(workspace)
-        if workspace.is_symlink() or not workspace.is_dir():
-            raise SandboxError("Workspace must be a real directory")
-        workspace = workspace.resolve(strict=True)
-        if "," in str(workspace) or "\n" in str(workspace):
-            raise SandboxError("Unsupported workspace path")
+        workspace = _mount_path(workspace)
+        if skill_path is not None and verifier_path is not None:
+            raise SandboxError("Skill and verifier mounts are mutually exclusive")
+        extra_path = skill_path if skill_path is not None else verifier_path
+        if extra_path is not None:
+            extra_path = _mount_path(extra_path, extra=True)
+            if _overlaps(workspace, extra_path):
+                raise SandboxError("Extra context must not overlap the workspace")
         if not isinstance(command, str) or not command or len(command) > 100_000:
             raise SandboxError("A bounded shell command is required")
         if not isinstance(timeout, (float, int)) or not 0 < timeout <= 3600:
@@ -149,6 +178,11 @@ class Sandbox:
             "--workdir",
             "/workspace",
         ]
+        if extra_path is not None:
+            destination = "/skills" if skill_path is not None else "/verifier"
+            arguments.extend(
+                ["--mount", f"type=bind,src={extra_path},dst={destination},readonly"]
+            )
         for variable in [
             "HTTP_PROXY",
             "HTTPS_PROXY",
