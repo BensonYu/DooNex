@@ -1,6 +1,6 @@
 # DooNex 首版架构
 
-更新：2026-11-06 · 状态：M1–M3 已完成受控验收；当前支持多项目、顺序执行/只读审查和手动私有 Skill Arena。M4 有限后台首片已整合，离线回归通过，首轮真实后台续接失败待修复，见 [M4 实施记录](M4_IMPLEMENTATION.md)。适用环境与限制见 [M3 实施记录](M3_IMPLEMENTATION.md)，M2 历史见 [M2 实施记录](M2_IMPLEMENTATION.md)，历史证据见 [M1 实施记录](M1_IMPLEMENTATION.md)。
+更新：2026-11-06 · 状态：M1–M3 已完成受控验收；当前支持多项目、顺序执行/只读审查和手动私有 Skill Arena。M4 有限后台首片已整合，751 项本机回归通过；SDK 续接缺陷已修复并获真实续接证据，后续供应商超时使整批验收仍未完成，见 [M4 实施记录](M4_IMPLEMENTATION.md)。适用环境与限制见 [M3 实施记录](M3_IMPLEMENTATION.md)，M2 历史见 [M2 实施记录](M2_IMPLEMENTATION.md)，历史证据见 [M1 实施记录](M1_IMPLEMENTATION.md)。
 
 ## 1. 选择与边界
 
