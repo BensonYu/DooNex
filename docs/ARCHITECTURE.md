@@ -173,3 +173,9 @@ M1 受控样例与历史界面检查见 [M1 实施记录](M1_IMPLEMENTATION.md)�
 - [SDK 许可证](https://github.com/OpenHands/software-agent-sdk/blob/main/LICENSE)：当前上游 MIT 许可。
 
 引用上游用于说明依赖和参考来源；当前已集成的能力与限制以本文件及实施记录为准，不表示实现了上游全部功能。
+
+## 模型配置扩展
+
+M2 后增加私有 `profiles.json` 配置档；原 `model.json` 只读映射为 `legacy`。配置 ID 稳定，更新使用内容摘要检查并发冲突；记录只含凭据环境变量名。Run 固定 executor/reviewer 的完整 ModelConfig 及配置档版本，旧运行保留单模型兼容路径。worker 为每个角色解析对应秘密，并对两者脱敏；SDK 使用该角色配置，角色切换仍共享总账。
+
+`MetadataClient` 仅按显式适配器 GET 同源 `/v1/models` 或 `/v1/usage`，限制超时、响应大小、重定向和返回字段；不执行自定义查询脚本，不调用推理，不自动识别供应商。查询结果包含来源与时间，模型 ID 仅表示候选。账户余额/套餐记录、本地 token 总账、费用估算分别显示，未知保持 null。混合计费总费用为 null，`metered_cost_usd` 与 `reserved_metered_cost_usd` 记录按量小计并受 Run 费用上限约束。实测与失败见 [模型接入记录](MODEL_INTEGRATION.md)。

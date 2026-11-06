@@ -9,7 +9,7 @@ DooNex 是面向个人编程工作流的本地 Web 工作台，复用 OpenHands 
 ## 当前使用流程
 
 1. 注册并选择本地 Git 项目，选择明确起始提交，保存需求与验收命令。项目具有稳定 ID，切换项目不会改变旧运行的归属。
-2. 在服务端配置实际模型 ID、凭据引用和预算，选择单执行或执行后只读审查。
+2. 在「模型设置」保存实际模型 ID、接口、凭据引用和预算；创建任务时分别选择执行与审查配置档。模型列表与账户用量可显式只读查询。
 3. 执行者在独立代码副本中修改；审查者随后查看固定的修改前/后代码与差异。两个角色使用独立会话，共享一个 Run 的预算与时钟，由一个有效 worker 顺序执行。
 4. 浏览器查看所属项目、角色状态、事件、总量和分项用量。需要时暂停或取消；中断后核查工作区、残留容器和未决动作，再确认续接。
 5. 查看结构化审查及固定快照的检查结果。审查批准仍须通过实际检查；要求修改或无效审查不能标记已验证完成。
@@ -64,7 +64,7 @@ docker pull python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0
 
 ## 配置模型与预算
 
-模型配置保存在私有数据目录的 `model.json`；以 [model.example.json](model.example.json) 为模板，填写实际供应商、API 模型 ID、接口模式、输入/输出上限与超时。当前适配器限定 `openai`、`anthropic`；OpenAI 适配器支持显式选择 Chat/Responses，本轮实际验证的是 `gpt-6.1-sol` 的 Responses 路径；Anthropic Chat 尚未真实调用验证。实际可用性仍须逐个模型和接口验证。远程地址默认要求 HTTPS；已授权私网 HTTP 需要显式开启 `allow_private_http`。
+初始模型配置保存在私有数据目录的 `model.json`，在界面中显示为只读 `legacy`；「模型设置」可复制或创建独立配置档，保存到私有 `profiles.json`。创建 Run 时冻结各角色完整配置和版本，后续编辑不改写历史。以 [model.example.json](model.example.json) 为模板，填写实际供应商、API 模型 ID、接口模式、输入/输出上限与超时。当前适配器限定 `openai`、`anthropic`；OpenAI 适配器支持显式选择 Chat/Responses，已真实验证 `gpt-6.1-sol` 执行及 `gpt-6.1-terra` 审查的 Responses 受控闭环；列表中的 `gpt-5.4-mini` 在相同接口返回 NotFound，不能视为可用。Anthropic Chat 尚未真实调用验证。实际可用性仍须逐个模型和接口验证。远程地址默认要求 HTTPS；已授权私网 HTTP 需要显式开启 `allow_private_http`。
 
 凭据由 `credential_env` 指定的服务端环境变量读取，也可保存到私有 `credentials.json`：它是以该环境变量名为键、密钥为值的 JSON 映射，文件权限须为 `0600`。模型密钥不交给浏览器或任务容器。`service.json` 保存数据库连接配置，也可用 `DOONEX_DATABASE_URL` 覆盖；`DOONEX_MODEL_CONFIG` 可指定模型配置文件。
 
@@ -73,7 +73,7 @@ docker pull python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0
 - `metered`：配置有来源的输入/输出单价与费用上限；价格未知时阻止启动。请求前预留调用数、token 和估计费用，返回后按实际用量结算；未知结果保留预留。
 - `subscription`：仅在用户明确确认包月授权后配置。费用及费用上限为 `null`，界面显示费用未知，不显示免费；仍强制限制调用数、token 和时长。
 
-时长从首次启动计算，包含暂停时间。角色切换与恢复不清零预算；每个模型与工具动作记录所属角色，未知预留同时保留在运行总账和角色分项中。明确创建的新 Run 是一次新授权，当前没有自动重试或任意独立任务之间的共享总账。费用限制约束新请求调度，不能保证供应商账单绝对封顶，也不从聊天产品套餐推断 API 权限。
+时长从首次启动计算，包含暂停时间。角色可以选择不同模型，切换与恢复不清零预算；每个模型与工具动作记录所属角色，未知预留同时保留在运行总账和角色分项中。明确创建的新 Run 是一次新授权，混合计费时总货币费用为未知，按量部分仍受费用上限约束。当前没有自动重试或任意独立任务之间的共享总账。费用限制约束新请求调度，不能保证供应商账单绝对封顶，也不从聊天产品套餐推断 API 权限。
 
 ## 检查与受控真实验收
 
@@ -119,7 +119,7 @@ git status --short
 | [架构说明](docs/ARCHITECTURE.md) | 运行边界、数据、恢复与安全约束 |
 | [M1 实施记录](docs/M1_IMPLEMENTATION.md) | 首次兼容性、受控验收与历史失败 |
 | [M2 实施记录](docs/M2_IMPLEMENTATION.md) | 当前多项目与执行/审查验收状态 |
-| [模型接入参考](docs/MODEL_INTEGRATION.md) | cc-switch 研究、网关只读实测与尚未实现的模型配置/用量计划 |
+| [模型接入与验收](docs/MODEL_INTEGRATION.md) | cc-switch 参考、配置档、角色冻结与真实模型/账户查询结果 |
 | [路线图](docs/ROADMAP.md) | 阶段依赖和退出条件 |
 | [Skill Arena](docs/SKILL_ARENA.md) | 后续私有竞技的唯一详细规则 |
 | [AGENTS.md](AGENTS.md) | 仓库协作与验证约定 |

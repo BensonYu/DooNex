@@ -1,6 +1,6 @@
 # 模型接入与用量查询参考
 
-更新：2026-11-06。状态：**研究与后续实施建议，不是已交付功能**。用户提出参考 [cc-switch](https://github.com/farion1231/cc-switch) 后，按其源码核对模型配置和用量路径；本轮 M2 应用范围不因此扩大。当前 DooNex 模型接入事实以 [README](../README.md) 和 [M2 实施记录](M2_IMPLEMENTATION.md) 为准。
+更新：2026-11-06。状态：**模型配置与用量阶段已实现，受控验收结果如下**。用户提出参考 [cc-switch](https://github.com/farion1231/cc-switch) 后，按其源码核对模型配置和用量路径；M2 历史验收不因此改写；用户后续授权持续推进后，作为 M3 前的独立纵向流程实施。
 
 ## 参考基准与决定
 
@@ -14,7 +14,7 @@
 | 套餐额度 | [`coding_plan.rs`](https://github.com/farion1231/cc-switch/blob/566448f0617165cfc4cd058911db6508be2c8259/src-tauri/src/services/coding_plan.rs)、[`subscription.rs`](https://github.com/farion1231/cc-switch/blob/566448f0617165cfc4cd058911db6508be2c8259/src-tauri/src/services/subscription.rs) 查询套餐窗口、重置时间等 | 额度必须来自账户查询，不通过 token 或模型名推算；没有接口或口径不明确时显示未知 |
 | 请求用量与费用 | [`proxy/usage`](https://github.com/farion1231/cc-switch/tree/566448f0617165cfc4cd058911db6508be2c8259/src-tauri/src/proxy/usage) 和 [用量说明](https://github.com/farion1231/cc-switch/blob/566448f0617165cfc4cd058911db6508be2c8259/docs/user-manual/zh/4-proxy/4.4-usage.md) 从响应或客户端日志统计用量，再按价格估算 | 保留现有 SDK 响应用量与 Run 总账；价格有明确来源才估算费用，包月费用保持 `null`。供应商账单、网关记录与本地 Run 的覆盖范围不同 |
 
-“接入模型”在这里指连接远程 API，不是把模型权重下载到 Mac mini。模型列表只提供候选 ID，不能证明工具调用、推理档位、Chat/Responses 或上下文上限可用；这些能力仍需按具体配置验证。当前 DooNex 仍是服务端单份模型配置，执行与审查共用该配置；两个配置档、角色模型选择和用量面板尚未实现。
+“接入模型”在这里指连接远程 API，不是把模型权重下载到 Mac mini。模型列表只提供候选 ID，不能证明工具调用、推理档位、Chat/Responses 或上下文上限可用；这些能力仍需按具体配置验证。DooNex 现已支持私有模型配置档、明确选择执行/审查模型和账户查询面板。复杂/快速仅是用户给配置档的名称；当前没有自动任务复杂度分类，也没有模型自动降级。
 
 ## 当前网关的只读实测
 
@@ -28,7 +28,7 @@ cc-switch 的 [`UsageScriptModal.tsx`](https://github.com/farion1231/cc-switch/b
 
 实测状态、字段和查询时间存于本机私有验收记录；网关地址、密钥、具体账户额度及完整账户响应不进入产品仓库。
 
-## 建议实施顺序
+## 已实施的流程
 
 1. **供应商与模型配置档**：沿用现有 `ModelConfig` 和秘密引用，增加稳定配置 ID、只读模型列表与手工输入回退。创建 Run 时冻结实际模型、接口、能力和价格来源；后续修改供应商设置不能改变历史运行。先由用户明确选择复杂/快速档，不做自动复杂度分类或故障后偷偷换模型。
 2. **按角色选择**：在固定 executor/reviewer 流程中显式绑定配置档，每个请求预留该模型所需额度，两个角色继续共享 Run 总账、时钟及未知预留。模型是否适合某角色取决于实际结果，不预设审查一定适合小模型。
@@ -36,7 +36,7 @@ cc-switch 的 [`UsageScriptModal.tsx`](https://github.com/farion1231/cc-switch/b
 4. **三种口径分别展示**：本次运行的调用/token/未知预留；网关或账户的套餐/余额；有价格依据的费用估算。缓存与推理 token 等细分仅在响应明确提供时展示，未知不用零代替。额度查询不得清空本地账本或隐藏失败。
 5. **验收后再扩展**：用固定响应覆盖零值、不限量标记、多窗口、401、429、超时、坏 JSON、字段缺失和换账户；再做实际元数据查询。新增模型的工具调用和恢复仍需单独受控验证，不能拿模型列表查询替代。
 
-这些是 P03 模型配置和现有用量展示的后续建议，不是 M3 Skill Arena 或 M4 自动调度的实现。开始应用改动前，应把本节收敛成一个独立可验收的小阶段。
+以上扩展 P03 模型配置和现有用量展示，不代表 M3 Skill Arena 或 M4 自动调度已完成。原服务端 model.json 作为只读 legacy 配置保留；新配置保存到私有 profiles.json，更新校验版本摘要，凭据只保存服务端引用。混合按量/包月角色的总货币费用为 null，另记按量小计并施加共享费用上限。
 
 ## 暂不直接引入用量脚本
 
@@ -45,3 +45,17 @@ cc-switch 的 [`UsageScriptModal.tsx`](https://github.com/farion1231/cc-switch/b
 当前需求用固定原生只读适配即可满足：限制目标地址、方法、响应大小、超时和重定向，密钥只在 HTTP 层注入。无需引入任意 JS、外部 shell、自动修改 CLI 配置或自动故障转移。
 
 上游 [LICENSE](https://github.com/farion1231/cc-switch/blob/566448f0617165cfc4cd058911db6508be2c8259/LICENSE) 为 MIT（2025 Jason Young）。后续若复制代码或实质性片段，应保留许可、版权和具体文件/提交来源；本次仅研究与设计，不改变 DooNex 自有许可证状态。
+
+## 本阶段实际验收
+
+后端及真实模型验证版本为 `7c86b40fc0f2a367164eb217288a6a17ff3e3b38`，2026-11-06 在原 Apple Silicon Mac mini 环境验证：
+
+- 完整本机回归 **214 passed，3 warnings，退出码 0**，含真实 Docker 边界；这些测试中的模型响应是模拟数据。
+- 配置档保存、模型列表和账户用量走真实服务端 API；两份配置的 `/v1/models` 与 `/v1/usage` 均 HTTP 200，每次模型列表返回 21 个 ID。没有把未调用模型记为兼容。
+- 首次 Sol 执行、Mini 审查：执行角色完成；`gpt-5.4-mini` Responses 请求返回 `NotFoundError`，Run 为 `failed`。共 4 次调用、2,854 已知 tokens、1 次未知调用，7,024 tokens 预留保持；不隐藏或按零用量结算。
+- 新建明确的 Terra 配置后单独验收：`gpt-6.1-sol` 执行与 `gpt-6.1-terra` 审查均完成，结构化审查批准，固定快照通过实际检查。共 **6 次调用、7,424 tokens**，无未知预留，费用 `null`；原脏工作区保持完整。没有自动修改失败运行的模型或重放动作。
+- 真实浏览器完成配置展示、21 个模型 ID、账户查询来源、未知上游额度、切换清理旧结果、角色选择和桌面/手机布局检查；初次测试发现初始化请求会抢走设置页，`85cb32c` 修复后显式延迟初始响应复验，8 项真实界面检查通过；模型输入边界另在 `aa2dac6` 修复，构建通过。合成响应界面检查 19 项通过，覆盖失败状态及配置冲突，不能代替真实模型验收。
+
+上述两个模型只验证了当前网关的 Responses 编程/审查受控样例，不证明速度、价格或复杂度优劣。Mini 的模型列表记录保留，其 Responses 路径不能列为可用。Anthropic 和其他模型仍未真实验证。
+
+私有原始记录保存在本机 DooNex 数据目录的 `verification/model-profiles/`；完整历史 campaign 继续累积，没有清零。真实账户响应、网关地址、API 密钥和样例源代码不进入本仓库。
