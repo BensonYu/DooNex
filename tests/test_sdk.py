@@ -418,3 +418,117 @@ def test_constructor_diagnostics_are_redacted(tmp_path, monkeypatch, caplog):
     assert "constructor diagnostic" in caplog.text
     assert "[REDACTED]" in caplog.text
     assert SECRET not in caplog.text
+
+
+def test_fresh_worker_disables_inherited_tracing_and_dotenv(tmp_path):
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    (tmp_path / ".env").write_text(
+        "LMNR_PROJECT_API_KEY=FAKE_DOTENV_TRACING_KEY\n"
+        "OTEL_ENDPOINT=https://dotenv-tracing.invalid\n"
+        "DOONEX_DOTENV_MUST_NOT_LOAD=loaded\n"
+    )
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "apps/server"),
+            "LITELLM_MODE": "DEV",
+            "LITELLM_LOCAL_MODEL_COST_MAP": "False",
+            "OTEL_SDK_DISABLED": "false",
+            "LMNR_PROJECT_API_KEY": "FAKE_INHERITED_TRACING_KEY",
+            "OTEL_ENDPOINT": "https://inherited-tracing.invalid",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "https://traces.invalid",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "https://exporter.invalid",
+        }
+    )
+    script = textwrap.dedent(
+        """
+        import os
+        import socket
+        import sys
+        from pathlib import Path
+
+        attempts = []
+        def forbidden_connection(*args, **kwargs):
+            attempts.append("network")
+            raise AssertionError("worker import/SDK fixture must stay offline")
+        socket.socket.connect = forbidden_connection
+
+        from doonex.sdk import GuardedLLM, run_session
+        from litellm import ModelResponse
+        from openhands.sdk.observability.laminar import should_enable_observability
+
+        for name in (
+            "LMNR_PROJECT_API_KEY", "OTEL_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "DOONEX_DOTENV_MUST_NOT_LOAD",
+        ):
+            assert name not in os.environ, name
+        assert os.environ["LITELLM_MODE"] == "PRODUCTION"
+        assert os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] == "True"
+        assert os.environ["OTEL_SDK_DISABLED"] == "true"
+        assert not should_enable_observability()
+        assert "lmnr" not in sys.modules
+
+        def fake_transport(*args, **kwargs):
+            return ModelResponse(
+                id="offline-finish", model="gateway-alias",
+                choices=[{"index": 0, "finish_reason": "tool_calls", "message": {
+                    "role": "assistant", "content": None, "tool_calls": [{
+                        "id": "finish-1", "type": "function", "function": {
+                            "name": "finish", "arguments": '{"message": "done"}'
+                        }
+                    }]
+                }}],
+                usage={"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+            )
+        GuardedLLM._transport_call = fake_transport
+        assert run_session(
+            run_id="offline-privacy", state_dir=Path("state"), prompt="Finish",
+            model={
+                "provider": "openai", "model_id": "gateway-alias", "api_mode": "chat",
+                "base_url": "https://authorized-gateway.invalid/v1",
+                "max_input_tokens": 100000, "max_output_tokens": 1000,
+                "timeout_seconds": 1,
+            },
+            api_key="FAKE_MODEL_KEY", before_model=lambda *args: object(),
+            after_model=lambda *args: None, shell=lambda *args: {},
+            on_event=lambda *args: None, should_stop=lambda: False,
+        ) == "finished"
+        assert not should_enable_observability()
+        assert "lmnr" not in sys.modules
+        assert attempts == [], attempts
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("state", ["tracing", "callbacks", "otel"])
+def test_reusing_instrumented_process_is_rejected(tmp_path, monkeypatch, state):
+    import litellm
+    import opentelemetry.trace
+    from openhands.sdk.observability import laminar
+
+    if state == "tracing":
+        monkeypatch.setattr(laminar, "_observability_enabled", True)
+    elif state == "callbacks":
+        monkeypatch.setattr(litellm, "success_callback", [lambda *args: None])
+    else:
+        monkeypatch.setattr(opentelemetry.trace, "_TRACER_PROVIDER", object())
+    kwargs, reservations, settlements, _, _ = harness(tmp_path / "state")
+    with pytest.raises(RuntimeError, match="fresh DooNex worker"):
+        run_session(**kwargs)
+    assert reservations == settlements == []
+    assert not Path(kwargs["state_dir"]).exists()

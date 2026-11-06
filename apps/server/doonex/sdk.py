@@ -1,14 +1,21 @@
-"""Pinned OpenHands integration; task code only runs through the shell callback.
+"""Pinned OpenHands integration for a dedicated DooNex worker process.
+
+Task code only runs through the shell callback. This module owns the worker
+process telemetry environment; it must be imported before any SDK/model use.
 
 The small private overrides below disable SDK 1.60.1's ambient discovery and
 tool bootstrap. They do not replace its model protocol, agent loop or event log.
 Upgrade the SDK only after running the boundary and recovery contract tests.
 """
 
+# Runtime privacy must be configured before third-party imports.
+
 from __future__ import annotations
 
 import json
 import logging
+import os
+import sys
 import threading
 import uuid
 from collections.abc import Callable
@@ -17,6 +24,21 @@ from importlib.metadata import version
 from pathlib import Path
 from typing import Any, ClassVar
 
+# The worker is an independent process. These settings do not alter the
+# user's shell environment. Never restore inherited tracing switches later:
+# SDK 1.60.1 checks them lazily and permanently caches an enabled result.
+for _tracing_env in (
+    "LMNR_PROJECT_API_KEY",
+    "OTEL_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+):
+    os.environ.pop(_tracing_env, None)
+os.environ["LITELLM_MODE"] = "PRODUCTION"  # Prevent implicit .env discovery.
+os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"  # No remote cost-map download.
+os.environ["OTEL_SDK_DISABLED"] = "true"
+
+import litellm
 from litellm import model_cost
 from openhands.sdk import LLM, Agent
 from openhands.sdk.context import AgentContext
@@ -34,6 +56,32 @@ SDK_VERSION = "1.60.1"
 _SUPPORTED_PROVIDERS = frozenset({"openai", "anthropic"})
 _RUN_LOCK = threading.Lock()
 _CALLBACKS: dict[str, tuple[Callable[[str], dict], Callable[[], bool]]] = {}
+
+
+def _assert_private_runtime() -> None:
+    # Environment filtering cannot undo an already instrumented host process.
+    # Fail closed rather than silently reusing its exporters or callbacks.
+    from openhands.sdk.observability import laminar
+
+    trace_module = sys.modules.get("opentelemetry.trace")
+    if (
+        laminar.should_enable_observability()
+        or getattr(trace_module, "_TRACER_PROVIDER", None) is not None
+    ):
+        raise RuntimeError("Start a fresh DooNex worker without initialized tracing")
+    callback_fields = (
+        "callbacks",
+        "input_callback",
+        "success_callback",
+        "failure_callback",
+        "service_callback",
+        "audit_log_callbacks",
+        "_async_input_callback",
+        "_async_success_callback",
+        "_async_failure_callback",
+    )
+    if any(getattr(litellm, field, ()) for field in callback_fields):
+        raise RuntimeError("Start a fresh DooNex worker without LiteLLM callbacks")
 
 
 class SessionStopped(Exception):
@@ -297,6 +345,7 @@ def run_session(
         raise ValueError("Model API credential is missing")
     if model.get("provider") not in _SUPPORTED_PROVIDERS:
         raise ValueError("M1 supports only the openai and anthropic provider adapters")
+    _assert_private_runtime()
     state_dir = Path(state_dir).resolve()
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     control_dir = state_dir / "control"
