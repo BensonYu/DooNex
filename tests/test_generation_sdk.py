@@ -7,11 +7,23 @@ import socket
 import subprocess
 import sys
 import textwrap
+import uuid
 from pathlib import Path
 
 import pytest
 from doonex import sdk
-from test_sdk import MODEL, SECRET, answer, harness, responses_answer
+from openhands.sdk.event import MessageEvent
+from test_sdk import MODEL, SECRET, answer, responses_answer
+from test_sdk import harness as sdk_harness
+
+
+def harness(tmp_path, **overrides):
+    arguments, *records = sdk_harness(tmp_path, **overrides)
+    if arguments.get("execution_policy") == "finish_only":
+        arguments.setdefault(
+            "frozen_prompt", arguments["prompt"] or "Create result.txt containing done"
+        )
+    return arguments, *records
 
 
 @pytest.fixture(autouse=True)
@@ -55,6 +67,235 @@ def state_hashes(root):
     }
 
 
+@pytest.mark.parametrize("frozen", [None, "", " ", [], "a different prompt"])
+def test_generation_requires_the_frozen_prompt_before_creating_state(tmp_path, frozen):
+    root = tmp_path / "session"
+    arguments, reservations, settlements, commands, _ = sdk_harness(
+        root, execution_policy="finish_only", frozen_prompt=frozen
+    )
+    with pytest.raises(ValueError, match="frozen prompt"):
+        sdk.run_session(**arguments)
+    assert not root.exists()
+    assert reservations == settlements == commands == []
+
+
+@pytest.mark.parametrize("change", ["append", "different_frozen", "missing_frozen"])
+def test_generation_resume_cannot_replace_or_append_its_prompt(tmp_path, change):
+    arguments, reservations, settlements, commands, _ = harness(
+        tmp_path, execution_policy="finish_only", should_stop=lambda: True
+    )
+    assert sdk.run_session(**arguments) == "paused"
+    arguments.update(resume=True, prompt=None, should_stop=lambda: False)
+    if change == "append":
+        arguments["prompt"] = arguments["frozen_prompt"]
+    elif change == "different_frozen":
+        arguments["frozen_prompt"] = "different frozen prompt"
+    else:
+        arguments.pop("frozen_prompt")
+    before = state_hashes(tmp_path)
+    with pytest.raises(ValueError, match="prompt"):
+        sdk.run_session(**arguments)
+    assert state_hashes(tmp_path) == before
+    assert reservations == settlements == commands == []
+
+
+def saved_user(root):
+    for path in root.rglob("event-*.json"):
+        value = json.loads(path.read_text())
+        if value.get("kind") == "MessageEvent" and value.get("source") == "user":
+            return path, value
+    raise AssertionError("The SDK did not persist its generation user message")
+
+
+def saved_system(root):
+    for path in root.rglob("event-*.json"):
+        value = json.loads(path.read_text())
+        if value.get("kind") == "SystemPromptEvent":
+            return path, value
+    raise AssertionError("The SDK did not persist its generation system message")
+
+
+@pytest.mark.parametrize("mode", ["chat", "responses"])
+@pytest.mark.parametrize("finished", [False, True])
+@pytest.mark.parametrize(
+    "change",
+    ["text", "extra_user", "missing", "content", "source", "activated", "extended"],
+)
+def test_saved_generation_prompt_tampering_fails_before_sdk_load(
+    tmp_path, monkeypatch, mode, finished, change
+):
+    factory = answer if mode == "chat" else responses_answer
+    requests = provider(
+        monkeypatch, mode, lambda: factory("finish", {"message": "saved proposal"})
+    )
+    finishes = []
+    arguments, reservations, settlements, commands, _ = harness(
+        tmp_path,
+        execution_policy="finish_only",
+        model={**MODEL, "api_mode": mode},
+        should_stop=lambda: not finished,
+        on_finish=finishes.append,
+    )
+    assert sdk.run_session(**arguments) == ("finished" if finished else "paused")
+    path, value = saved_user(tmp_path)
+    if change == "missing":
+        path.unlink()
+    else:
+        if change == "text":
+            value["llm_message"]["content"][0]["text"] = "SYNTHETIC_FROZEN_INPUT_TAMPER"
+        elif change == "extra_user":
+            value["id"] = str(uuid.uuid4())
+            path = path.with_name("event-99999-" + value["id"] + ".json")
+        elif change == "content":
+            value["llm_message"]["content"].append(
+                {"type": "text", "text": "An additional input"}
+            )
+        elif change == "source":
+            value["source"] = "agent"
+        elif change == "activated":
+            value["activated_skills"] = ["unauthorized extra context"]
+        else:
+            value["extended_content"] = [{"type": "text", "text": "hidden input"}]
+        path.write_text(json.dumps(value))
+    before = state_hashes(tmp_path)
+
+    def forbidden_load(*args, **kwargs):
+        pytest.fail("A changed generation prompt must fail before SDK construction")
+
+    monkeypatch.setattr(sdk._M1Conversation, "__init__", forbidden_load)
+    arguments.update(resume=True, prompt=None, should_stop=lambda: False)
+    with pytest.raises(ValueError, match="frozen prompt"):
+        sdk.run_session(**arguments)
+    assert state_hashes(tmp_path) == before
+    assert len(requests) == len(reservations) == len(settlements) == int(finished)
+    assert finishes == (["saved proposal"] if finished else [])
+    assert commands == []
+
+
+@pytest.mark.parametrize("mode", ["chat", "responses"])
+@pytest.mark.parametrize("finished", [False, True])
+@pytest.mark.parametrize(
+    "change", ["text", "extra_system", "missing", "dynamic", "tools", "source"]
+)
+def test_saved_generation_system_tampering_fails_before_sdk_load(
+    tmp_path, monkeypatch, mode, finished, change
+):
+    factory = answer if mode == "chat" else responses_answer
+    requests = provider(
+        monkeypatch, mode, lambda: factory("finish", {"message": "saved proposal"})
+    )
+    finishes = []
+    arguments, reservations, settlements, commands, _ = harness(
+        tmp_path,
+        execution_policy="finish_only",
+        model={**MODEL, "api_mode": mode},
+        should_stop=lambda: not finished,
+        on_finish=finishes.append,
+    )
+    assert sdk.run_session(**arguments) == ("finished" if finished else "paused")
+    path, value = saved_system(tmp_path)
+    assert value.get("dynamic_context") is None
+    if change == "missing":
+        path.unlink()
+    else:
+        if change == "text":
+            value["system_prompt"]["text"] = "SYNTHETIC_SYSTEM_INPUT_TAMPER"
+        elif change == "extra_system":
+            value["id"] = str(uuid.uuid4())
+            path = path.with_name("event-99999-" + value["id"] + ".json")
+        elif change == "dynamic":
+            value["dynamic_context"] = {"type": "text", "text": "hidden context"}
+        elif change == "tools":
+            value["tools"] = []
+        else:
+            value["source"] = "user"
+        path.write_text(json.dumps(value))
+    before = state_hashes(tmp_path)
+
+    def forbidden_load(*args, **kwargs):
+        pytest.fail("A changed system prompt must fail before SDK construction")
+
+    monkeypatch.setattr(sdk._M1Conversation, "__init__", forbidden_load)
+    arguments.update(resume=True, prompt=None, should_stop=lambda: False)
+    with pytest.raises(ValueError, match="frozen prompt"):
+        sdk.run_session(**arguments)
+    assert state_hashes(tmp_path) == before
+    assert len(requests) == len(reservations) == len(settlements) == int(finished)
+    assert finishes == (["saved proposal"] if finished else [])
+    assert commands == []
+
+
+@pytest.mark.parametrize("mode", ["chat", "responses"])
+@pytest.mark.parametrize("change", ["user", "system", "assistant"])
+def test_generation_rechecks_all_dispatched_input_before_reservation(
+    tmp_path, monkeypatch, mode, change
+):
+    original_step = sdk._M1Agent._step
+
+    def changed_step(agent, conversation, on_event, stream):
+        for event in conversation.state.active_branch():
+            if change == "user" and getattr(event, "kind", None) == "MessageEvent":
+                event.llm_message.content[0].text = "changed after SDK construction"
+            if (
+                change == "system"
+                and getattr(event, "kind", None) == "SystemPromptEvent"
+            ):
+                event.system_prompt.text = "changed after SDK construction"
+        if change == "assistant":
+            on_event(
+                MessageEvent(
+                    source="agent",
+                    llm_message=sdk.Message(
+                        role="assistant", content=[sdk.TextContent(text="hidden input")]
+                    ),
+                )
+            )
+        return original_step(agent, conversation, on_event, stream)
+
+    monkeypatch.setattr(sdk._M1Agent, "_step", changed_step)
+    finishes = []
+    arguments, reservations, settlements, commands, _ = harness(
+        tmp_path,
+        execution_policy="finish_only",
+        model={**MODEL, "api_mode": mode},
+        on_finish=finishes.append,
+    )
+    with pytest.raises(sdk.SessionContractError, match="frozen system and user prompt"):
+        sdk.run_session(**arguments)
+    assert reservations == settlements == commands == finishes == []
+
+
+@pytest.mark.parametrize("mode", ["chat", "responses"])
+def test_generation_resume_matches_the_redacted_unicode_prompt(
+    tmp_path, monkeypatch, mode
+):
+    factory = answer if mode == "chat" else responses_answer
+    requests = provider(
+        monkeypatch, mode, lambda: factory("finish", {"message": "saved proposal"})
+    )
+    prompt = "冻结的可见输入：" + SECRET
+    finishes = []
+    arguments, reservations, settlements, commands, _ = harness(
+        tmp_path,
+        execution_policy="finish_only",
+        prompt=prompt,
+        model={**MODEL, "api_mode": mode},
+        on_finish=finishes.append,
+    )
+    assert sdk.run_session(**arguments) == "finished"
+    arguments.update(resume=True, prompt=None)
+    assert sdk.run_session(**arguments) == "finished"
+    assert finishes == ["saved proposal", "saved proposal"]
+    assert len(requests) == len(reservations) == len(settlements) == 1
+    assert commands == []
+    _, state = saved_state(tmp_path)
+    assert (
+        state["agent"]["generation_prompt_sha256"]
+        == hashlib.sha256(prompt.replace(SECRET, "[REDACTED]").encode()).hexdigest()
+    )
+    assert SECRET not in "".join(path.read_text() for path in tmp_path.rglob("*.json"))
+
+
 @pytest.mark.parametrize("mode", ["chat", "responses"])
 def test_generation_registers_only_finish_and_uses_fixed_prompt(
     tmp_path, monkeypatch, mode
@@ -93,11 +334,19 @@ def test_generation_registers_only_finish_and_uses_fixed_prompt(
     assert "bounded Skill candidate generator" in str(system)
     assert "unverified proposal" in str(system)
     assert "Untrusted example" not in str(system)
+    assert "CURRENT_DATETIME" not in str(system)
+    _, system_event = saved_system(tmp_path)
+    assert system_event["system_prompt"]["text"] == sdk._GENERATION_SYSTEM_PROMPT
+    assert system_event.get("dynamic_context") is None
     _, state = saved_state(tmp_path)
     assert state["agent"]["execution_policy"] == "finish_only"
     assert state["agent"]["doonex_run_id"] == "sdk-contract"
     assert state["agent"]["tools"] == []
     assert state["agent"]["include_default_tools"] == ["FinishTool"]
+    assert (
+        state["agent"]["generation_prompt_sha256"]
+        == hashlib.sha256(arguments["frozen_prompt"].encode()).hexdigest()
+    )
     assert SECRET not in json.dumps(events)
     assert SECRET not in "".join(path.read_text() for path in tmp_path.rglob("*.json"))
 
@@ -353,6 +602,8 @@ def test_generation_paused_before_dispatch_resumes_with_original_policy(
         "kind",
         "system_prompt",
         "system_prompt_kwargs",
+        "generation_prompt_sha256",
+        "remove_prompt_sha256",
     ],
 )
 def test_resume_checks_saved_generation_policy_before_sdk_load(
@@ -366,6 +617,8 @@ def test_resume_checks_saved_generation_policy_before_sdk_load(
     agent = state["agent"]
     if change == "remove_policy":
         del agent["execution_policy"]
+    elif change == "remove_prompt_sha256":
+        del agent["generation_prompt_sha256"]
     else:
         agent[change] = {
             "tools": [{"name": "doonex_shell", "params": {"run_id": "sdk-contract"}}],
@@ -377,6 +630,7 @@ def test_resume_checks_saved_generation_policy_before_sdk_load(
             "kind": "Agent",
             "system_prompt": "A changed generation policy",
             "system_prompt_kwargs": {"soul_content": "changed"},
+            "generation_prompt_sha256": "f" * 64,
         }[change]
     path.write_text(json.dumps(state))
     before = state_hashes(tmp_path)
@@ -463,6 +717,7 @@ def test_generation_finished_resume_in_fresh_process_uses_no_model(tmp_path, mod
 
             arguments, reservations, settlements, commands, _ = harness(
                 root / "session", execution_policy="finish_only",
+                frozen_prompt="Create result.txt containing done",
                 model={**MODEL, "api_mode": mode}, on_finish=finishes.append,
             )
             if phase == "resume":

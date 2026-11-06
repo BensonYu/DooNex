@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import stat
 import sys
 import threading
 import uuid
@@ -50,6 +51,7 @@ from openhands.sdk.conversation.state import (
     ConversationExecutionStatus,
     ConversationState,
 )
+from openhands.sdk.llm import Message, TextContent
 from openhands.sdk.tool import Tool, ToolDefinition, ToolExecutor
 from openhands.sdk.tool.builtins import FinishTool
 from openhands.sdk.tool.schema import Action, Observation
@@ -394,7 +396,10 @@ def _verify_skill_resume(saved_path: Path, skill: _OpaqueSkill | None) -> None:
 
 
 def _verify_execution_policy_resume(
-    saved_path: Path, run_id: str, execution_policy: str
+    saved_path: Path,
+    run_id: str,
+    execution_policy: str,
+    generation_prompt_sha256: str | None = None,
 ) -> None:
     # Upstream permits adding tools and replacing other Agent fields on resume.
     # Check the saved contract before any SDK deserialization or autosave can
@@ -421,7 +426,8 @@ def _verify_execution_policy_resume(
         ):
             raise ValueError
         if execution_policy == "finish_only" and (
-            agent.get("system_prompt") != _GENERATION_SYSTEM_PROMPT
+            agent.get("generation_prompt_sha256") != generation_prompt_sha256
+            or agent.get("system_prompt") != _GENERATION_SYSTEM_PROMPT
             or agent.get("system_prompt_kwargs")
             != {
                 "soul_content": "DooNex executor worker",
@@ -432,6 +438,81 @@ def _verify_execution_policy_resume(
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         raise ValueError(
             "SDK resume execution policy does not match its frozen tools and prompt"
+        ) from None
+
+
+def _generation_user_message(prompt: str) -> dict:
+    return Message(role="user", content=[TextContent(text=prompt)]).model_dump(
+        mode="json", exclude_none=True
+    )
+
+
+def _generation_system_message() -> dict:
+    return Message(
+        role="system", content=[TextContent(text=_GENERATION_SYSTEM_PROMPT)]
+    ).model_dump(mode="json", exclude_none=True)
+
+
+def _verify_generation_prompt_resume(saved_path: Path, expected: dict) -> None:
+    # Read primitive JSON before the SDK can load or autosave the conversation.
+    # Require one fixed system and frozen user, including on abandoned branches.
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError
+            result[key] = value
+        return result
+
+    try:
+        events = saved_path / "events"
+        if saved_path.is_symlink() or events.is_symlink() or not events.is_dir():
+            raise ValueError
+        paths = sorted(events.glob("event-*.json"))
+        if not paths or len(paths) > 128:
+            raise ValueError
+        remaining, users, systems = 16 * 1024 * 1024, [], []
+        expected_system = _generation_system_message()["content"][0]
+        expected_tools = [
+            tool.model_dump(mode="json", exclude_none=True)
+            for tool in FinishTool.create()
+        ]
+        for path in paths:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as source:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    raise ValueError
+                raw = source.read(remaining + 1)
+            remaining -= len(raw)
+            if remaining < 0:
+                raise ValueError
+            event = json.loads(raw, object_pairs_hook=unique_object)
+            message = event.get("llm_message") or {}
+            if event.get("kind") == "MessageEvent" and (
+                event.get("source") == "user" or message.get("role") == "user"
+            ):
+                if (
+                    event.get("source") != "user"
+                    or message != expected
+                    or event.get("activated_skills") != []
+                    or event.get("extended_content") != []
+                ):
+                    raise ValueError
+                users.append(event)
+            if event.get("kind") == "SystemPromptEvent":
+                if (
+                    event.get("source") != "agent"
+                    or event.get("system_prompt") != expected_system
+                    or event.get("dynamic_context") is not None
+                    or event.get("tools") != expected_tools
+                ):
+                    raise ValueError
+                systems.append(event)
+        if len(users) != 1 or len(systems) != 1:
+            raise ValueError
+    except (OSError, ValueError, TypeError, AttributeError):
+        raise ValueError(
+            "SDK resume generation messages differ from their frozen prompt"
         ) from None
 
 
@@ -557,6 +638,7 @@ class GuardedLLM(LLM):
     _stop: Callable[[], bool] = PrivateAttr()
     _scheduling: _SchedulingRuntime | None = PrivateAttr(default=None)
     _execution_policy: str = PrivateAttr(default="workspace")
+    _generation_user: dict | None = PrivateAttr(default=None)
 
     def _model_name_for_capabilities(self) -> str:
         model = super()._model_name_for_capabilities()
@@ -593,11 +675,18 @@ class GuardedLLM(LLM):
         return None
 
     def bind(
-        self, before, after, should_stop, scheduling=None, execution_policy="workspace"
+        self,
+        before,
+        after,
+        should_stop,
+        scheduling=None,
+        execution_policy="workspace",
+        generation_user=None,
     ) -> None:
         self._before, self._after, self._stop = before, after, should_stop
         self._scheduling = scheduling
         self._execution_policy = execution_policy
+        self._generation_user = generation_user
 
     def _validate_finish_response(self, message, tools):
         # Validate before Agent's response dispatch: empty/reasoning/content
@@ -634,6 +723,18 @@ class GuardedLLM(LLM):
     def _guarded_request(self, call, mode, messages, tools, kwargs):
         if self._stop():
             raise SessionStopped("Execution stopped before a model request")
+        if self._execution_policy == "finish_only":
+            actual = [
+                message.model_dump(mode="json", exclude_none=True)
+                for message in messages
+            ]
+            if self._generation_user is None or actual != [
+                _generation_system_message(),
+                self._generation_user,
+            ]:
+                raise SessionContractError(
+                    "Generation request differs from its frozen system and user prompt"
+                )
         # Bytes plus framing overhead is deliberately conservative, not a claim
         # of an exact provider tokenizer. Tool schemas and system text count.
         payload = {
@@ -785,6 +886,7 @@ class _M1Agent(Agent):
     # always supplies identity directly, independently of the available tools.
     doonex_run_id: str = ""
     execution_policy: Literal["workspace", "finish_only"] = "workspace"
+    generation_prompt_sha256: str | None = None
 
     def _initialize(self, state):
         # SDK's ordinary bootstrap can add host-backed vision/profile tools.
@@ -799,6 +901,13 @@ class _M1Agent(Agent):
     def get_all_llms(self):
         # Upstream's default excludes LLM subclasses, including GuardedLLM.
         yield self.llm
+
+    def get_dynamic_context(self, state):
+        if self.execution_policy == "finish_only":
+            # A generation request is exactly the frozen input and policy.
+            # SDK's ordinary context adds a timestamp even with all Skills off.
+            return None
+        return super().get_dynamic_context(state)
 
     def _step(self, conversation, on_event, stream):
         scheduling = _SCHEDULING.get(self.doonex_run_id)
@@ -909,6 +1018,7 @@ def run_session(
     scheduling: SessionScheduling | None = None,
     shell_with_action: Callable[[str, dict], dict] | None = None,
     execution_policy: str = "workspace",
+    frozen_prompt: str | None = None,
 ) -> str:
     """Run/resume one SDK conversation; model credentials remain in this process.
 
@@ -926,7 +1036,8 @@ def run_session(
 
     ``finish_only`` is an executor-only generation policy with a fixed system
     prompt and only FinishTool. It rejects Skills and scheduling; the caller's
-    shell callback is never registered. Policy and tools cannot change on resume.
+    shell callback is never registered. The caller supplies ``frozen_prompt``
+    on every call; resume cannot append messages or alter its saved user input.
     """
     if execution_policy not in ("workspace", "finish_only"):
         raise ValueError(
@@ -941,6 +1052,13 @@ def run_session(
         raise ValueError(
             "finish_only requires executor without Skill, scheduling or shell actions"
         )
+    if execution_policy == "finish_only":
+        if not isinstance(frozen_prompt, str) or not frozen_prompt.strip():
+            raise ValueError("finish_only requires its frozen prompt")
+        if resume and prompt is not None:
+            raise ValueError("finish_only resume cannot append a prompt")
+        if not resume and prompt != frozen_prompt:
+            raise ValueError("finish_only prompt must match its frozen prompt")
     if role not in {"executor", "reviewer"}:
         raise ValueError("Only the executor and reviewer roles are supported")
     if role == "reviewer" and skill is not None:
@@ -963,6 +1081,11 @@ def run_session(
         raise ValueError("M1 supports Responses only through the openai adapter")
     if not api_key:
         raise ValueError("Model API credential is missing")
+    generation_user, generation_prompt_sha256 = None, None
+    if execution_policy == "finish_only":
+        cleaned_prompt = _redact(frozen_prompt, api_key)
+        generation_user = _generation_user_message(cleaned_prompt)
+        generation_prompt_sha256 = hashlib.sha256(cleaned_prompt.encode()).hexdigest()
     if model.get("provider") not in _SUPPORTED_PROVIDERS:
         raise ValueError("M1 supports only the openai and anthropic provider adapters")
     _assert_private_runtime()
@@ -988,8 +1111,12 @@ def run_session(
     if not resume and not prompt:
         raise ValueError("A new conversation requires a prompt")
     if resume:
-        _verify_execution_policy_resume(saved_path, run_id, execution_policy)
+        _verify_execution_policy_resume(
+            saved_path, run_id, execution_policy, generation_prompt_sha256
+        )
         _verify_skill_resume(saved_path, selected_skill)
+        if generation_user is not None:
+            _verify_generation_prompt_resume(saved_path, generation_user)
 
     # Include LLM/Agent construction, restoration and close in the log boundary.
     # One SDK session per worker process; callback references never serialize.
@@ -1019,11 +1146,13 @@ def run_session(
             should_stop,
             scheduling_runtime,
             execution_policy=execution_policy,
+            generation_user=generation_user,
         )
         agent = _M1Agent(
             llm=llm,
             doonex_run_id=run_id,
             execution_policy=execution_policy,
+            generation_prompt_sha256=generation_prompt_sha256,
             tools=(
                 [Tool(name=ShellTool.name, params={"run_id": run_id})]
                 if execution_policy == "workspace"
@@ -1120,6 +1249,17 @@ def run_session(
                     )
             if prompt:
                 conversation.send_message(prompt)
+            if generation_user is not None:
+                users = [
+                    event.llm_message.model_dump(mode="json", exclude_none=True)
+                    for event in conversation.state.active_branch()
+                    if getattr(event, "kind", None) == "MessageEvent"
+                    and getattr(event, "source", None) == "user"
+                ]
+                if users != [generation_user]:
+                    raise ValueError(
+                        "Generation conversation differs from its frozen user prompt"
+                    )
             if should_stop():
                 conversation.pause()
                 return "paused"
