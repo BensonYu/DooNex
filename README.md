@@ -6,7 +6,7 @@ DooNex 是面向个人编程工作流的本地 Web 工作台，复用 OpenHands 
 
 > **当前状态：M1–M3 已完成受控验收。** 现有多项目执行/只读审查、模型配置与用量、私有 Skill 版本、固定 Arena 批次及推荐入口。M3 最终源码通过 570 项本机测试、静态检查和前端构建；真实 45 次尝试形成完整证据，43 次通过、2 次预算停止，全部记录保留。适用环境、版本与限制见 [M3 实施记录](docs/M3_IMPLEMENTATION.md)，历史见 [M2](docs/M2_IMPLEMENTATION.md) 与 [M1](docs/M1_IMPLEMENTATION.md)。受控样例不形成通用成功率或模型/Skill 优胜声明。
 
-M4 当前仅整合了限期、一次性的后台调优首片，最终离线回归进行中，受控真实验收尚未执行；候选发现、生成与后续切片尚未实现。具体状态见 [M4 实施记录](docs/M4_IMPLEMENTATION.md)。
+M4 当前仅整合了限期、一次性的后台调优首片，离线回归通过；首轮真实测试已证明前台让出，但后台续接的下一次模型请求失败，用量未知保留，尚未完成真实闭环。候选发现、生成与后续切片尚未实现。具体状态见 [M4 实施记录](docs/M4_IMPLEMENTATION.md)。
 
 ## 当前使用流程
 
@@ -123,7 +123,17 @@ git status --short
 
 一次授权最多创建一个 Arena 批次。普通 Run 优先于手动 Arena，手动 Arena 优先于后台；后台在可核验的安全检查点让出，已派发动作等待结果或超时。可以撤销并停止新派发，在途结果继续结算，失败与未知预留保留；通过关联 Arena 查看全部尝试和运行证据。后台调优不具推荐推广资格。
 
-以上实现仍待最终离线回归和受控真实验收，不代表首片已完成验收。当前没有循环建批、候选发现、模型生成候选、自动补跑或自动推广。实际检查、已知失败与等待边界见 [M4 实施记录](docs/M4_IMPLEMENTATION.md)。
+当前离线检查通过，首轮真实测试的后台续接失败仍待修复，不代表首片已完成验收。没有循环建批、候选发现、模型生成候选、自动补跑或自动推广。实际检查、已知失败与等待边界见 [M4 实施记录](docs/M4_IMPLEMENTATION.md)。
+
+受控真实让出验收要求已有有限授权草稿和从未开始、无动作或停止请求的 `paused` 前台样例，二者使用相同已确认模型；先停止普通 worker，再显式运行：
+
+```bash
+.venv/bin/python scripts/live_background.py --confirm-model-usage \
+  --enable-authorization --authorization-id EXISTING_DRAFT_UUID \
+  --foreground-run-id PRISTINE_PAUSED_RUN_UUID --model ACTUAL_API_MODEL_ID
+```
+
+脚本持有 campaign 与 worker 锁，先持久化批次及前台的完整额度，再启用草稿、创建唯一批次。它在首个后台模型请求预留后插入指定前台，验证安全让出、前台交付和原 SDK 会话续接；没有替换模型传输。它不提供通用样例创建或未知故障恢复，已有尝试禁止重跑。失败和未知记录保留；SIGKILL 或主机丢失后须先核查持久状态，不能直接重启普通 worker。
 
 ## 当前限制
 
