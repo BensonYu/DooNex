@@ -281,6 +281,7 @@ div.notice:has(> button) { display: flex; justify-content: space-between; align-
 .arena-comparison { min-width: 850px; }
 .arena-comparison caption { text-align: left; margin-bottom: 14px; font-size: 13px; font-weight: 600; }
 .arena-comparison th, .arena-comparison td { min-width: 115px; }
+.arena-comparison th small { overflow-wrap: anywhere; }
 .arena-arm { border-top: 1px solid var(--line); margin-top: 24px; padding-top: 18px; }
 .arena-arm > summary { font-weight: 600; font-size: 13px; }
 .metric-reasons { font-size: 12px; line-height: 1.8; color: #8b560a; padding-left: 20px; }
