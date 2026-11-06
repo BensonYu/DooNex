@@ -461,8 +461,23 @@ class Generation:
             declared
             and not re.search(
                 r"(?i)non[- ]?commercial|all rights reserved|proprietary|source[- ]available|"
-                r"\b(?:[AL]?GPL|MPL|EPL|CC-BY|Unlicense)\b",
+                r"\b(?:[AL]?GPL|BSD|MPL|EPL|ISC|CC-BY|Unlicense)\b",
                 declared,
+            ),
+            "generation_parent_metadata_license_conflict",
+        )
+        identifiers = set()
+        if re.search(r"\bMIT\b", declared, flags=re.IGNORECASE):
+            identifiers.add("MIT")
+        if re.search(r"\bApache\b", declared, flags=re.IGNORECASE):
+            identifiers.add("Apache-2.0")
+        references = {item["path"] for item in license_receipt["files"]}
+        require(
+            identifiers == {license_receipt["spdx"]}
+            or (not identifiers and declared in references)
+            or (
+                not identifiers
+                and declared in {"Complete terms in " + name for name in references}
             ),
             "generation_parent_metadata_license_conflict",
         )
@@ -800,7 +815,6 @@ class Generation:
         )
         raw = _read(root / "output.json", MAX_OUTPUT_BYTES)
         report_raw = _read(root / "report.json")
-        report = json.loads(report_raw)
         expected = {
             "schema_version": SCHEMA_VERSION,
             "generation_id": run["request"]["generation"]["id"],
@@ -809,7 +823,7 @@ class Generation:
             "output_sha256": sha(raw),
             "size": len(raw),
         }
-        require(report == expected, "generation_output_report_changed")
+        require(report_raw == canonical(expected), "generation_output_report_changed")
         binding = {**expected, "report_sha256": sha(report_raw)}
         if run.get("generation_output") is not None:
             require(
@@ -904,6 +918,64 @@ class Generation:
         )
         _raw, output = self._output(run, directory, require_binding=True)
         require(report["output"] == output, "generation_candidate_output_changed")
+        value = self.get(run["request"]["generation"]["id"])
+        parent_files = self._frozen(value)
+        expected_report = {
+            "schema_version": SCHEMA_VERSION,
+            "generation_id": value["id"],
+            "run_id": run["id"],
+            "policy": POLICY,
+            "output": output,
+            "valid": True,
+            "errors": [],
+            "parent_manifest_sha256": digest(value["parent_manifest"]),
+            "parent_report_sha256": value["parent"]["report_sha256"],
+        }
+        try:
+            append = parse_output(_raw)
+            expected_files = {
+                **parent_files,
+                "SKILL.md": FileContent(
+                    parent_files["SKILL.md"].data + SEPARATOR + append,
+                    parent_files["SKILL.md"].mode,
+                ),
+            }
+            directory_names = tuple(
+                entry["path"]
+                for entry in value["parent_manifest"]["directories"]
+                if entry["path"]
+            )
+            _validate_content(expected_files, directory_names)
+            expected_manifest = {
+                "files": manifest(expected_files),
+                "directories": value["parent_manifest"]["directories"],
+            }
+            expected_report.update(
+                manifest=expected_manifest,
+                manifest_sha256=digest(expected_manifest),
+                archive_sha256=sha(
+                    _archive(expected_files, expected_manifest["directories"])
+                ),
+                content_digest=digest(
+                    {
+                        "files": manifest(expected_files),
+                        "directories": list(directory_names),
+                    }
+                ),
+            )
+        except (ValueError, UnicodeError) as error:
+            expected_report.update(
+                valid=False,
+                errors=[
+                    error.code
+                    if isinstance(error, GenerationError)
+                    else "generation_candidate_content_invalid"
+                ],
+            )
+        require(
+            report_raw == canonical(expected_report),
+            "generation_candidate_structural_report_changed",
+        )
         if report["valid"]:
             require(
                 sorted(p.name for p in root.iterdir())
@@ -1071,6 +1143,14 @@ class Generation:
         return binding
 
     def validate_run(self, run, directory, require_workspace=False):
+        try:
+            return self._validate_run(run, directory, require_workspace)
+        except GenerationError:
+            raise
+        except (OSError, KeyError, TypeError, ValueError):
+            raise GenerationError("generation_run_integrity_invalid") from None
+
+    def _validate_run(self, run, directory, require_workspace):
         value, directory, files = self._run(run, directory)
         if (directory / "baseline").exists():
             baseline, identity = _snapshot(directory / "baseline")
@@ -1114,12 +1194,24 @@ class Generation:
         report = json.loads(raw)
         binding = self._candidate(run, directory, required=True)
         require(
-            report["candidate"] == binding
+            set(report)
+            == {
+                "schema_version",
+                "generation_id",
+                "run_id",
+                "candidate",
+                "evidence_report_sha256",
+                "valid",
+            }
+            and type(report["schema_version"]) is int
+            and report["schema_version"] == SCHEMA_VERSION
+            and report["candidate"] == binding
             and report["generation_id"] == binding["generation_id"]
             and report["run_id"] == run["id"]
             and report["valid"] is True,
             "generation_final_binding_changed",
         )
+        require(raw == canonical(report), "generation_final_encoding_changed")
         candidate_files, _identity = _snapshot(
             directory / "generation-candidate" / "context"
         )

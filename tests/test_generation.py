@@ -629,3 +629,324 @@ def test_private_artifacts_have_fixed_permissions(setup_generation):
         canonical(report)
         == (directory / "generation-candidate/report.json").read_bytes()
     )
+
+
+def test_taskset_sql_projects_only_selected_visible_fields(
+    setup_generation, monkeypatch
+):
+    service, body, _parent, _taskset, _project = setup_generation
+    executed = []
+    connect = service.store.connect
+
+    class Connection:
+        def __init__(self):
+            self.connection = connect()
+
+        def __enter__(self):
+            self.connection.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.connection.__exit__(*args)
+
+        def execute(self, query, parameters=None):
+            executed.append((query, parameters))
+            return self.connection.execute(query, parameters)
+
+    monkeypatch.setattr(service.store, "connect", Connection)
+    report, selected = service._tasks(body.taskset_id, ["two"])
+    assert report == "2" * 64 and [value["id"] for value in selected] == ["two"]
+    assert len(executed) == 2
+    assert "data->>'split' AS split" in executed[0][0]
+    assert (
+        "jsonb_build_object" in executed[1][0] and "t->>'id'=ANY(%s)" in executed[1][0]
+    )
+    assert executed[1][1] == (body.taskset_id, "2" * 64, ["two"])
+    assert not any("SELECT data " in query for query, _params in executed)
+    assert not any(
+        word in executed[1][0]
+        for word in ("answer", "source", "verifier", "evaluation")
+    )
+
+
+@pytest.mark.parametrize(
+    "change,code",
+    [
+        (
+            {
+                "budget": {
+                    "max_calls": 2,
+                    "max_tokens": 100,
+                    "max_cost_usd": 1,
+                    "max_seconds": 600,
+                }
+            },
+            "generation_budget_cannot_reserve_request",
+        ),
+        (
+            {
+                "budget": {
+                    "max_calls": 2,
+                    "max_tokens": 100000,
+                    "max_cost_usd": 0.0001,
+                    "max_seconds": 600,
+                }
+            },
+            "generation_cost_budget_cannot_reserve_request",
+        ),
+        ({"task_ids": ["missing"]}, "generation_visible_task_not_found"),
+    ],
+)
+def test_unusable_drafts_do_not_create_records_or_runs(setup_generation, change, code):
+    service, body, _parent, _taskset, _project = setup_generation
+    with pytest.raises(GenerationError, match=code):
+        service.create(GenerationInput(**{**body.model_dump(), **change}))
+    assert service.list() == [] and service.store.list_runs() == []
+
+
+def test_draft_does_not_require_credentials_start_does(setup_generation, monkeypatch):
+    service, body, _parent, _taskset, _project = setup_generation
+    monkeypatch.delenv("DOONEX_LLM_API_KEY")
+    draft = service.create(body)
+    with pytest.raises(GenerationError, match="generation_credential_unavailable"):
+        service.start(
+            draft["id"],
+            StartInput(
+                expected_revision=draft["revision"],
+                confirm_model_usage=True,
+                confirm_derivative_rights=True,
+            ),
+        )
+    assert (
+        service.store.list_runs() == [] and service.get(draft["id"])["run_id"] is None
+    )
+
+
+def test_model_profile_changes_leave_frozen_input_and_budget_unchanged(
+    setup_generation,
+):
+    service, body, _parent, _taskset, _project = setup_generation
+    draft = service.create(body)
+    original = service.settings.model
+    object.__setattr__(
+        service.settings,
+        "model",
+        original.model_copy(update={"model_id": "openai/other-config"}),
+    )
+    try:
+        queued = service.start(
+            draft["id"],
+            StartInput(
+                expected_revision=draft["revision"],
+                confirm_model_usage=True,
+                confirm_derivative_rights=True,
+            ),
+        )
+    finally:
+        object.__setattr__(service.settings, "model", original)
+    request = service.store.get(queued["run_id"])["request"]
+    assert request["model"] == draft["model"] and request["budget"] == draft["budget"]
+
+
+def test_visible_projection_changes_block_start(setup_generation):
+    service, body, _parent, _taskset, _project = setup_generation
+    draft = service.create(body)
+    with service.store.connect() as c:
+        c.execute(
+            "UPDATE library_versions SET data=jsonb_set(data,'{tasks,0,prompt}','\"changed visible input\"') WHERE kind='taskset'"
+        )
+    with pytest.raises(GenerationError, match="generation_visible_projection_changed"):
+        service.start(
+            draft["id"],
+            StartInput(
+                expected_revision=draft["revision"],
+                confirm_model_usage=True,
+                confirm_derivative_rights=True,
+            ),
+        )
+    assert service.store.list_runs() == []
+
+
+def test_concurrent_import_publishes_one_pending_version(setup_generation):
+    service, body, _parent, _taskset, _project = setup_generation
+    draft, _run, _directory, _workspace, _start = completed_run(service, body)
+    preview = service.preview(
+        draft["id"],
+        RevisionInput(expected_revision=service.get(draft["id"])["revision"]),
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda _: service.import_skill(draft["id"], import_body(preview)),
+                range(2),
+            )
+        )
+    assert results[0]["skill"]["version_id"] == results[1]["skill"]["version_id"]
+    assert (
+        results[0]["skill"]["review_status"]
+        == results[1]["skill"]["review_status"]
+        == "pending"
+    )
+    assert (
+        len(service.library.list("skill")) == 2 and len(service.store.list_runs()) == 1
+    )
+
+
+def test_existing_partial_baseline_or_symlink_is_never_repaired(setup_generation):
+    service, body, _parent, _taskset, _project = setup_generation
+    draft = service.create(body)
+    queued = service.start(
+        draft["id"],
+        StartInput(
+            expected_revision=draft["revision"],
+            confirm_model_usage=True,
+            confirm_derivative_rights=True,
+        ),
+    )
+    with service.store.locked(queued["run_id"]) as (_c, run):
+        run.update(
+            state="running", owner="synthetic-generation-owner", first_started_at=now()
+        )
+    run = service.store.get(queued["run_id"])
+    directory = service.settings.home / "runs" / run["id"]
+    directory.mkdir(mode=0o700, parents=True)
+    service.validate_run(run, directory)
+    (directory / "baseline").mkdir(mode=0o700)
+    (directory / "baseline/SKILL.md").write_bytes(b"partial")
+    with pytest.raises(GenerationError, match="generation_baseline_changed"):
+        service.prepare_workspace(run, directory)
+    assert (directory / "baseline/SKILL.md").read_bytes() == b"partial"
+    (directory / "baseline/SKILL.md").unlink()
+    (directory / "baseline").rmdir()
+    (directory / "baseline").symlink_to(
+        service.library.skills.versions / body.parent_version_id / "context"
+    )
+    with pytest.raises(GenerationError, match="generation_run_integrity_invalid"):
+        service.prepare_workspace(run, directory)
+    assert (directory / "baseline").is_symlink()
+
+
+@pytest.mark.parametrize(
+    "declared,status",
+    [
+        ("Apache-2.0", "declared"),
+        ("Unknown custom terms", "declared"),
+        ("MIT OR Apache-2.0", "declared"),
+        ("MIT", "restricted"),
+        (None, "unknown"),
+    ],
+)
+def test_parent_metadata_conflicts_or_unknown_rights_block_draft(
+    setup_generation, declared, status
+):
+    service, body, files, _taskset, _project = setup_generation
+    old = service.library.get("skill", body.parent_version_id)
+    metadata = {**old["metadata"], "license_text": declared, "license_status": status}
+    report = service.library.skills.persist(
+        prepare_bytes(files, ("__pycache__", "assets", "empty", "scripts"), metadata)
+    )
+    service.library.bind(
+        "skill",
+        report["version_id"],
+        {**report, "review_status": "approved", "review_history": []},
+    )
+    changed = GenerationInput(
+        **{**body.model_dump(), "parent_version_id": report["version_id"]}
+    )
+    with pytest.raises(
+        GenerationError,
+        match="generation_parent_(?:metadata_license_conflict|license_status_unsupported)",
+    ):
+        service.create(changed)
+    assert service.list() == [] and service.store.list_runs() == []
+
+
+def test_unbound_candidate_publication_recomputes_every_report_field(setup_generation):
+    service, body, _parent, _taskset, _project = setup_generation
+    _draft, run, directory, _workspace, _start = start_run(service, body)
+    run = bind_finish(service, run, directory)
+    candidate = service.build_candidate(run, directory)
+    assert candidate["valid"] and "generation_candidate" not in run
+    path = directory / "generation-candidate/report.json"
+    original = path.read_bytes()
+    for field in (
+        "schema_version",
+        "content_digest",
+        "parent_manifest_sha256",
+        "parent_report_sha256",
+        "manifest_sha256",
+        "valid",
+        "errors",
+        "policy",
+    ):
+        for mutation in ("change", "remove"):
+            changed = json.loads(original)
+            if mutation == "change":
+                changed[field] = "unexpected-value"
+            else:
+                changed.pop(field)
+            path.write_bytes(canonical(changed))
+            with pytest.raises(GenerationError):
+                service.validate_run(run, directory, require_workspace=True)
+            path.write_bytes(original)
+    path.write_bytes(original + b"\n")
+    with pytest.raises(
+        GenerationError, match="generation_candidate_structural_report_changed"
+    ):
+        service.validate_run(run, directory, require_workspace=True)
+    path.write_bytes(original)
+    assert service.build_candidate(run, directory) == candidate
+
+
+def test_unbound_invalid_report_and_final_schema_cannot_be_rebound(setup_generation):
+    service, body, _parent, _taskset, _project = setup_generation
+    _draft, run, directory, _workspace, _start = start_run(service, body)
+    run = bind_finish(service, run, directory, '{"append_text":"Copyright fake"}')
+    candidate = service.build_candidate(run, directory)
+    assert not candidate["valid"]
+    path = directory / "generation-candidate/report.json"
+    original = json.loads(path.read_bytes())
+    for field, value in (
+        ("errors", ["different-safe-code"]),
+        ("parent_report_sha256", "f" * 64),
+        ("schema_version", 2),
+    ):
+        changed = {**original, field: value}
+        path.write_bytes(canonical(changed))
+        with pytest.raises(
+            GenerationError, match="generation_candidate_structural_report_changed"
+        ):
+            service.build_candidate(run, directory)
+    # A separate completed source tests the final publication-before-Run-bind
+    # window: the worker has not saved the final binding yet.
+    _draft, run, directory, workspace, _start = candidate_run(service, body)
+    evidence = Evidence.capture(workspace, directory, [], Sandbox(), 1, run["id"])
+    service.finalize_candidate(run, directory, evidence)
+    path = directory / "generation-final/report.json"
+    final = json.loads(path.read_bytes())
+    for value in (2, True, 1.0):
+        path.write_bytes(canonical({**final, "schema_version": value}))
+        with pytest.raises(GenerationError, match="generation_final_binding_changed"):
+            service.validate_run(run, directory, require_workspace=True)
+
+
+def test_generation_output_and_candidate_do_not_reset_unknown_reserves(
+    setup_generation,
+):
+    service, body, _parent, _taskset, _project = setup_generation
+    _draft, run, directory, _workspace, _start = start_run(service, body)
+    with service.store.locked(run["id"]) as (_c, current):
+        current["usage"].update(
+            calls=1,
+            unknown_calls=1,
+            reserved_tokens=1234,
+            reserved_cost_usd=0.07,
+            reserved_metered_cost_usd=0.07,
+        )
+    run = service.store.get(run["id"])
+    before = copy.deepcopy(run["usage"])
+    started = run["first_started_at"]
+    run = bind_finish(service, run, directory)
+    service.build_candidate(run, directory)
+    saved = service.store.get(run["id"])
+    assert saved["usage"] == before and saved["first_started_at"] == started
