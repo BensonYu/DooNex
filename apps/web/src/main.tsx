@@ -1,10 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Api, type ArtifactName, type Budget, type Diff, type ModelProfiles, type Project, type Recovery, type Run, type RunEvent, type Settings, type SkillVersion, type Workflow } from './api';
+import { Api, type ArenaRecommendation, type ArenaRecommendations, type ArtifactName, type Budget, type Diff, type ModelProfiles, type Project, type Recovery, type Run, type RunEvent, type Settings, type SkillVersion, type Workflow } from './api';
 import './style.css';
 import { ReviewReport, WorkflowProgress } from './workflow';
 import { FrozenModels, ModelSettings, RoleModelChoices } from './model-settings';
-import { FrozenSkill, SkillChoice, SkillsView, skillReady } from './skills';
+import { FrozenSkill, RecommendationChoice, SkillChoice, SkillsView, sameModelConfig, skillReady } from './skills';
 import { ArenaView } from './arena';
 
 const stateNames: Record<string, string> = {
@@ -34,7 +34,7 @@ function writeStorage(storage: 'local' | 'session', key: string, value: string) 
 const selectionKey = (projectId: string) => `doonex.selectedRun.${projectId}`;
 const runPath = (projectId: string, id: string, suffix = '', query: Record<string, string> = {}) =>
   `/runs/${encodeURIComponent(id)}${suffix ? `/${suffix}` : ''}?${new URLSearchParams({ ...query, project_id: projectId })}`;
-type TaskDraft = { baseRef: string; prompt: string; checks: string; workflow: Workflow; executorProfileId?: string; reviewerProfileId?: string; skillVersionId?: string; budget?: Budget };
+type TaskDraft = { baseRef: string; prompt: string; checks: string; workflow: Workflow; executorProfileId?: string; reviewerProfileId?: string; skillVersionId?: string; recommendationId?: string; budget?: Budget };
 const emptyDraft: TaskDraft = { baseRef: 'HEAD', prompt: '', checks: '', workflow: 'execute_review' };
 type ActionContext = { signal: AbortSignal; isCurrent: () => boolean };
 function readDrafts(): Record<string, TaskDraft> {
@@ -46,7 +46,7 @@ function readDrafts(): Record<string, TaskDraft> {
       if (!draft || typeof draft !== 'object') return false;
       const item = draft as Record<string, unknown>;
       if (typeof item.baseRef !== 'string' || typeof item.prompt !== 'string' || typeof item.checks !== 'string' || !['execute', 'execute_review'].includes(String(item.workflow))) return false;
-      if (['executorProfileId', 'reviewerProfileId', 'skillVersionId'].some((key) => item[key] !== undefined && typeof item[key] !== 'string')) return false;
+      if (['executorProfileId', 'reviewerProfileId', 'skillVersionId', 'recommendationId'].some((key) => item[key] !== undefined && typeof item[key] !== 'string')) return false;
       if (item.budget == null) return true;
       const budget = item.budget as Record<string, unknown>;
       return ['max_calls', 'max_tokens', 'max_seconds'].every((key) => typeof budget[key] === 'number' && Number.isFinite(budget[key]))
@@ -93,6 +93,10 @@ function App() {
   const [registry, setRegistry] = useState<ModelProfiles | null>(null);
   const [view, setView] = useState<'workbench' | 'models' | 'skills' | 'arena'>('workbench');
   const [skills, setSkills] = useState<SkillVersion[]>([]);
+  const [recommendations, setRecommendations] = useState<ArenaRecommendation[]>([]);
+  const [recommendationLoading, setRecommendationLoading] = useState(false);
+  const [recommendationError, setRecommendationError] = useState('');
+  const [recommendationRefresh, setRecommendationRefresh] = useState(0);
   const [arenaEvaluationId, setArenaEvaluationId] = useState('');
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState(() => readStorage('local', 'doonex.selectedProject'));
@@ -204,6 +208,18 @@ function App() {
   }, [api, token, projectId, project?.id, select]);
 
   useEffect(() => {
+    if (!token || view !== 'workbench' || !showCreate) return;
+    const controller = new AbortController();
+    setRecommendationLoading(true); setRecommendationError('');
+    void api.get<ArenaRecommendations>('/arena/recommendations', controller.signal).then((next) => {
+      if (!controller.signal.aborted) setRecommendations(next.current);
+    }).catch((err: unknown) => {
+      if (!controller.signal.aborted) { setRecommendations([]); setRecommendationError(message(err)); }
+    }).finally(() => { if (!controller.signal.aborted) setRecommendationLoading(false); });
+    return () => controller.abort();
+  }, [api, token, view, showCreate, recommendationRefresh]);
+
+  useEffect(() => {
     if (!token || !projectId || !selectedId || !project) return;
     const controller = new AbortController();
     let timeout: ReturnType<typeof setTimeout>;
@@ -312,7 +328,9 @@ function App() {
   const isSubscription = models.every((model) => model?.billing_mode === 'subscription');
   const hasPrice = models.every((model) => model && (model.billing_mode === 'subscription' || model.input_price_per_million != null && model.output_price_per_million != null && !!model.price_source));
   const hasSkill = !draft.skillVersionId || skills.some((skill) => skill.version_id === draft.skillVersionId && skillReady(skill));
-  const canCreate = !!project && hasModel && hasPrice && hasSkill && !!budget && !busy;
+  const matchingRecommendations = recommendations.filter((item) => executorModel && item.model && sameModelConfig(item.model, executorModel) && skills.some((skill) => skill.version_id === item.arm_id && skillReady(skill)));
+  const hasRecommendation = !draft.recommendationId || !recommendationLoading && matchingRecommendations.some((item) => item.id === draft.recommendationId && item.arm_id === draft.skillVersionId);
+  const canCreate = !!project && hasModel && hasPrice && hasSkill && hasRecommendation && !!budget && !busy;
   const selected = run?.id === selectedId && run.request.project_id === projectId ? run : null;
   const selectedModels = selected ? selected.request.workflow === 'execute_review'
     ? [selected.request.role_models?.executor ?? selected.request.model, selected.request.role_models?.reviewer ?? selected.request.model]
@@ -325,7 +343,7 @@ function App() {
     <header className="app-header">
       <div className="wordmark">DooNex<span>编程工作台</span></div>
       <div className="header-actions"><span className="local-label">本地 · 有限协作</span><button className="quiet" onClick={() => {
-        clearView(); active.current = { projectId: '', runId: '' }; writeStorage('session', 'doonex.token', ''); setToken(''); setSettings(null); setRegistry(null); setSkills([]); setArenaEvaluationId(''); setView('workbench'); setProjects([]); setProjectId(''); setSelectedId(''); setRuns([]);
+        clearView(); active.current = { projectId: '', runId: '' }; writeStorage('session', 'doonex.token', ''); setToken(''); setSettings(null); setRegistry(null); setSkills([]); setRecommendations([]); setArenaEvaluationId(''); setView('workbench'); setProjects([]); setProjectId(''); setSelectedId(''); setRuns([]);
       }}>断开连接</button></div>
     </header>
     <nav className="app-nav" aria-label="工作区页面">{([['workbench', '工作台'], ['skills', 'Skills'], ['arena', 'Skill Arena'], ['models', '模型设置']] as const).map(([id, label]) => <button key={id} aria-current={view === id ? 'page' : undefined} onClick={() => { setView(id); setError(''); }}>{label}</button>)}</nav>
@@ -373,15 +391,16 @@ function App() {
             </form>
             <p className="field-help">只读取选定提交建立独立工作副本，原工作区中的未提交内容不会自动带入。</p>
           </section>
-          <RoleModelChoices registry={registry} workflow={workflow} executorId={executorProfileId} reviewerId={reviewerProfileId} onChange={(role, id) => updateDraft(role === 'executor' ? { executorProfileId: id } : { reviewerProfileId: id })} onSettings={() => setView('models')} fallback={settings} />
+          <RoleModelChoices registry={registry} workflow={workflow} executorId={executorProfileId} reviewerId={reviewerProfileId} onChange={(role, id) => updateDraft(role === 'executor' ? { executorProfileId: id, recommendationId: '' } : { reviewerProfileId: id })} onSettings={() => setView('models')} fallback={settings} />
           {!hasModel && <p className="field-help warning-text">请选择有效配置，并在服务端提供每个角色所需的凭据引用。</p>}
           {!hasPrice && <p className="field-help warning-text">按量模型需要有来源的输入和输出价格。补齐后才能使用共享费用预算。</p>}
-          <SkillChoice skills={skills} value={draft.skillVersionId ?? ''} onChange={(id) => updateDraft({ skillVersionId: id })} onManage={() => setView('skills')} />
+          <RecommendationChoice recommendations={matchingRecommendations} value={draft.recommendationId ?? ''} loading={recommendationLoading} error={recommendationError} onRefresh={() => setRecommendationRefresh((old) => old + 1)} onChange={(item) => updateDraft({ recommendationId: item?.id ?? '', ...(item ? { skillVersionId: item.arm_id } : {}) })} />
+          <SkillChoice skills={skills} value={draft.skillVersionId ?? ''} onChange={(id) => updateDraft({ skillVersionId: id, recommendationId: '' })} onManage={() => setView('skills')} />
           <form onSubmit={(event) => {
             event.preventDefault();
             if (!canCreate || !budget) return;
             void perform(async ({ signal, isCurrent }) => {
-              const created = await api.post<Run>('/runs', { project_id: projectId, workflow, model_profile_id: executorProfileId || null, ...(workflow === 'execute_review' ? { reviewer_model_profile_id: reviewerProfileId || null } : {}), skill_version_id: draft.skillVersionId || null, prompt: prompt.trim(), base_ref: baseRef.trim(), checks: checks.split('\n').map((line) => line.trim()).filter(Boolean), budget: { ...budget, max_cost_usd: isSubscription ? null : budget.max_cost_usd } }, signal);
+              const created = await api.post<Run>('/runs', { project_id: projectId, workflow, model_profile_id: executorProfileId || null, ...(workflow === 'execute_review' ? { reviewer_model_profile_id: reviewerProfileId || null } : {}), skill_version_id: draft.skillVersionId || null, recommendation_id: draft.recommendationId || null, prompt: prompt.trim(), base_ref: baseRef.trim(), checks: checks.split('\n').map((line) => line.trim()).filter(Boolean), budget: { ...budget, max_cost_usd: isSubscription ? null : budget.max_cost_usd } }, signal);
               if (!isCurrent()) return;
               setRuns((old) => [created, ...old.filter((item) => item.id !== created.id)]);
               updateDraft({ prompt: '', checks: '' }); select(created.id);

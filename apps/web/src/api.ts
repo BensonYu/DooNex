@@ -151,6 +151,8 @@ export type ArenaRecommendation = {
   arm_id: string;
   evaluation_id: string;
   fingerprint: string;
+  category: string;
+  model: ModelConfig;
   created_at: string;
   previous_id: string | null;
 };
@@ -214,6 +216,7 @@ export type Run = {
     role_models?: Partial<Record<Role, ModelConfig>>;
     model_profiles?: Partial<Record<Role, { id: string; name: string; revision: string | number }>>;
     skill?: { version_id: string; content_digest: string; report_sha256: string; metadata: SkillMetadata } | null;
+    recommendation?: ArenaRecommendation | null;
   };
   usage: Usage;
   evidence?: Record<string, unknown> | null;

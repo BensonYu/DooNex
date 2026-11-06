@@ -1,11 +1,36 @@
 import { useEffect, useRef, useState } from 'react';
-import { Api, type ArenaEvaluation, type Run, type SkillMetadata, type SkillVersion } from './api';
+import { Api, type ArenaEvaluation, type ArenaRecommendation, type ModelConfig, type RecommendationPosition, type Run, type SkillMetadata, type SkillVersion } from './api';
 
 export const skillReady = (skill: SkillVersion) => skill.review_status === 'approved' && skill.integrity.valid;
 const reviewNames = { pending: '待审核', approved: '已批准', rejected: '已拒绝' };
 const licenseNames: Record<SkillMetadata['license_status'], string> = { unknown: '许可未知', declared: '已声明许可', verified: '许可已核对', restricted: '限制使用' };
 const lines = (text: string) => text.split('\n').map((item) => item.trim()).filter(Boolean);
 const when = (value: string) => new Date(value).toLocaleString('zh-CN', { hour12: false });
+const recommendationPositions: Record<RecommendationPosition, string> = { reliable: '可靠优先', cost: '成本优先', speed: '速度优先' };
+const modelIdentity = (model: ModelConfig) => JSON.stringify(Object.entries(model).sort(([left], [right]) => left.localeCompare(right)));
+export const sameModelConfig = (left: ModelConfig, right: ModelConfig) => modelIdentity(left) === modelIdentity(right);
+
+export function RecommendationChoice({ recommendations, value, loading, error, onChange, onRefresh }: {
+  recommendations: ArenaRecommendation[]; value: string; loading: boolean; error: string;
+  onChange: (recommendation: ArenaRecommendation | null) => void; onRefresh: () => void;
+}) {
+  const selected = recommendations.find((item) => item.id === value);
+  return <section className="section-block" aria-label="执行推荐选择">
+    <div className="section-heading"><h2>场景推荐</h2><button type="button" className="quiet compact" disabled={loading} onClick={onRefresh}>刷新当前推荐</button></div>
+    <label htmlFor="run-recommendation">使用已选用推荐</label>
+    <select id="run-recommendation" value={value} disabled={loading} onChange={(event) => onChange(recommendations.find((item) => item.id === event.target.value) ?? null)}>
+      <option value="">自行选择 Skill</option>
+      {value && !selected && <option value={value} disabled>已选推荐当前不可用，请重新选择</option>}
+      {recommendations.map((item) => <option value={item.id} key={item.id}>{item.category} · {recommendationPositions[item.position]} · {item.arm_id}</option>)}
+    </select>
+    <p className="field-help">仅显示与本次执行模型全部配置一致、版本可用的当前推荐。请按任务类别明确选择；系统不推断任务类别，也不自动应用推荐。</p>
+    {loading && <p className="muted small" role="status">正在读取当前推荐…</p>}
+    {error && <p className="warning-text small" role="alert">{error}</p>}
+    {!loading && !error && !recommendations.length && <p className="muted small">当前执行模型没有可选用的推荐。</p>}
+    {selected && <p className="small path-text">已选：{selected.category} · {recommendationPositions[selected.position]} · 版本 <code>{selected.arm_id}</code>；来源评测 <code>{selected.evaluation_id}</code>。新运行将冻结此推荐记录。</p>}
+    {value && !selected && <p className="warning-text small">推荐或执行条件已变化，请刷新后重新选择，或手动选择 Skill。</p>}
+  </section>;
+}
 
 export function SkillMetadataReport({ metadata }: { metadata: SkillMetadata }) {
   return <dl className="config-list">
@@ -38,8 +63,10 @@ export function SkillChoice({ skills, value, onChange, onManage }: {
 
 export function FrozenSkill({ run }: { run: Run }) {
   const skill = run.request.skill;
+  const recommendation = run.request.recommendation;
   return <details className="frozen-skill"><summary>本次冻结的 Skill 版本</summary>
     {skill ? <><dl className="config-list"><div><dt>版本</dt><dd><code>{skill.version_id}</code></dd></div><div><dt>内容摘要</dt><dd><code>{skill.content_digest}</code></dd></div><div><dt>检查报告摘要</dt><dd><code>{skill.report_sha256}</code></dd></div></dl><SkillMetadataReport metadata={skill.metadata} /><p className="field-help">这份记录随本次运行固定，后续审核、选用或回滚不会改写它。</p></> : <p className="muted small">无额外 Skill（基线）。项目共同规范仍然适用。</p>}
+    {recommendation && <section aria-label="本次冻结的推荐来源"><h3>推荐来源</h3><dl className="config-list"><div><dt>任务类别 / 推荐位置</dt><dd>{recommendation.category} · {recommendationPositions[recommendation.position]}</dd></div><div><dt>推荐记录</dt><dd><code>{recommendation.id}</code></dd></div><div><dt>来源评测</dt><dd><code>{recommendation.evaluation_id}</code></dd></div><div><dt>版本</dt><dd><code>{recommendation.arm_id}</code></dd></div><div><dt>推荐记录时间</dt><dd>{when(recommendation.created_at)}</dd></div><div><dt>执行条件摘要</dt><dd><code>{recommendation.fingerprint}</code></dd></div></dl></section>}
   </details>;
 }
 
