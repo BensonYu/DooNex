@@ -17,6 +17,7 @@ from importlib.metadata import version
 from pathlib import Path
 from typing import Any, ClassVar
 
+from litellm import model_cost
 from openhands.sdk import LLM, Agent
 from openhands.sdk.context import AgentContext
 from openhands.sdk.conversation.impl.local_conversation import LocalConversation
@@ -30,6 +31,7 @@ from openhands.sdk.tool.schema import Action, Observation
 from pydantic import Field, PrivateAttr, SecretStr
 
 SDK_VERSION = "1.60.1"
+_SUPPORTED_PROVIDERS = frozenset({"openai", "anthropic"})
 _RUN_LOCK = threading.Lock()
 _CALLBACKS: dict[str, tuple[Callable[[str], dict], Callable[[], bool]]] = {}
 
@@ -103,6 +105,40 @@ class GuardedLLM(LLM):
     _before: Callable[[int, int], object] = PrivateAttr()
     _after: Callable[[object, dict | None], None] = PrivateAttr()
     _stop: Callable[[], bool] = PrivateAttr()
+
+    def _model_name_for_capabilities(self) -> str:
+        model = super()._model_name_for_capabilities()
+        if model.startswith("openai/"):
+            # Gateway aliases are opaque OpenAI model names. Do not let SDK
+            # normalization reinterpret e.g. prod/ollama/name as an Ollama
+            # route and perform provider discovery. Transport keeps its name.
+            return "openai/" + model.removeprefix("openai/").replace("/", "_")
+        return model
+
+    def _init_model_info_and_caps(self) -> None:
+        # SDK 1.60.1's resolver can send authenticated provider metadata requests
+        # during construction, before the budget callback. Read only LiteLLM's
+        # already-loaded static map. Explicit configured limits remain required;
+        # static metadata guides formatting, never proves a remote capability.
+        model = self.model_canonical_name or self.model
+        candidates = (model, model.split(":")[0], model.split("/")[-1])
+        self._model_info = next(
+            (dict(model_cost[name]) for name in candidates if name in model_cost),
+            None,
+        )
+        if self.max_input_tokens is None or self.max_output_tokens is None:
+            raise ValueError("M1 requires explicit input and output token bounds")
+        self._effective_max_input_tokens = self.max_input_tokens
+        self._effective_max_output_tokens = self.max_output_tokens
+        self._validate_context_window_size()
+
+    def resolve_runtime_metadata(self, *, force: bool = False):
+        # Provider probes are outside the budgeted completion request. M1 uses
+        # configured bounds and validates behavior from actual responses.
+        return None
+
+    async def aresolve_runtime_metadata(self, *, force: bool = False):
+        return None
 
     def bind(self, before, after, should_stop) -> None:
         self._before, self._after, self._stop = before, after, should_stop
@@ -259,6 +295,8 @@ def run_session(
         raise ValueError("M1 currently supports the chat completion API only")
     if not api_key:
         raise ValueError("Model API credential is missing")
+    if model.get("provider") not in _SUPPORTED_PROVIDERS:
+        raise ValueError("M1 supports only the openai and anthropic provider adapters")
     state_dir = Path(state_dir).resolve()
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     control_dir = state_dir / "control"
@@ -273,56 +311,57 @@ def run_session(
     if not resume and not prompt:
         raise ValueError("A new conversation requires a prompt")
 
-    model_id = model["model_id"]
-    provider = model.get("provider")
-    if provider and not model_id.startswith(f"{provider}/"):
-        model_id = f"{provider}/{model_id}"
-    llm = GuardedLLM(
-        model=model_id,
-        api_mode="chat",
-        api_key=SecretStr(api_key),
-        base_url=model.get("base_url"),
-        usage_id="doonex-agent",
-        num_retries=0,
-        caching_prompt=False,
-        fallback_strategy=None,
-        log_completions=False,
-        stream=False,
-        timeout=model["timeout_seconds"],
-        max_input_tokens=model["max_input_tokens"],
-        max_output_tokens=model["max_output_tokens"],
-    )
-    llm.bind(before_model, after_model, should_stop)
-    agent = _M1Agent(
-        llm=llm,
-        tools=[Tool(name=ShellTool.name, params={"run_id": run_id})],
-        include_default_tools=["FinishTool"],
-        condenser=None,
-        critic=None,
-        mcp_config={},
-        tool_concurrency_limit=1,
-        system_prompt=(
-            "You are DooNex's single coding agent. Complete the authorized task using "
-            "only doonex_shell, then call finish. The shell runs in /workspace in an "
-            "isolated container; your local SDK directory is not the project. Use "
-            "relative paths or /workspace. Each shell call is stateless and bounded. "
-            "There is no network or access to host credentials. Follow the supplied "
-            "acceptance criteria. Report limitations honestly. Your finish message "
-            "does not establish verification; DooNex runs the acceptance checks."
-        ),
-        system_prompt_kwargs={"soul_content": "DooNex single-agent worker"},
-        agent_context=AgentContext(
-            skills=[],
-            load_user_skills=False,
-            load_public_skills=False,
-            load_project_skills=False,
-            load_memory=False,
-            registered_marketplaces=[],
-        ),
-    )
-
+    # Include LLM/Agent construction, restoration and close in the log boundary.
     # One SDK session per worker process; callback references never serialize.
     with _RUN_LOCK, _filtered_logs(api_key):
+        model_id = model["model_id"]
+        provider = model.get("provider")
+        if provider and not model_id.startswith(f"{provider}/"):
+            model_id = f"{provider}/{model_id}"
+        llm = GuardedLLM(
+            model=model_id,
+            api_mode="chat",
+            api_key=SecretStr(api_key),
+            base_url=model.get("base_url"),
+            usage_id="doonex-agent",
+            num_retries=0,
+            caching_prompt=False,
+            fallback_strategy=None,
+            log_completions=False,
+            stream=False,
+            timeout=model["timeout_seconds"],
+            max_input_tokens=model["max_input_tokens"],
+            max_output_tokens=model["max_output_tokens"],
+        )
+        llm.bind(before_model, after_model, should_stop)
+        agent = _M1Agent(
+            llm=llm,
+            tools=[Tool(name=ShellTool.name, params={"run_id": run_id})],
+            include_default_tools=["FinishTool"],
+            condenser=None,
+            critic=None,
+            mcp_config={},
+            tool_concurrency_limit=1,
+            system_prompt=(
+                "You are DooNex's single coding agent. Complete the authorized task using "
+                "only doonex_shell, then call finish. The shell runs in /workspace in an "
+                "isolated container; your local SDK directory is not the project. Use "
+                "relative paths or /workspace. Each shell call is stateless and bounded. "
+                "There is no network or access to host credentials. Follow the supplied "
+                "acceptance criteria. Report limitations honestly. Your finish message "
+                "does not establish verification; DooNex runs the acceptance checks."
+            ),
+            system_prompt_kwargs={"soul_content": "DooNex single-agent worker"},
+            agent_context=AgentContext(
+                skills=[],
+                load_user_skills=False,
+                load_public_skills=False,
+                load_project_skills=False,
+                load_memory=False,
+                registered_marketplaces=[],
+            ),
+        )
+
         _CALLBACKS[run_id] = (shell, should_stop)
         conversation = None
         try:

@@ -318,3 +318,103 @@ def test_unsupported_api_mode_is_rejected_before_state_creation(tmp_path):
     with pytest.raises(ValueError, match="chat completion"):
         run_session(**kwargs)
     assert not Path(kwargs["state_dir"]).exists()
+
+
+@pytest.mark.parametrize(
+    "provider", ["litellm_proxy", "ollama", "huggingface", "openrouter"]
+)
+def test_unsupported_provider_is_rejected_before_network_or_state(
+    tmp_path, monkeypatch, provider
+):
+    import httpx
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("unsupported providers must not perform discovery or inference")
+
+    monkeypatch.setattr(httpx, "get", forbidden)
+    monkeypatch.setattr(httpx.Client, "send", forbidden)
+    monkeypatch.setattr(GuardedLLM, "_transport_call", forbidden)
+    kwargs, reservations, settlements, _, _ = harness(
+        tmp_path / "state", model={**MODEL, "provider": provider}
+    )
+    with pytest.raises(ValueError, match="openai and anthropic"):
+        run_session(**kwargs)
+    assert reservations == settlements == []
+    assert not Path(kwargs["state_dir"]).exists()
+
+
+@pytest.mark.parametrize(
+    ("provider", "model_id"),
+    [
+        ("openai", "gpt-4.1-mini"),
+        ("openai", "prod/ollama/opaque-gateway-alias"),
+        ("anthropic", "claude-sonnet-4-5"),
+    ],
+)
+def test_supported_gateway_uses_no_constructor_or_runtime_metadata_requests(
+    tmp_path, monkeypatch, provider, model_id
+):
+    import asyncio
+
+    import httpx
+    import openhands.sdk.llm.llm as upstream
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("provider metadata discovery must remain offline")
+
+    monkeypatch.setattr(httpx, "get", forbidden)
+    monkeypatch.setattr(httpx.Client, "send", forbidden)
+    monkeypatch.setattr(httpx.AsyncClient, "send", forbidden)
+    monkeypatch.setattr(upstream, "get_litellm_model_info", forbidden)
+    monkeypatch.setattr(upstream, "resolve_provider_metadata_sync", forbidden)
+    monkeypatch.setattr(upstream, "aresolve_provider_metadata", forbidden)
+
+    def transport(self, **kwargs):
+        assert self.model == f"{provider}/{model_id}"
+        assert self.base_url == "https://private-gateway.invalid/custom/v1"
+        assert self.resolve_runtime_metadata(force=True) is None
+        assert asyncio.run(self.aresolve_runtime_metadata(force=True)) is None
+        assert self.effective_max_input_tokens == MODEL["max_input_tokens"]
+        assert self.effective_max_output_tokens == MODEL["max_output_tokens"]
+        if model_id == "gpt-4.1-mini":
+            assert self.model_info["supports_function_calling"] is True
+        return answer("finish", {"message": "done"})
+
+    monkeypatch.setattr(GuardedLLM, "_transport_call", transport)
+    kwargs, reservations, _, _, _ = harness(
+        tmp_path,
+        model={
+            **MODEL,
+            "provider": provider,
+            "model_id": model_id,
+            "base_url": "https://private-gateway.invalid/custom/v1",
+        },
+    )
+    assert run_session(**kwargs) == "finished"
+    assert len(reservations) == 1
+
+
+def test_constructor_diagnostics_are_redacted(tmp_path, monkeypatch, caplog):
+    refresh = GuardedLLM._refresh_litellm_metadata
+
+    def diagnostic_refresh(self):
+        try:
+            raise RuntimeError(f"construction diagnostic echoed {SECRET}")
+        except RuntimeError:
+            logging.getLogger("openhands.sdk.llm.llm").exception(
+                "constructor diagnostic: %s", SECRET
+            )
+        refresh(self)
+
+    monkeypatch.setattr(GuardedLLM, "_refresh_litellm_metadata", diagnostic_refresh)
+    monkeypatch.setattr(
+        GuardedLLM,
+        "_transport_call",
+        lambda *a, **k: answer("finish", {"message": "done"}),
+    )
+    kwargs, *_ = harness(tmp_path)
+    with caplog.at_level(logging.ERROR):
+        assert run_session(**kwargs) == "finished"
+    assert "constructor diagnostic" in caplog.text
+    assert "[REDACTED]" in caplog.text
+    assert SECRET not in caplog.text
