@@ -986,13 +986,8 @@ def check_license(files):
             except UnicodeDecodeError:
                 reasons.append("license_not_utf8")
                 continue
-            normalized = " ".join(text.split())
             kind = None
-            if (
-                "/" not in path
-                and hashlib.sha256(normalized.encode()).hexdigest()
-                == APACHE_TEXT_SHA256
-            ):
+            if "/" not in path and complete_apache(text):
                 kind = "Apache-2.0"
             elif "/" not in path and complete_mit(text):
                 kind = "MIT"
@@ -1072,6 +1067,44 @@ def check_license(files):
         "files": sorted(found, key=lambda item: item["path"]),
         "reasons": sorted(set(reasons)),
     }
+
+
+def complete_apache(text):
+    """Match the entire license, allowing only its specified copyright fields.
+
+    The canonical appendix explicitly instructs an adopter to fill in these
+    fields. No terms, other notices or text outside that line are normalized.
+    """
+    normalized = " ".join(text.split())
+    if hashlib.sha256(normalized.encode()).hexdigest() == APACHE_TEXT_SHA256:
+        return True
+    appendix = " APPENDIX: How to apply the Apache License to your work. "
+    before, marker, after = normalized.partition(appendix)
+    if not marker:
+        return False
+    instructions, copyright_marker, notice = after.partition(" Copyright ")
+    owner, license_marker, remaining = notice.partition(
+        " Licensed under the Apache License, Version 2.0"
+    )
+    if (
+        not copyright_marker
+        or not license_marker
+        or not re.fullmatch(
+            r"(?:19|20)[0-9]{2}(?:[-–](?:19|20)[0-9]{2})? [\w][\w .,&'()/-]{0,199}",
+            owner,
+        )
+    ):
+        return False
+    canonical_text = (
+        before
+        + marker
+        + instructions
+        + copyright_marker
+        + "[yyyy] [name of copyright owner]"
+        + license_marker
+        + remaining
+    )
+    return hashlib.sha256(canonical_text.encode()).hexdigest() == APACHE_TEXT_SHA256
 
 
 def complete_mit(text):
