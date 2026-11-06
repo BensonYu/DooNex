@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import tempfile
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from doonex.api import create_app
@@ -71,6 +72,11 @@ def main():
         "--workflow", choices=["execute", "execute_review"], default="execute"
     )
     parser.add_argument("--sample-name", default="sample-project")
+    parser.add_argument(
+        "--authorize-subscription-campaign",
+        action="store_true",
+        help="Record explicit permission for subscription testing without an aggregate cap; each run stays bounded",
+    )
     args = parser.parse_args()
     if not 1 <= args.max_calls <= 10 or not 35_000 <= args.max_tokens <= 100_000:
         raise SystemExit("Invalid bounded campaign allowance")
@@ -94,7 +100,36 @@ def main():
             if campaign_path.exists()
             else {"reserved_calls": 0, "reserved_tokens": 0, "runs": []}
         )
-        if (
+        if args.authorize_subscription_campaign:
+            if model.billing_mode != "subscription":
+                raise SystemExit(
+                    "Uncapped campaign authorization requires confirmed subscription billing"
+                )
+            if campaign.get("authorization", {}).get("mode") != "subscription_uncapped":
+                campaign.setdefault("authorization_history", []).append(
+                    {
+                        "at": datetime.now(UTC).isoformat(),
+                        "previous_max_calls": 10,
+                        "previous_max_tokens": 100_000,
+                        "recorded_calls": campaign["reserved_calls"],
+                        "recorded_tokens": campaign["reserved_tokens"],
+                        "authorization": "Explicit user permission for subscription testing without an aggregate cap",
+                    }
+                )
+                campaign["authorization"] = {
+                    "mode": "subscription_uncapped",
+                    "max_calls": None,
+                    "max_tokens": None,
+                }
+                save_campaign(campaign_path, campaign)
+        uncapped = (
+            campaign.get("authorization", {}).get("mode") == "subscription_uncapped"
+        )
+        if uncapped and model.billing_mode != "subscription":
+            raise SystemExit(
+                "Subscription campaign authorization cannot be reused for metered billing"
+            )
+        if not uncapped and (
             campaign["reserved_calls"] + args.max_calls > 10
             or campaign["reserved_tokens"] + args.max_tokens > 100_000
         ):

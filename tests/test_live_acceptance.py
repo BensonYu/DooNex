@@ -114,3 +114,49 @@ def test_terminal_settlement_preserves_previous_unknown_allowances(
     assert campaign["reserved_calls"] == 6
     assert campaign["reserved_tokens"] == 15140 + 120 + 228
     assert campaign["runs"][0] == original["runs"][0]
+
+
+def test_explicit_subscription_authorization_retains_history_and_run_bounds(
+    settings, store, monkeypatch
+):
+    settings = Settings(
+        settings.home,
+        settings.database_url,
+        settings.token,
+        settings.model.model_copy(update={"billing_mode": "subscription"}),
+    )
+    configure(monkeypatch, settings)
+    monkeypatch.setattr(sys, "argv", [*sys.argv, "--authorize-subscription-campaign"])
+    settings.home.mkdir(parents=True)
+    previous = {
+        "reserved_calls": 10,
+        "reserved_tokens": 20535,
+        "runs": [{"run_id": "preserve-previous"}],
+    }
+    (settings.home / "live-acceptance.json").write_text(json.dumps(previous))
+
+    def finish(self, run_id):
+        run = self.store.get(run_id)
+        assert run["request"]["budget"]["max_calls"] == 2
+        assert run["request"]["budget"]["max_seconds"] == 300
+        self.store.transition(run_id, "failed", "fixture")
+
+    monkeypatch.setattr(Worker, "execute", finish)
+    with pytest.raises(SystemExit):
+        live_acceptance.main()
+    campaign = json.loads((settings.home / "live-acceptance.json").read_text())
+    assert campaign["reserved_calls"] == previous["reserved_calls"]
+    assert campaign["reserved_tokens"] == previous["reserved_tokens"]
+    assert campaign["runs"][0] == previous["runs"][0]
+    assert campaign["authorization"]["mode"] == "subscription_uncapped"
+    assert campaign["authorization_history"][0]["recorded_calls"] == 10
+
+
+def test_metered_model_cannot_use_subscription_campaign_permission(
+    settings, monkeypatch
+):
+    configure(monkeypatch, settings)
+    monkeypatch.setattr(sys, "argv", [*sys.argv, "--authorize-subscription-campaign"])
+    with pytest.raises(SystemExit, match="confirmed subscription"):
+        live_acceptance.main()
+    assert not (settings.home / "live-acceptance.json").exists()
