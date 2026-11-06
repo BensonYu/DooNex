@@ -187,6 +187,7 @@ export type BackgroundAuthorization = {
   consumed_at: string | null;
   evaluation_id: string | null;
   evaluation?: Pick<ArenaEvaluation, 'id' | 'state' | 'reason' | 'usage'> & { yielded_runs?: number } | null;
+  dispatch_status?: { state: 'waiting' | 'blocked'; reason: string; at: string };
   date: string;
   window_start: string;
   window_end: string;
