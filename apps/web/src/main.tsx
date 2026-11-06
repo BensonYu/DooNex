@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Api, type ArtifactName, type Budget, type Project, type Recovery, type Run, type RunEvent, type Settings, type Workflow } from './api';
+import { Api, type ArtifactName, type Budget, type Diff, type Project, type Recovery, type Run, type RunEvent, type Settings, type Workflow } from './api';
 import './style.css';
 import { ReviewReport, WorkflowProgress } from './workflow';
 
@@ -98,7 +98,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [showCreate, setShowCreate] = useState(true);
   const [tab, setTab] = useState<'events' | 'diff' | 'evidence'>('events');
-  const [diff, setDiff] = useState<string | null>(null);
+  const [diff, setDiff] = useState<Diff | null>(null);
   const [evidence, setEvidence] = useState<Record<string, unknown> | null>(null);
   const [detailError, setDetailError] = useState('');
   const [detailLoading, setDetailLoading] = useState(false);
@@ -223,7 +223,7 @@ function App() {
     setDetailLoading(true);
     const path = runPath(projectId, run.id, tab);
     const request = tab === 'diff'
-      ? api.get<{ diff: string }>(path, controller.signal).then((result) => { if (isCurrent()) setDiff(result.diff); })
+      ? api.get<Diff>(path, controller.signal).then((result) => { if (isCurrent()) setDiff(result); })
       : api.get<Record<string, unknown>>(path, controller.signal).then((result) => { if (isCurrent()) setEvidence(result); });
     void request.catch((err: unknown) => { if (isCurrent()) setDetailError(message(err)); })
       .finally(() => { if (isCurrent()) setDetailLoading(false); });
@@ -445,7 +445,7 @@ function App() {
               {!events.length && <p className="empty-copy">尚无已记录事件。运行启动后会在这里显示进展。</p>}
               <ol className="event-list">{events.map((event) => <li key={event.id}><div className="event-heading"><strong>{event.kind}</strong><time dateTime={event.created_at}>{fmtTime(event.created_at)}</time><span>#{event.id}</span></div><pre>{typeof event.payload === 'string' ? event.payload : json(event.payload)}</pre></li>)}</ol>
             </>}
-            {tab === 'diff' && <>{detailLoading && diff === null ? <p role="status" className="muted">正在读取代码变更…</p> : diff ? <pre className="diff-output">{diff}</pre> : !detailError && <p className="empty-copy">目前没有可显示的代码差异。</p>}</>}
+            {tab === 'diff' && <>{diff?.source === 'review_handoff' && <div className="notice" role="status"><strong>审查交接快照，尚未完成验收</strong><p>以下修改来自执行者交给审查者的固定快照。{diff.snapshot_digest && <code>{diff.snapshot_digest}</code>}</p></div>}{detailLoading && diff === null ? <p role="status" className="muted">正在读取代码变更…</p> : diff?.source !== 'unavailable' && diff?.diff ? <pre className="diff-output">{diff.diff}</pre> : !detailError && <p className="empty-copy">目前没有可显示的代码差异。</p>}</>}
             {tab === 'evidence' && <>
               <ReviewReport run={selected} />
               <div className="evidence-intro"><h2>与代码快照绑定的交付证据</h2><p className="muted">检查命令、退出码、日志和时间以服务保存的报告为准。失败、缺失或过期证据不能证明当前代码已通过验收。</p></div>

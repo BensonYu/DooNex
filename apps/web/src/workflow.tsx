@@ -4,7 +4,7 @@ const roles: Role[] = ['executor', 'reviewer'];
 const names = { executor: '执行', reviewer: '只读审查' };
 const states: Record<string, string> = {
   pending: '等待开始', queued: '等待开始', running: '进行中', completed: '已完成',
-  interrupted: '已中断', failed: '失败', paused: '已暂停', cancelled: '已取消', skipped: '未执行',
+  interrupted: '已中断', failed: '失败', budget_exceeded: '预算已用尽', paused: '已暂停', cancelled: '已取消', skipped: '未执行',
 };
 const money = (value: number | null | undefined) => value == null || !Number.isFinite(value) ? '未知' : `US$${value.toFixed(4)}`;
 

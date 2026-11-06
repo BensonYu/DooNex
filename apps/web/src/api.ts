@@ -99,6 +99,8 @@ export type Recovery = {
   notes: string[];
 };
 
+export type Diff = { diff: string; source?: 'review_handoff' | 'evidence' | 'unavailable'; snapshot_digest?: string; verified?: boolean };
+
 export type ArtifactName = 'patch' | 'snapshot' | 'report' | `check-${number}.log`;
 
 function errorMessage(value: unknown): string | null {
