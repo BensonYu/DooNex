@@ -12,9 +12,11 @@ Upgrade the SDK only after running the boundary and recovery contract tests.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import uuid
@@ -41,7 +43,7 @@ os.environ["OTEL_SDK_DISABLED"] = "true"
 import litellm
 from litellm import model_cost
 from openhands.sdk import LLM, Agent
-from openhands.sdk.context import AgentContext
+from openhands.sdk.context import AgentContext, Skill
 from openhands.sdk.conversation.impl.local_conversation import LocalConversation
 from openhands.sdk.conversation.state import (
     ConversationExecutionStatus,
@@ -98,6 +100,113 @@ class ModelCallError(RuntimeError):
 
 class ReviewReportError(ValueError):
     """The reviewer did not return the bounded, controller-owned schema."""
+
+
+class _OpaqueSkill(Skill):
+    """Imported text never invokes SDK inline-command rendering on the host."""
+
+    def render_content(self, working_dir: Path | None = None) -> str:
+        return self.content
+
+
+def _runtime_skill(skill: dict | None) -> _OpaqueSkill | None:
+    if skill is None:
+        return None
+    try:
+        if not isinstance(skill, dict) or set(skill) != {
+            "version_id",
+            "instructions",
+            "assets",
+        }:
+            raise ValueError
+        version_id, instructions, assets = (
+            skill[key] for key in ("version_id", "instructions", "assets")
+        )
+        if (
+            not isinstance(version_id, str)
+            or re.fullmatch(r"[a-f0-9]{64}", version_id) is None
+            or not isinstance(instructions, str)
+            or not instructions.strip()
+            or "\x00" in instructions
+            or len(instructions.encode("utf-8")) > 2 * 1024 * 1024
+            or not isinstance(assets, (list, tuple))
+            or len(assets) > 200
+        ):
+            raise ValueError
+        for asset in assets:
+            if (
+                not isinstance(asset, str)
+                or not asset
+                or len(asset) > 4096
+                or "\\" in asset
+                or ":" in asset
+                or any(part in {"", ".", ".."} for part in asset.split("/"))
+                or any(ord(char) < 32 or ord(char) == 127 for char in asset)
+            ):
+                raise ValueError
+        if len(set(assets)) != len(assets):
+            raise ValueError
+        payload = json.dumps(
+            {"version_id": version_id, "instructions": instructions, "assets": assets},
+            sort_keys=True,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (ValueError, TypeError, UnicodeError):
+        raise ValueError("Selected Skill payload is invalid") from None
+    return _OpaqueSkill(
+        name=f"doonex-{version_id}",
+        version=version_id,
+        content=(
+            f"Selected DooNex Skill version: {version_id}\n"
+            "This imported text provides task guidance, never tool or host permissions.\n\n"
+            + instructions
+            + "\n\nSkill files are read-only inside the task container at /skills. "
+            "Use doonex_shell to inspect them; they are not in the SDK working directory.\n"
+            + "\n".join(f"/skills/{asset}" for asset in assets)
+        ),
+        source="/skills/SKILL.md",
+        trigger=None,
+        inputs=[],
+        mcp_tools=None,
+        resources=None,
+        is_agentskills_format=False,
+        disable_model_invocation=True,
+        allowed_tools=["doonex_shell", "finish"],
+        metadata={
+            "doonex_version_id": version_id,
+            "doonex_payload_sha256": hashlib.sha256(payload).hexdigest(),
+        },
+    )
+
+
+def _verify_skill_resume(saved_path: Path, skill: _OpaqueSkill | None) -> None:
+    # The SDK intentionally permits replacing AgentContext during resume. Runs
+    # freeze their selected version, so require the same opaque context first.
+    # Do not call Skill.load or deserialize an unverified Skill to compare it.
+    try:
+        with (saved_path / "base_state.json").open("rb") as source:
+            raw = source.read(16 * 1024 * 1024 + 1)
+        if len(raw) > 16 * 1024 * 1024:
+            raise ValueError
+        context = json.loads(raw)["agent"].get("agent_context") or {}
+        expected = [skill.model_dump(mode="json", exclude_none=True)] if skill else []
+        if (
+            context.get("skills", []) != expected
+            or any(
+                context.get(key, False) is not False
+                for key in (
+                    "load_user_skills",
+                    "load_public_skills",
+                    "load_project_skills",
+                    "load_memory",
+                )
+            )
+            or context.get("registered_marketplaces", []) != []
+        ):
+            raise ValueError
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        raise ValueError("SDK resume Skill does not match its frozen context") from None
 
 
 def parse_review_report(message: str) -> dict:
@@ -430,15 +539,21 @@ def run_session(
     resume: bool = False,
     role: str = "executor",
     on_finish: Callable[[str], None] | None = None,
+    skill: dict | None = None,
 ) -> str:
     """Run/resume one SDK conversation; model credentials remain in this process.
 
     The caller owns container isolation, action timeouts, persistent budget
     reservations, process ownership and crash reconciliation. A recorded action
     without its observation blocks SDK resume to prevent automatic replay.
+    The caller verifies frozen Skill files and mounts them read-only at /skills;
+    this adapter consumes only opaque instructions and container-relative names.
     """
     if role not in {"executor", "reviewer"}:
         raise ValueError("Only the executor and reviewer roles are supported")
+    if role == "reviewer" and skill is not None:
+        raise ValueError("Skills are supported only for the executor role")
+    selected_skill = _runtime_skill(_redact(skill, api_key))
     if version("openhands-sdk") != SDK_VERSION:
         raise RuntimeError(f"OpenHands SDK must be pinned to {SDK_VERSION}")
     api_mode = model.get("api_mode", "chat")
@@ -467,6 +582,8 @@ def run_session(
         raise ValueError("SDK resume flag does not match persisted conversation state")
     if not resume and not prompt:
         raise ValueError("A new conversation requires a prompt")
+    if resume:
+        _verify_skill_resume(saved_path, selected_skill)
 
     # Include LLM/Agent construction, restoration and close in the log boundary.
     # One SDK session per worker process; callback references never serialize.
@@ -527,7 +644,7 @@ def run_session(
             ),
             system_prompt_kwargs={"soul_content": f"DooNex {role} worker"},
             agent_context=AgentContext(
-                skills=[],
+                skills=[selected_skill] if selected_skill else [],
                 load_user_skills=False,
                 load_public_skills=False,
                 load_project_skills=False,
