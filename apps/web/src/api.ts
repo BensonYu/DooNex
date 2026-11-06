@@ -1,7 +1,7 @@
 export type Budget = {
   max_calls: number;
   max_tokens: number;
-  max_cost_usd: number;
+  max_cost_usd: number | null;
   max_seconds: number;
 };
 
@@ -17,6 +17,8 @@ export type ModelConfig = {
   output_price_per_million?: number | null;
   price_source?: string | null;
   credential_env: string;
+  billing_mode: 'metered' | 'subscription';
+  allow_private_http: boolean;
 };
 
 export type Settings = {
@@ -65,6 +67,8 @@ export type Recovery = {
   workspace_ok: boolean;
   notes: string[];
 };
+
+export type ArtifactName = 'patch' | 'snapshot' | 'report' | `check-${number}.log`;
 
 function errorMessage(value: unknown): string | null {
   if (typeof value === 'string') return value;
@@ -120,8 +124,8 @@ export class Api {
     return (await this.response(path, { method: 'POST', body: JSON.stringify(body) })).json() as Promise<T>;
   }
 
-  async download(runId: string, name: 'patch' | 'snapshot' | 'report'): Promise<void> {
-    const response = await this.response(`/runs/${encodeURIComponent(runId)}/artifact?name=${name}`);
+  async download(runId: string, name: ArtifactName): Promise<void> {
+    const response = await this.response(`/runs/${encodeURIComponent(runId)}/artifact?name=${encodeURIComponent(name)}`);
     const blob = await response.blob();
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
@@ -133,7 +137,8 @@ export class Api {
     if (encodedName) {
       try { filename = decodeURIComponent(encodedName); } catch { /* Use the plain name or fallback. */ }
     }
-    anchor.download = filename?.replace(/[\\/\x00-\x1f]/g, '_') || `doonex-${runId}-${name}${name === 'patch' ? '.patch' : name === 'report' ? '.json' : '.tar.gz'}`;
+    const extension = name === 'patch' ? '.patch' : name === 'report' ? '.json' : name === 'snapshot' ? '.tar.gz' : '';
+    anchor.download = filename?.replace(/[\\/\x00-\x1f]/g, '_') || `doonex-${runId}-${name}${extension}`;
     document.body.appendChild(anchor);
     anchor.click();
     anchor.remove();

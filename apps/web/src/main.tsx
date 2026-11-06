@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Api, type Budget, type Project, type Recovery, type Run, type RunEvent, type Settings } from './api';
+import { Api, type ArtifactName, type Budget, type Project, type Recovery, type Run, type RunEvent, type Settings } from './api';
 import './style.css';
 
 const stateNames: Record<string, string> = {
@@ -29,7 +29,7 @@ function Status({ state }: { state: string }) {
   return <span className={`status status-${state}`}>{stateNames[state] ?? state}</span>;
 }
 
-function CheckReport({ evidence }: { evidence: Record<string, unknown> }) {
+function CheckReport({ evidence, busy, onDownloadLog }: { evidence: Record<string, unknown>; busy: boolean; onDownloadLog: (name: ArtifactName) => void }) {
   const reportValue = evidence.report ?? evidence.evidence ?? evidence;
   const report = reportValue && typeof reportValue === 'object' ? reportValue as Record<string, unknown> : {};
   const checks = Array.isArray(report.checks) ? report.checks : [];
@@ -39,10 +39,17 @@ function CheckReport({ evidence }: { evidence: Record<string, unknown> }) {
       const nested = check.result && typeof check.result === 'object' ? check.result as Record<string, unknown> : check;
       const exitCode = nested.exit_code;
       const result = nested.timed_out ? '超时' : nested.cancelled ? '已取消' : typeof exitCode === 'number' ? `退出码 ${exitCode}` : '未取得退出码';
+      const logName = typeof check.log === 'string' && /^check-[1-9][0-9]*\.log$/.test(check.log) ? check.log as ArtifactName : null;
+      const { output, ...metadata } = nested;
       return <article className="check-result" key={index}>
         <div className="check-heading"><code>{typeof check.command === 'string' ? check.command : `检查 ${index + 1}`}</code><span className={exitCode === 0 && !nested.timed_out && !nested.cancelled ? 'positive' : 'attention'}>{result}</span></div>
         {typeof nested.started_at === 'string' && <p className="muted small">开始 {fmtTime(nested.started_at)}{typeof nested.ended_at === 'string' ? ` · 结束 ${fmtTime(nested.ended_at)}` : ''}</p>}
-        <details><summary>检查日志与原始记录</summary><pre>{json(value)}</pre></details>
+        <details><summary>检查日志与原始记录</summary>
+          {typeof output === 'string' && <pre>{output}</pre>}
+          {nested.output_truncated === true && <p className="field-help">显示内容已截断，可下载完整检查日志。</p>}
+          <pre>{json(metadata)}</pre>
+        </details>
+        {logName && <div className="button-row artifact-actions"><button disabled={busy} aria-label={`下载第 ${index + 1} 条检查日志`} onClick={() => onDownloadLog(logName)}>下载检查日志</button></div>}
       </article>;
     })}</div>}
     <details className="raw-evidence" open={!checks.length}><summary>完整证据报告</summary><pre className="evidence-output">{json(evidence)}</pre></details>
@@ -218,9 +225,11 @@ function App() {
   }
 
   const hasModel = !!settings?.model && settings.credential_available;
-  const hasPrice = settings?.model?.input_price_per_million != null && settings?.model?.output_price_per_million != null;
+  const isSubscription = settings?.model?.billing_mode === 'subscription';
+  const hasPrice = isSubscription || (settings?.model?.input_price_per_million != null && settings?.model?.output_price_per_million != null);
   const canCreate = !!project && hasModel && hasPrice && !!budget && !busy;
   const selected = run;
+  const selectedSubscription = selected?.request.model.billing_mode === 'subscription';
   const isActive = !!selected && activeStates.has(selected.state);
 
   return <div className="app-shell">
@@ -269,13 +278,15 @@ function App() {
           <section className="section-block model-section">
             <div className="section-heading"><h2>模型连接</h2><span className={`text-state ${hasModel && hasPrice ? 'positive' : 'attention'}`}>{hasModel ? hasPrice ? '凭据已就绪' : '价格信息缺失' : '待配置'}</span></div>
             {settings?.model ? <>
-              <p className="model-name">{settings.model.model_id}<span>{settings.model.provider} · {settings.model.api_mode}</span></p>
+              <p className="model-name">{settings.model.model_id}<span>{settings.model.provider} · {settings.model.api_mode} · {isSubscription ? '包月连接' : '按量计费'}</span></p>
               <details><summary>连接与能力配置</summary><dl className="config-list">
                 <div><dt>凭据引用</dt><dd>{settings.model.credential_env} · {settings.credential_available ? '已提供' : '未提供'}</dd></div>
                 <div><dt>输入 / 输出上限</dt><dd>{settings.model.max_input_tokens.toLocaleString()} / {settings.model.max_output_tokens.toLocaleString()} tokens</dd></div>
                 <div><dt>请求超时</dt><dd>{settings.model.timeout_seconds} 秒</dd></div>
-                <div><dt>每百万 tokens 价格</dt><dd>输入 {money(settings.model.input_price_per_million)}；输出 {money(settings.model.output_price_per_million)}</dd></div>
-                <div><dt>价格来源</dt><dd>{settings.model.price_source || '未知'}</dd></div>
+                {isSubscription ? <div><dt>货币费用</dt><dd>未知；包月连接按调用、token 和时长上限控制</dd></div> : <>
+                  <div><dt>每百万 tokens 价格</dt><dd>输入 {money(settings.model.input_price_per_million)}；输出 {money(settings.model.output_price_per_million)}</dd></div>
+                  <div><dt>价格来源</dt><dd>{settings.model.price_source || '未知'}</dd></div>
+                </>}
                 {settings.model.base_url && <div><dt>API 地址</dt><dd className="path-text">{settings.model.base_url}</dd></div>}
               </dl></details>
             </> : <p className="muted">请在本地服务中配置供应商、实际模型 ID、凭据引用和价格。浏览器不接收模型密钥。</p>}
@@ -286,7 +297,7 @@ function App() {
             event.preventDefault();
             if (!canCreate || !budget) return;
             void perform(async () => {
-              const created = await api.post<Run>('/runs', { prompt: prompt.trim(), base_ref: baseRef.trim(), checks: checks.split('\n').map((line) => line.trim()).filter(Boolean), budget });
+              const created = await api.post<Run>('/runs', { prompt: prompt.trim(), base_ref: baseRef.trim(), checks: checks.split('\n').map((line) => line.trim()).filter(Boolean), budget: { ...budget, max_cost_usd: isSubscription ? null : budget.max_cost_usd } });
               setRuns((old) => [created, ...old.filter((item) => item.id !== created.id)]);
               select(created.id);
               setPrompt(''); setChecks('');
@@ -305,10 +316,10 @@ function App() {
               {budget ? <div className="budget-inputs">
                 <label>模型调用上限<input type="number" min={1} step={1} required value={budget.max_calls} onChange={(event) => setBudget({ ...budget, max_calls: Number(event.target.value) })} /></label>
                 <label>Token 上限<input type="number" min={1} step={1} required value={budget.max_tokens} onChange={(event) => setBudget({ ...budget, max_tokens: Number(event.target.value) })} /></label>
-                <label>估计费用上限（US$）<input type="number" min={0.0001} step="any" required value={budget.max_cost_usd} onChange={(event) => setBudget({ ...budget, max_cost_usd: Number(event.target.value) })} /></label>
+                <label>估计费用上限（US$）<input type="number" min={0.0001} step="any" required={!isSubscription} disabled={isSubscription} placeholder={isSubscription ? '包月连接' : ''} value={isSubscription ? '' : budget.max_cost_usd ?? ''} onChange={(event) => setBudget({ ...budget, max_cost_usd: event.target.value === '' ? null : Number(event.target.value) })} /></label>
                 <label>总时长上限（秒）<input type="number" min={1} step={1} required value={budget.max_seconds} onChange={(event) => setBudget({ ...budget, max_seconds: Number(event.target.value) })} /></label>
               </div> : <p className="muted">正在读取预算配置…</p>}
-              <p className="field-help">预算限制后续请求的派发。在途请求仍可能产生费用，预估上限不等于供应商账单的绝对封顶。</p>
+              <p className="field-help">{isSubscription ? '包月连接的货币费用未知。本次运行仍受模型调用、token 和时长上限约束。' : '预算限制后续请求的派发。在途请求仍可能产生费用，预估上限不等于供应商账单的绝对封顶。'}</p>
             </section>
             <div className="form-footer"><span className="muted small">需求、验收和预算将随本次运行保存。</span><button className="primary" type="submit" disabled={!canCreate}>{busy ? '正在创建…' : '创建并开始运行'}</button></div>
           </form>
@@ -340,9 +351,9 @@ function App() {
           <section className="usage-panel" aria-label="预算与用量">
             <div><span>模型调用</span><strong>{selected.usage.calls ?? 0}<small> / {selected.request.budget.max_calls}</small></strong></div>
             <div><span>已记录 tokens</span><strong>{(selected.usage.tokens ?? 0).toLocaleString()}<small> / {selected.request.budget.max_tokens.toLocaleString()}</small></strong></div>
-            <div><span>已记录估计费用</span><strong>{money(selected.usage.cost_usd)}<small> / {money(selected.request.budget.max_cost_usd)}</small></strong></div>
+            <div><span>{selectedSubscription ? '货币费用未知' : '已记录估计费用'}</span><strong>{selectedSubscription ? '包月连接' : money(selected.usage.cost_usd)}{!selectedSubscription && <small> / {money(selected.request.budget.max_cost_usd)}</small>}</strong></div>
             <div><span>总时长上限</span><strong>{selected.request.budget.max_seconds}<small> 秒</small></strong></div>
-            <p>预留：{(selected.usage.reserved_tokens ?? 0).toLocaleString()} tokens，{money(selected.usage.reserved_cost_usd)}。{selected.usage.unknown_calls > 0 ? `有 ${selected.usage.unknown_calls} 次调用的实际用量未知，保留预算预留。` : '预留会在供应商返回用量后结算。'}</p>
+            <p>预留：{(selected.usage.reserved_tokens ?? 0).toLocaleString()} tokens{selectedSubscription ? '。包月连接按调用、token 和时长约束，货币费用未知。' : `，${money(selected.usage.reserved_cost_usd)}。`}{selected.usage.unknown_calls > 0 ? `有 ${selected.usage.unknown_calls} 次调用的实际用量未知，保留预算预留。` : '预留会在供应商返回用量后结算。'}</p>
           </section>
           <div className="tabs" role="tablist" aria-label="运行内容">{([['events', '执行过程'], ['diff', '代码变更'], ['evidence', '验证与交付']] as const).map(([value, title], index) => <button key={value} id={`tab-${value}`} role="tab" tabIndex={tab === value ? 0 : -1} aria-selected={tab === value} aria-controls={`panel-${value}`} onClick={() => setTab(value)} onKeyDown={(event) => {
             const keys = ['events', 'diff', 'evidence'] as const;
@@ -363,7 +374,7 @@ function App() {
               <div className="evidence-intro"><h2>与代码快照绑定的交付证据</h2><p className="muted">检查命令、退出码、日志和时间以服务保存的报告为准。失败、缺失或过期证据不能证明当前代码已通过验收。</p></div>
               <div className="button-row artifact-actions">{(['patch', 'snapshot', 'report'] as const).map((name) => <button key={name} disabled={busy} onClick={() => { void perform(() => api.download(selected.id, name)); }}>下载{({ patch: '补丁', snapshot: '代码快照', report: '检查报告' })[name]}</button>)}<button disabled={busy || isActive} onClick={() => { void perform(async () => setAdoption(await api.post<{ safe: boolean; reason: string }>(`/runs/${encodeURIComponent(selected.id)}/adoption-check`))); }}>检查采纳条件</button></div>
               {adoption && <div className={`notice ${adoption.safe ? '' : 'error'}`} role="status"><strong>{adoption.safe ? '采纳预检通过' : '采纳预检未通过'}</strong><p>{adoption.reason}</p><p>请保留补丁并人工检查后整合。预检不会修改原项目，也不会推送或部署。</p></div>}
-              {detailLoading && evidence === null ? <p className="muted" role="status">正在读取证据…</p> : evidence ? <CheckReport evidence={evidence} /> : !detailError && <p className="empty-copy">尚无验证报告。</p>}
+              {detailLoading && evidence === null ? <p className="muted" role="status">正在读取证据…</p> : evidence ? <CheckReport evidence={evidence} busy={busy} onDownloadLog={(name) => { void perform(() => api.download(selected.id, name)); }} /> : !detailError && <p className="empty-copy">尚无验证报告。</p>}
             </>}
           </section>
         </div> : <div className="empty-state"><h1>{selectedId ? '正在读取运行…' : '准备开始'}</h1><p className="muted">{selectedId ? '从已保存的记录恢复视图。' : '注册一个项目，创建第一个任务。'}</p><button onClick={() => setShowCreate(true)}>创建任务</button></div>}
