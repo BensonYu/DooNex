@@ -2,97 +2,120 @@
 
 **Do next. 把下一步交给 AI。**
 
-DooNex 是一个以个人使用为起点的 AI 编程工作台。它计划把项目、模型、Agent 协作和 Skill 竞技放在同一个 Web 界面中，让任务持续推进，让执行结果可以检查，让技能选择有证据可依。
+DooNex 是面向个人编程工作流的本地 Web 工作台，复用 OpenHands Software Agent SDK 执行任务，由 DooNex 管理项目、预算、恢复状态和交付证据。
 
-> **当前状态：规划与文档阶段。** 仓库已建立产品需求和开发约定，尚无可运行客户端、Agent 服务或评测系统。下面的功能和架构均为计划，不代表已经实现。
+> **当前状态：M1 受控验收已完成。** 已有单项目、单 Agent 的 Web/API/worker、PostgreSQL、隔离工具、预算、恢复与证据。真实模型通过 Responses 接口完成了样例代码修改及固定快照检查；完整本机测试 86 项通过，真实界面的证据查看、下载与刷新也已复核。两次先前失败及未知用量仍保留，不把受控样例结果推广为所有模型或项目兼容。详细证据和限制见 [M1 实施记录](docs/M1_IMPLEMENTATION.md)。
 
-## 为什么做 DooNex
+## 当前使用流程
 
-使用多个 AI 编程工具时，任务进度、上下文、测试结果和模型成本容易分散。一个 Agent 说“完成了”，并不意味着它修改后的代码已经通过验证；一个热门 Skill，也不一定适合当前项目或模型。
+1. 注册一个本地 Git 项目，选择明确起始提交，保存需求与验收命令。
+2. 在服务端配置实际模型 ID、凭据引用和预算，启动一个 Agent。
+3. Agent 在独立代码副本中执行；浏览器查看状态、事件、用量、文件差异与检查结果。
+4. 需要时暂停或取消；中断后核查工作区、残留容器和未决动作，再确认续接。
+5. 查看固定快照、实际检查命令、退出码与日志，下载补丁或快照，人工决定是否采纳。
 
-DooNex 希望提供三个清楚的答案：
+当前采纳入口只检查目标分支、工作区状态及补丁冲突，不自动修改目标、推送 GitHub 或部署。执行/审查协作属于 M2，Skill 竞技属于 M3。
 
-- **现在做到哪了？** 项目、任务、执行记录和中断原因能被找回，恢复前核对真实状态。
-- **结果可靠吗？** 展示代码变更、实际执行的检查和被验证的代码版本。
-- **该用哪个 Skill？** 在一致条件下比较候选，分别保留可靠、经济、快速等场景的推荐。
-
-## 计划中的使用流程
-
-1. 选择一个 Git 项目，描述要完成的工作和验收条件。
-2. 选择模型、预算及已审核的 Skill，启动任务。
-3. 执行 Agent 在独立工作区中修改代码；按需交给审查 Agent 检查。
-4. 查看变更、测试证据、成本和剩余问题，决定是否采纳或发布。
-5. 在私有 Skill Arena 中比较不同技能，并为下一次任务选择合适版本。
-
-用户授权过的范围可以持续执行；需要新增权限或扩大外部影响时，再请求具体授权。
-
-## 产品边界与阶段
+## 产品阶段
 
 | 阶段 | 目标 | 当前状态 |
 | --- | --- | --- |
-| M0 · 项目定义 | README、PRD、架构、竞技规则与 Agent 规范 | 已建立文档 |
-| M1 · 最小可用工作台 | 一个项目中的单 Agent 执行、隔离、预算、恢复与完成证据 | 未实现 |
-| M2 · 有限多 Agent 协作 | 执行与审查分工、多项目隔离、可解释的交接 | 未实现 |
-| M3 · 私有 Skill Arena | 版本化技能、可复查评测、多个场景推荐 | 未实现 |
-| M4 · 受控持续改进 | 有预算的后台评测、候选发现与生成 | 后续探索 |
-| M5 · 公共生态 | 公开发布、可信榜单、作者激励及商业服务 | 后续探索 |
+| M0 · 项目定义 | 产品、架构、竞技规则与 Agent 规范 | 已建立文档 |
+| M1 · 最小可用工作台 | 单项目单 Agent、隔离、预算、恢复与证据 | 已完成受控验收 |
+| M2 · 有限多 Agent 协作 | 执行与审查分工、多项目隔离 | 未实现 |
+| M3 · 私有 Skill Arena | 版本化技能、公平评测、多场景推荐 | 未实现 |
+| M4 · 受控持续改进 | 有预算的后台试验与候选发现 | 后续探索 |
+| M5 · 公共生态 | 市场、可信榜单与商业服务 | 后续探索 |
 
-首个可用版本以 M1 为界；包含多 Agent 与 Skill 竞技的个人 Alpha 以 M1–M3 为界。完整验收条件见 [PRD](docs/PRD.md)，交付顺序见 [路线图](docs/ROADMAP.md)。
+首个可用版本以 M1 为界，个人 Alpha 为 M1–M3。不包含公共市场、结算、分布式集群、专业 CAD/PCB 集成或原生桌面客户端。需求与验收以 [PRD](docs/PRD.md) 为准，交付顺序见 [路线图](docs/ROADMAP.md)。
 
-首版不包含公共 Skill 市场、收入分成、无人监管的无限实验、PCB/CAD 自动操作或原生桌面客户端。
+## 本机安装与启动
 
-## Skill Arena 的原则
-
-- 对照组包含无额外 Skill 的基线；比较时固定任务、模型配置、代码版本、工具和资源上限。
-- 先满足功能、回归和权限边界等硬性要求，再比较成本、耗时和稳定性。
-- 保留多个适用场景的推荐；不把所有任务、模型和角色混成一个“全球最强”分数。
-- 显示原始结果、样本量和失败记录；少量试验只能形成初步判断。
-- Skill 来源、版本和许可证可追溯；星数和下载量是发现信号，不是质量证明。
-- 正在运行的任务锁定 Skill 版本；推荐变化不会悄悄改变当前任务。
-
-详见 [Skill Arena 评测规范](docs/SKILL_ARENA.md)。
-
-## 拟采用的技术栈
-
-| 部分 | 拟采用方案 | 职责 |
-| --- | --- | --- |
-| Web 客户端 | React、TypeScript、Vite | 项目、任务、执行证据和竞技结果 |
-| 应用服务 | Python、FastAPI | 产品状态、调度、授权、预算和评测规则 |
-| Agent 运行能力 | OpenHands Software Agent SDK | 会话、工具、模型调用及工作环境接入 |
-| 持久化 | PostgreSQL + 本地工件目录 | 任务元数据、运行事件、日志与结果 |
-| 任务环境 | 独立 Git 工作区 + 容器 | 分离代码修改，限制任务执行权限 |
-| 部署 | Mac mini 上自托管，拟用 Docker Compose | 首先服务单用户，不预设分布式集群 |
-
-这些是首版设计基线。具体依赖版本、SDK 接口和 Apple Silicon 容器兼容性须在 M1 接入验证后锁定；模型使用用户实际可调用的 API 标识，不依赖某个产品昵称。详见 [架构说明](docs/ARCHITECTURE.md)。
-
-## 从这里开始
-
-目前可以克隆并阅读文档，**尚无应用安装或启动命令**：
+首个验证环境为 Apple Silicon Mac mini、macOS、Docker 与 Python 3.12。系统 Python 3.9 不用于应用运行；`uv` 根据项目约束创建 Python 3.12 环境。还需可用的 Git、Node.js 和 `pnpm`，前端包管理器锁定为 `pnpm@11.1.1`。这些命令供本机开发使用，不代表已验证其他硬件或公网部署。
 
 ```bash
 git clone git@github.com:BensonYu/DooNex.git doonex
 cd doonex
+python3 -m venv .bootstrap
+.bootstrap/bin/pip install uv==0.13.7
+.bootstrap/bin/uv sync --frozen
+pnpm --dir apps/web install --frozen-lockfile
+pnpm --dir apps/web build
+.venv/bin/python scripts/setup_local.py
+docker compose --env-file "$HOME/Library/Application Support/DooNex/compose.env" up -d --wait
+docker pull python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0fde4134606dd40d8dd8dbcade98e669c
+.venv/bin/doonex init
 ```
+
+`setup_local.py` 在私有数据目录创建 `service.json` 与 `compose.env`，不会推断模型凭据或 API 额度，已有配置会保留。PostgreSQL 仅映射到本机端口。默认数据目录为 `~/Library/Application Support/DooNex`，可通过 `DOONEX_HOME` 指向其他私有目录；自定义目录需同步用于配置和启动。
+
+在两个终端分别运行：
+
+```bash
+.venv/bin/doonex serve
+```
+
+```bash
+.venv/bin/doonex worker
+```
+
+打开 `http://127.0.0.1:8741`。首次登录使用私有数据目录中的 `access-token`，不要把令牌写进 URL、截图、普通日志或 Git。worker 独立于浏览器和 API 请求；网页刷新不会新建运行。
+
+## 配置模型与预算
+
+模型配置保存在私有数据目录的 `model.json`；以 [model.example.json](model.example.json) 为模板，填写实际供应商、API 模型 ID、接口模式、输入/输出上限与超时。当前适配器限定 `openai`、`anthropic`；OpenAI 适配器支持显式选择 Chat/Responses，本轮实际验证的是 `gpt-6.1-sol` 的 Responses 路径；Anthropic Chat 尚未真实调用验证。实际可用性仍须逐个模型和接口验证。远程地址默认要求 HTTPS；已授权私网 HTTP 需要显式开启 `allow_private_http`。
+
+凭据由 `credential_env` 指定的服务端环境变量读取，也可保存到私有 `credentials.json`：它是以该环境变量名为键、密钥为值的 JSON 映射，文件权限须为 `0600`。模型密钥不交给浏览器或任务容器。`service.json` 保存数据库连接配置，也可用 `DOONEX_DATABASE_URL` 覆盖；`DOONEX_MODEL_CONFIG` 可指定模型配置文件。
+
+计费模式有两种：
+
+- `metered`：配置有来源的输入/输出单价与费用上限；价格未知时阻止启动。请求前预留调用数、token 和估计费用，返回后按实际用量结算；未知结果保留预留。
+- `subscription`：仅在用户明确确认包月授权后配置。费用及费用上限为 `null`，界面显示费用未知，不显示免费；仍强制限制调用数、token 和时长。
+
+时长从首次启动计算，包含暂停时间。恢复不清零预算。费用限制约束新请求调度，不能保证供应商账单绝对封顶，也不从聊天产品套餐推断 API 权限。
+
+## 检查与受控真实验收
+
+不调用模型的本机检查：
+
+```bash
+.venv/bin/python scripts/test_local.py
+.venv/bin/ruff check apps/server/doonex tests scripts
+pnpm --dir apps/web build
+git diff --check
+git diff --cached --check
+git status --short
+```
+
+`test_local.py` 启动一次性 PostgreSQL，运行包含真实 Docker 边界检查的测试，结束后清理测试数据库容器。SDK 合同测试使用模拟供应商响应；它们不消耗真实模型额度，也不替代真实发布验收。
+
+明确确认凭据、模型与本轮额度后，才运行受控样例：
+
+```bash
+.venv/bin/python scripts/live_acceptance.py --confirm-model-usage --model ACTUAL_API_MODEL_ID --max-calls 4 --max-tokens 50000
+```
+
+将 `ACTUAL_API_MODEL_ID` 替换为真实 API ID。脚本使用生成的样例仓库，已有其他注册项目时拒绝覆盖；真实运行记录、会话和工件保存在私有数据目录。整个验收 campaign 累计最多 10 次调用、100,000 token，失败尝试和未知在途用量也保留记录；不得删除或重置账本绕过授权额度。脚本成功后仍须完成 [PRD 的 M1 失败场景验收](docs/PRD.md#8-发布验收与测量)。
+
+## 当前限制
+
+- 一个项目、一个有效 worker、一个 Agent；不包含 M2–M5 功能。
+- 独立副本从指定 Git 对象导出，不带 `.git`，也不带原工作区未提交内容；任务内不能直接使用 Git 管理命令。
+- 拒绝符号链接、submodule、特殊文件、常见秘密文件名以及超出数量/大小限制的内容；常见生成缓存不进入快照。这一保守策略也会拒绝部分合法项目形态。
+- 任务容器默认无网络、非 root、只读根文件系统，仅持久化 `/workspace`；依赖须已包含在固定镜像中，任务不能在线安装软件包。
+- 每条验收命令使用同一固定快照的全新副本；验证失败、缺失或过期均不能标记已验证。
+- SDK 集成包含针对固定版本的少量私有覆盖，用于禁用环境发现、额外工具和未计费元数据请求；升级必须复验。遥测与秘密边界见 [架构说明](docs/ARCHITECTURE.md)。
+
+## 文档与来源
 
 | 文件 | 用途 |
 | --- | --- |
-| [PRD](docs/PRD.md) | 产品定位、范围、需求和验收标准 |
-| [架构说明](docs/ARCHITECTURE.md) | 模块边界、执行流程、数据与部署约束 |
-| [Skill Arena](docs/SKILL_ARENA.md) | 可比较实验、质量门槛、推荐与推广规则 |
-| [路线图](docs/ROADMAP.md) | 各阶段交付物、依赖和退出条件 |
-| [AGENTS.md](AGENTS.md) | 所有编程 Agent 的仓库协作约定 |
-| [CLAUDE.md](CLAUDE.md) | Claude 的项目规范入口，引用 AGENTS.md |
+| [PRD](docs/PRD.md) | 范围、需求与发布验收 |
+| [架构说明](docs/ARCHITECTURE.md) | 运行边界、数据、恢复与安全约束 |
+| [M1 实施记录](docs/M1_IMPLEMENTATION.md) | 实测进度、失败与下一步 |
+| [路线图](docs/ROADMAP.md) | 阶段依赖和退出条件 |
+| [Skill Arena](docs/SKILL_ARENA.md) | 后续私有竞技的唯一详细规则 |
+| [AGENTS.md](AGENTS.md) | 仓库协作与验证约定 |
+| [CLAUDE.md](CLAUDE.md) | Claude 的规范入口 |
 
-后续开发按阶段补充真实的依赖文件、启动方式和验证命令。提交应说明改动目的、实际验证结果和未验证事项。
-
-## 与 OpenHands 的关系
-
-DooNex 是独立项目，计划复用 [OpenHands Software Agent SDK](https://github.com/OpenHands/software-agent-sdk) 的运行能力。DooNex 自己负责工作台体验、任务编排、完成证据和 Skill 评测规则，不声称独创上游引擎，也不代表 OpenHands 官方。
-
-截至 2026-11-06 查阅，上游 SDK 使用 [MIT 许可证](https://github.com/OpenHands/software-agent-sdk/blob/main/LICENSE)。实际引入依赖或复制代码时，须根据锁定版本保留相应许可证及归属说明。
-
-## 许可与商业方向
-
-DooNex 自有内容的许可证及开源范围尚未确定。本次文档初始化不代替维护者选择开源许可证；仓库可见性也不等同于已授予开源使用许可。
-
-长期可探索托管服务、团队协作、企业部署及 Skill 生态。公共市场和作者分成尚未上线，也没有承诺收费标准或收益比例；相关决策见 [PRD](docs/PRD.md)。
+DooNex 是独立项目，复用 [OpenHands Software Agent SDK](https://github.com/OpenHands/software-agent-sdk)，不代表 OpenHands 官方。当前锁定 SDK 1.60.1，上游采用 MIT 许可证；归属与许可见 [第三方说明](THIRD_PARTY_NOTICES.md)。DooNex 自有内容的许可证与开放范围仍未确定，不自动选择开源许可证，也未上线公共市场、收费或作者分成。

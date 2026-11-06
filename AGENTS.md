@@ -7,13 +7,13 @@
 1. 阅读 [README](README.md)、[PRD](docs/PRD.md) 和当前阶段的 [路线图](docs/ROADMAP.md)。涉及运行机制或评测时，再读对应规范。
 2. 检查 Git 状态、已有文件和最近提交，保留用户及其他 Agent 的未提交改动。
 3. 明确本次范围、受影响的调用方与验收方法。先完成一个可验收的纵向流程，再扩展功能。
-4. 区分已实现事实、设计基线和后续设想。当前仓库只有文档，没有可运行应用。
+4. 区分已实现事实、设计基线和后续设想。当前处于 M1 实施阶段，已有 Web/API、独立 worker、PostgreSQL、SDK 接入、容器工具与证据实现；发布验收状态以 docs/M1_IMPLEMENTATION.md 为准，不能把离线测试当作真实模型任务通过。
 
 ## 产品约束
 
 - 产品名为 **DooNex**，仓库及程序标识使用 `doonex`。
 - 首先服务个人编程工作流；首个可用版为 M1，个人 Alpha 为 M1–M3。
-- 拟复用 OpenHands SDK；先验证接口及限制，避免重写已有模型、工具和会话能力。
+- 复用锁定版本的 OpenHands SDK；接口、模型能力和升级影响须实际验证，避免重写已有模型、工具和会话能力。
 - 不将公共市场、结算、分布式集群、专业 CAD/PCB 集成混入首版。
 - 不把综合分、星数或下载量当成普遍质量结论；竞技规则以 [评测规范](docs/SKILL_ARENA.md) 为准。
 - 不承诺模型一定支持某种 API、推理等级或工具能力；检查真实配置与响应。
@@ -56,7 +56,15 @@
 
 ## 当前可用检查
 
-当前没有应用构建、单元测试或启动脚本，不要虚构 `npm test`、`pytest` 等已经可用。
+应用的真实安装与启动命令见 [README](README.md)。与实现相关的检查按风险选择，整合后必须验证最终代码状态：
+
+```bash
+.venv/bin/python scripts/test_local.py
+.venv/bin/ruff check apps/server/doonex tests scripts
+pnpm --dir apps/web build
+```
+
+`test_local.py` 使用一次性 PostgreSQL，包含真实 Docker 边界测试；模拟 SDK 响应不代表真实模型接通。真实 API 验收只能在用户已确认的凭据、模型与累计预算内显式运行 `scripts/live_acceptance.py --confirm-model-usage`；失败和未知用量不得通过重置账本绕过。包月模式也必须限制调用、token 和时长，费用未知显示 `null`，不能写成免费。
 
 文档改动至少执行：
 
