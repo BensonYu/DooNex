@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from doonex.api import create_app
 from doonex.config import Settings
+from doonex.model_registry import ModelRegistry
 from doonex.store import Store
 from doonex.worker import WORKER_LOCK, Worker
 from doonex.workspace import _git
@@ -66,6 +67,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--confirm-model-usage", action="store_true", required=True)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--model-profile")
+    parser.add_argument("--reviewer-model-profile")
     parser.add_argument("--max-calls", type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=50_000)
     parser.add_argument(
@@ -81,16 +84,37 @@ def main():
     if not 1 <= args.max_calls <= 10 or not 35_000 <= args.max_tokens <= 100_000:
         raise SystemExit("Invalid bounded campaign allowance")
     if not re.fullmatch(
-        r"(?:sample-project|m2-sample-[a-z0-9-]{1,40})", args.sample_name
+        r"(?:sample-project|m[23]-sample-[a-z0-9-]{1,40})", args.sample_name
     ):
-        raise SystemExit("Use sample-project or a bounded m2-sample- name")
+        raise SystemExit("Use sample-project or a bounded m2-/m3-sample- name")
     os.umask(0o077)
     logging.getLogger().setLevel(logging.ERROR)
     settings = Settings.load()
-    if not settings.model or not settings.credential():
-        raise SystemExit("Configure an actual model and private credential first")
-    model = settings.model.model_copy(update={"model_id": args.model})
-    settings = Settings(settings.home, settings.database_url, settings.token, model)
+    if args.reviewer_model_profile and args.workflow != "execute_review":
+        raise SystemExit("A reviewer profile requires execute_review")
+    if args.model_profile:
+        model = ModelRegistry(settings).get(args.model_profile).model
+        if model.model_id != args.model:
+            raise SystemExit(
+                "The selected profile must match the explicitly confirmed model ID"
+            )
+    else:
+        if not settings.model:
+            raise SystemExit("Configure an actual model first")
+        model = settings.model.model_copy(update={"model_id": args.model})
+        settings = Settings(settings.home, settings.database_url, settings.token, model)
+    role_models = {"executor": model}
+    if args.workflow == "execute_review":
+        role_models["reviewer"] = (
+            ModelRegistry(settings).get(args.reviewer_model_profile).model
+            if args.reviewer_model_profile
+            else model
+        )
+    if not all(settings.credential(item.model_dump()) for item in role_models.values()):
+        raise SystemExit("Configure each selected model's private credential first")
+    subscription_only = all(
+        item.billing_mode == "subscription" for item in role_models.values()
+    )
     settings.home.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (settings.home / "live-acceptance.lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -101,7 +125,7 @@ def main():
             else {"reserved_calls": 0, "reserved_tokens": 0, "runs": []}
         )
         if args.authorize_subscription_campaign:
-            if model.billing_mode != "subscription":
+            if not subscription_only:
                 raise SystemExit(
                     "Uncapped campaign authorization requires confirmed subscription billing"
                 )
@@ -125,7 +149,7 @@ def main():
         uncapped = (
             campaign.get("authorization", {}).get("mode") == "subscription_uncapped"
         )
-        if uncapped and model.billing_mode != "subscription":
+        if uncapped and not subscription_only:
             raise SystemExit(
                 "Subscription campaign authorization cannot be reused for metered billing"
             )
@@ -183,6 +207,9 @@ def main():
                     "attempt_id": str(uuid4()),
                     "model": args.model,
                     "workflow": args.workflow,
+                    "role_models": {
+                        role: item.model_id for role, item in role_models.items()
+                    },
                     "status": "reserved",
                     "allocated_calls": args.max_calls,
                     "allocated_tokens": args.max_tokens,
@@ -196,15 +223,15 @@ def main():
                     json={
                         "project_id": project_id,
                         "workflow": args.workflow,
+                        "model_profile_id": args.model_profile,
+                        "reviewer_model_profile_id": args.reviewer_model_profile,
                         "prompt": "Fix calculator.py so add(a, b) returns the sum. Inspect it with doonex_shell, make the smallest change, and finish. Do not modify acceptance criteria. This is a controlled coding acceptance task.",
                         "checks": [check],
                         "base_ref": "HEAD",
                         "budget": {
                             "max_calls": args.max_calls,
                             "max_tokens": args.max_tokens,
-                            "max_cost_usd": None
-                            if model.billing_mode == "subscription"
-                            else 2,
+                            "max_cost_usd": None if subscription_only else 2,
                             "max_seconds": 300,
                         },
                     },
@@ -225,6 +252,9 @@ def main():
                 "run_id": run_id,
                 "model": args.model,
                 "workflow": args.workflow,
+                "role_models": {
+                    role: item.model_id for role, item in role_models.items()
+                },
                 "state": final["state"],
                 "reason": final["reason"],
                 "usage": final["usage"],

@@ -160,3 +160,48 @@ def test_metered_model_cannot_use_subscription_campaign_permission(
     with pytest.raises(SystemExit, match="confirmed subscription"):
         live_acceptance.main()
     assert not (settings.home / "live-acceptance.json").exists()
+
+
+def test_selected_profile_must_match_explicit_confirmed_model(
+    settings, store, monkeypatch
+):
+    from doonex.model_registry import ModelRegistry
+
+    ModelRegistry(settings).save("actual", "Actual", settings.model)
+    configure(monkeypatch, settings)
+    monkeypatch.setattr(sys, "argv", [*sys.argv, "--model-profile", "actual"])
+    with pytest.raises(SystemExit, match="confirmed model ID"):
+        live_acceptance.main()
+    assert store.list_runs() == []
+    assert not (settings.home / "live-acceptance.json").exists()
+
+
+def test_subscription_executor_does_not_authorize_metered_reviewer(
+    settings, store, monkeypatch
+):
+    from doonex.model_registry import ModelRegistry
+
+    ModelRegistry(settings).save("priced-review", "Priced review", settings.model)
+    monthly = Settings(
+        settings.home,
+        settings.database_url,
+        settings.token,
+        settings.model.model_copy(update={"billing_mode": "subscription"}),
+    )
+    configure(monkeypatch, monthly)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            *sys.argv,
+            "--workflow",
+            "execute_review",
+            "--reviewer-model-profile",
+            "priced-review",
+            "--authorize-subscription-campaign",
+        ],
+    )
+    with pytest.raises(SystemExit, match="confirmed subscription"):
+        live_acceptance.main()
+    assert store.list_runs() == []
+    assert not (settings.home / "live-acceptance.json").exists()

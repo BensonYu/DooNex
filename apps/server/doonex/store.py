@@ -8,6 +8,8 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from doonex.models import model_for_role, run_roles
+
 
 def now():
     return datetime.now(UTC).isoformat()
@@ -99,6 +101,20 @@ class Store:
 
     def create_run(self, request):
         run_id = str(uuid.uuid4())
+        roles = run_roles(request)
+
+        def initial_usage(subscription):
+            return {
+                "calls": 0,
+                "tokens": 0,
+                "cost_usd": None if subscription else 0.0,
+                "reserved_tokens": 0,
+                "reserved_cost_usd": None if subscription else 0.0,
+                "metered_cost_usd": 0.0,
+                "reserved_metered_cost_usd": 0.0,
+                "unknown_calls": 0,
+            }
+
         data = {
             "id": run_id,
             "state": "queued",
@@ -106,27 +122,18 @@ class Store:
             "created_at": now(),
             "updated_at": now(),
             "request": request,
-            "usage": {
-                "calls": 0,
-                "tokens": 0,
-                "cost_usd": None
-                if request["model"].get("billing_mode") == "subscription"
-                else 0.0,
-                "reserved_tokens": 0,
-                "reserved_cost_usd": None
-                if request["model"].get("billing_mode") == "subscription"
-                else 0.0,
-                "unknown_calls": 0,
-            },
+            "usage": initial_usage(
+                any(
+                    model_for_role(request, role).get("billing_mode") == "subscription"
+                    for role in roles
+                )
+            ),
             "first_started_at": None,
             "evidence": None,
             "phase": "execution",
             "active_assignment": "executor",
             "review": None,
         }
-        roles = ["executor"]
-        if request.get("workflow") == "execute_review":
-            roles.append("reviewer")
         data["assignments"] = {
             role: {
                 "id": str(uuid.uuid4()),
@@ -137,7 +144,9 @@ class Store:
                 "ended_at": None,
                 "session_generation": 0,
                 "resume_session": False,
-                "usage": dict(data["usage"]),
+                "usage": initial_usage(
+                    model_for_role(request, role).get("billing_mode") == "subscription"
+                ),
             }
             for role in roles
         }

@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 from doonex.budget import elapsed
 from doonex.config import Settings, redact
-from doonex.models import Budget, ProjectInput, ResumeInput, RunInput
+from doonex.models import Budget, ModelProfileInput, ProjectInput, ResumeInput, RunInput
 from doonex.store import Store
 from doonex.worker import get_workspace, run_directory
 
@@ -38,8 +38,11 @@ def identifier(value):
 
 
 def create_app(settings=None):
+    from doonex.model_registry import MetadataClient, ModelRegistry
+
     settings = settings or Settings.load()
     store = Store(settings.database_url)
+    registry = ModelRegistry(settings)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -175,6 +178,46 @@ def create_app(settings=None):
             ).model_dump(),
         }
 
+    def public_profile(profile):
+        return {
+            "id": profile.id,
+            "name": profile.name,
+            "revision": profile.revision,
+            "read_only": profile.read_only,
+            "usage_adapter": profile.usage_adapter,
+            "model": profile.model.model_dump(),
+            "credential_available": bool(
+                settings.credential(profile.model.model_dump())
+            ),
+        }
+
+    @app.get("/api/model-profiles", dependencies=auth)
+    def model_profiles():
+        return {
+            "profiles": [public_profile(profile) for profile in registry.list()],
+            "default_profile_id": "legacy" if settings.model else None,
+        }
+
+    @app.put("/api/model-profiles/{profile_id}", dependencies=auth)
+    def save_model_profile(profile_id: str, body: ModelProfileInput):
+        return public_profile(
+            registry.save(
+                profile_id,
+                body.name,
+                body.model,
+                usage_adapter=body.usage_adapter,
+                expected_revision=body.expected_revision,
+            )
+        )
+
+    @app.get("/api/model-profiles/{profile_id}/models", dependencies=auth)
+    def discover_models(profile_id: str):
+        return MetadataClient(settings).discover(registry.get(profile_id))
+
+    @app.get("/api/model-profiles/{profile_id}/usage", dependencies=auth)
+    def provider_usage(profile_id: str):
+        return MetadataClient(settings).usage(registry.get(profile_id))
+
     @app.get("/api/project", dependencies=auth)
     def project():
         return store.project()
@@ -228,16 +271,41 @@ def create_app(settings=None):
         context = http_request.query_params.get("project_id")
         if context and identifier(context) != registered["id"]:
             raise ValueError("创建请求的项目与当前项目上下文不一致")
-        if not settings.model or not settings.credential():
-            raise ValueError("请先在服务端配置模型和凭据；模型 API 预算需单独授权")
-        model = settings.model
-        if model.billing_mode != "subscription" and (
-            body.budget.max_cost_usd is None
-            or not model.input_price_per_million
-            or not model.output_price_per_million
-            or not model.price_source
-        ):
-            raise ValueError("模型价格未知；请配置有来源的输入/输出价格后启动")
+        if body.reviewer_model_profile_id and body.workflow != "execute_review":
+            raise ValueError("只有执行后审查流程可以选择审查模型")
+        selected_id = body.model_profile_id or ("legacy" if settings.model else None)
+        if not selected_id:
+            raise ValueError("请先选择服务端模型配置档；模型 API 预算需单独授权")
+        selected = {"executor": registry.get(selected_id)}
+        if body.workflow == "execute_review":
+            selected["reviewer"] = registry.get(
+                body.reviewer_model_profile_id or selected_id
+            )
+        for profile in selected.values():
+            model = profile.model
+            if not settings.credential(model.model_dump()):
+                raise ValueError("worker 缺少所选配置档引用的模型凭据")
+            if model.billing_mode != "subscription" and (
+                body.budget.max_cost_usd is None
+                or not model.input_price_per_million
+                or not model.output_price_per_million
+                or not model.price_source
+            ):
+                raise ValueError("模型价格未知；请配置有来源的输入/输出价格后启动")
+            upper = model.max_input_tokens + model.max_output_tokens
+            cost = (
+                None
+                if model.billing_mode == "subscription"
+                else (
+                    model.max_input_tokens * model.input_price_per_million
+                    + model.max_output_tokens * model.output_price_per_million
+                )
+                / 1_000_000
+            )
+            if body.budget.max_tokens < upper or (
+                cost is not None and body.budget.max_cost_usd < cost
+            ):
+                raise ValueError("预算不足以预留一次所选角色配置上限的模型请求")
         if body.base_ref.startswith("-"):
             raise ValueError("起始版本不能是 Git 选项")
         commit = git(
@@ -250,26 +318,23 @@ def create_app(settings=None):
             "repo_path": registered["path"],
             "base_commit": commit,
             "base_branch": branch(registered["path"]),
-            "model": model.model_dump(),
+            "model": selected["executor"].model.model_dump(),
+            "role_models": {
+                role: profile.model.model_dump() for role, profile in selected.items()
+            },
+            "model_profiles": {
+                role: {
+                    "id": profile.id,
+                    "name": profile.name,
+                    "revision": profile.revision,
+                }
+                for role, profile in selected.items()
+            },
             "acceptance_version": 1,
         }
-        # Preflight does not reserve or call the provider.
-        upper = model.max_input_tokens + model.max_output_tokens
-        cost = (
-            None
-            if model.billing_mode == "subscription"
-            else (
-                model.max_input_tokens * model.input_price_per_million
-                + model.max_output_tokens * model.output_price_per_million
-            )
-            / 1_000_000
-        )
-        if model.billing_mode == "subscription":
+        # A mixed run has unknown total cost, but still caps its priced subtotal.
+        if all(p.model.billing_mode == "subscription" for p in selected.values()):
             request["budget"]["max_cost_usd"] = None
-        if body.budget.max_tokens < upper or (
-            cost is not None and body.budget.max_cost_usd < cost
-        ):
-            raise ValueError("预算不足以预留一次配置上限的模型请求")
         return store.create_run(request)
 
     @app.get("/api/runs/{run_id}", dependencies=auth)

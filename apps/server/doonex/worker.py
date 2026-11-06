@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from doonex.budget import Halt, Ledger, elapsed, guard
 from doonex.config import Settings, redact
+from doonex.models import model_for_role, run_roles
 from doonex.store import OwnershipLost, Store, now
 
 WORKER_LOCK = 4142061106
@@ -122,8 +123,11 @@ class Worker:
         sandbox = Sandbox()
         run = self.store.get(run_id)
         request = run["request"]
-        key = self.settings.credential(request["model"])
-        secrets = (key, self.settings.token, self.settings.database_url)
+        role_keys = {
+            role: self.settings.credential(model_for_role(request, role))
+            for role in run_roles(request)
+        }
+        secrets = (*role_keys.values(), self.settings.token, self.settings.database_url)
 
         def event(kind, payload):
             self.lease()
@@ -139,7 +143,7 @@ class Worker:
                     current["first_started_at"] = now()
                 self.store.event(run_id, "running", {}, c)
             self.fence()
-            if not key:
+            if not all(role_keys.values()):
                 raise ValueError("worker 缺少运行所引用的模型凭据环境变量")
             if not (directory / "workspace").exists():
                 workspace = Workspace.create(
@@ -157,6 +161,7 @@ class Worker:
                     raise ValueError("持久化基线尚未绑定，须核对后重新创建任务")
 
             def execute_role(role, shell_path, *, read_only=False):
+                selected_model = model_for_role(request, role)
                 with self.store.locked(run_id, self.owner) as (c, current):
                     guard(current)
                     assignment = current.get("assignments", {}).get(role)
@@ -286,11 +291,11 @@ class Worker:
                     state_dir=session_dir,
                     prompt=prompt,
                     model={
-                        **request["model"],
+                        **selected_model,
                         "timeout_seconds": max(
                             1,
                             min(
-                                request["model"]["timeout_seconds"],
+                                selected_model["timeout_seconds"],
                                 int(
                                     request["budget"]["max_seconds"]
                                     - elapsed(self.store.get(run_id))
@@ -298,7 +303,7 @@ class Worker:
                             ),
                         ),
                     },
-                    api_key=key,
+                    api_key=role_keys[role],
                     before_model=before_model,
                     after_model=after_model,
                     shell=shell,

@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime
 
+from doonex.models import model_for_role
 from doonex.store import now
 
 
@@ -69,7 +70,7 @@ class Ledger:
             guard(run)
             usages = self.usages(run, dispatch=True)
             model, limits, usage = (
-                run["request"]["model"],
+                model_for_role(run["request"], self.role),
                 run["request"]["budget"],
                 run["usage"],
             )
@@ -106,7 +107,11 @@ class Ledger:
             ):
                 raise Halt("剩余 token 预算不足以预留本次请求")
             if not subscription and (
-                usage["cost_usd"] + usage["reserved_cost_usd"] + cost
+                usage.get("metered_cost_usd", usage["cost_usd"] or 0)
+                + usage.get(
+                    "reserved_metered_cost_usd", usage["reserved_cost_usd"] or 0
+                )
+                + cost
                 > limits["max_cost_usd"]
             ):
                 raise Halt("剩余费用预算不足以预留本次请求")
@@ -115,6 +120,9 @@ class Ledger:
                 "output_tokens": output_tokens,
                 "tokens": tokens,
                 "cost": cost,
+                "model_id": model["model_id"],
+                "provider": model["provider"],
+                "api_mode": model.get("api_mode", "chat"),
                 **self.attribution(),
             }
             action_id = self.store.action(self.run_id, "model", reservation, c)
@@ -122,7 +130,13 @@ class Ledger:
                 item["calls"] += 1
                 item["reserved_tokens"] += tokens
                 if cost is not None:
-                    item["reserved_cost_usd"] += cost
+                    item.setdefault("metered_cost_usd", item["cost_usd"] or 0)
+                    item.setdefault(
+                        "reserved_metered_cost_usd", item["reserved_cost_usd"] or 0
+                    )
+                    item["reserved_metered_cost_usd"] += cost
+                    if item["reserved_cost_usd"] is not None:
+                        item["reserved_cost_usd"] += cost
             self.store.event(
                 self.run_id,
                 "model_reserved",
@@ -155,7 +169,7 @@ class Ledger:
                 raise ValueError("模型请求已结算")
             # The persisted reservation is authoritative, not callback data.
             reservation = {**existing["data"], "id": reservation["id"]}
-            usages, model = self.usages(run), run["request"]["model"]
+            usages, model = self.usages(run), model_for_role(run["request"], self.role)
             valid = actual is not None and all(
                 isinstance(actual.get(k), int)
                 and not isinstance(actual[k], bool)
@@ -188,10 +202,19 @@ class Ledger:
                 usage["reserved_tokens"] -= reservation["tokens"]
                 usage["tokens"] += actual["input_tokens"] + actual["output_tokens"]
                 if cost is not None:
-                    usage["reserved_cost_usd"] = max(
-                        0, usage["reserved_cost_usd"] - reservation["cost"]
+                    usage.setdefault("metered_cost_usd", usage["cost_usd"] or 0)
+                    usage.setdefault(
+                        "reserved_metered_cost_usd", usage["reserved_cost_usd"] or 0
                     )
-                    usage["cost_usd"] += cost
+                    usage["reserved_metered_cost_usd"] = max(
+                        0, usage["reserved_metered_cost_usd"] - reservation["cost"]
+                    )
+                    usage["metered_cost_usd"] += cost
+                    if usage["cost_usd"] is not None:
+                        usage["reserved_cost_usd"] = max(
+                            0, usage["reserved_cost_usd"] - reservation["cost"]
+                        )
+                        usage["cost_usd"] += cost
             self.store.finish_action(
                 reservation["id"],
                 "completed",

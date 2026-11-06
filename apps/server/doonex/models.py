@@ -25,7 +25,7 @@ class ModelConfig(StrictModel):
     credential_env: str = Field(
         default="DOONEX_LLM_API_KEY", pattern=r"^[A-Z][A-Z0-9_]{0,100}$"
     )
-    base_url: str | None = None
+    base_url: str | None = Field(default=None, max_length=4096)
     allow_private_http: bool = False
     billing_mode: Literal["metered", "subscription"] = "metered"
     max_input_tokens: int = Field(default=32_768, ge=16_384, le=200_000)
@@ -41,6 +41,12 @@ class ModelConfig(StrictModel):
             raise ValueError("Responses 接口仅支持 OpenAI 兼容配置")
         if self.base_url:
             url = urlparse(self.base_url)
+            if not url.hostname or any(char.isspace() for char in self.base_url):
+                raise ValueError("模型地址必须包含有效主机名且不能含空白")
+            try:
+                _ = url.port
+            except ValueError:
+                raise ValueError("模型地址端口无效") from None
             if url.username or url.password or url.query or url.fragment:
                 raise ValueError("模型地址不能包含凭据、查询或片段")
             private = False
@@ -62,6 +68,12 @@ class ModelConfig(StrictModel):
 
 class RunInput(StrictModel):
     project_id: str | None = Field(default=None, min_length=36, max_length=36)
+    model_profile_id: str | None = Field(
+        default=None, pattern=r"^[a-z][a-z0-9_-]{0,63}$"
+    )
+    reviewer_model_profile_id: str | None = Field(
+        default=None, pattern=r"^[a-z][a-z0-9_-]{0,63}$"
+    )
     workflow: Literal["execute", "execute_review"] = "execute"
     prompt: str = Field(min_length=1, max_length=20_000)
     base_ref: str = Field(
@@ -86,3 +98,23 @@ class ProjectInput(StrictModel):
 
 class ResumeInput(StrictModel):
     acknowledge_unknown: bool = False
+
+
+class ModelProfileInput(StrictModel):
+    name: str = Field(min_length=1, max_length=100)
+    model: ModelConfig
+    usage_adapter: Literal["none", "gateway_v1"] = "none"
+    expected_revision: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+
+def model_for_role(request: dict, role: str | None = None) -> dict:
+    """Frozen role settings; historical single-model runs need no migration."""
+    return request.get("role_models", {}).get(role or "executor", request["model"])
+
+
+def run_roles(request: dict) -> tuple[str, ...]:
+    return (
+        ("executor", "reviewer")
+        if request.get("workflow") == "execute_review"
+        else ("executor",)
+    )
