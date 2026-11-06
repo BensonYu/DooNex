@@ -26,12 +26,16 @@ try:
 except OSError:
     connected = False
 try:
-    open('/root/root-write-probe', 'w').write('bad')
+    open('/var/tmp/root-write-probe', 'w').write('bad')
     root_write = True
-except OSError:
+    root_errno = None
+except OSError as error:
     root_write = False
+    root_errno = error.errno
 print(json.dumps({'uid': os.getuid(), 'outside': os.path.exists(OUTSIDE),
 'key': 'OPENAI_API_KEY' in os.environ, 'network': connected, 'root_write': root_write,
+'root_errno': root_errno, 'interfaces': os.listdir('/sys/class/net'),
+'no_new_privileges': next(line.strip().split()[1] for line in open('/proc/self/status') if line.startswith('NoNewPrivs:')),
 'socket': os.path.exists('/var/run/docker.sock'),
 'capabilities': next(line.strip().split()[1] for line in open('/proc/self/status') if line.startswith('CapEff:'))}))
 open('/workspace/result.txt', 'w').write('isolated')
@@ -46,6 +50,9 @@ open('/workspace/result.txt', 'w').write('isolated')
         "key": False,
         "network": False,
         "root_write": False,
+        "root_errno": 30,
+        "interfaces": ["lo"],
+        "no_new_privileges": "1",
         "socket": False,
         "capabilities": "0000000000000000",
     }

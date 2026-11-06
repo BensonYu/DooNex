@@ -51,6 +51,7 @@ def test_fixed_snapshot_fresh_checks_and_delivery_integrity(workspace, tmp_path)
     patch = (root / "diff.patch").read_text()
     assert "diff --git a/main.py b/main.py" in patch
     assert "added.py" in patch and "+answer = 42" in patch
+    git(workspace.repository, "apply", "--check", str(root / "diff.patch"))
     with tarfile.open(root / "snapshot.tar.gz") as archive:
         assert sorted(archive.getnames()) == ["added.py", "main.py"]
     assert (workspace.path / "main.py").read_text() == 'print("new")\n'
