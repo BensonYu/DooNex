@@ -61,7 +61,7 @@ class ModelConfig(StrictModel):
 
 
 class RunInput(StrictModel):
-    project_id: str | None = Field(default=None, max_length=36)
+    project_id: str | None = Field(default=None, min_length=36, max_length=36)
     workflow: Literal["execute", "execute_review"] = "execute"
     prompt: str = Field(min_length=1, max_length=20_000)
     base_ref: str = Field(
