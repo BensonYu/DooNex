@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -17,7 +17,7 @@ from doonex.library import Library
 from doonex.model_registry import ModelRegistry
 from doonex.models import Budget, StrictModel
 from doonex.sandbox import TASK_IMAGE
-from doonex.store import now
+from doonex.store import dispatch_lock, now
 
 TERMINAL_RUNS = {
     "completed_verified",
@@ -64,6 +64,8 @@ def environment():
                 "library.py",
                 "models.py",
                 "store.py",
+                "background.py",
+                "scheduling.py",
             )
         },
         "provider_cache_control": "unsupported",
@@ -158,7 +160,7 @@ class Arena:
                 (value["state"], Jsonb(value), value["id"]),
             )
 
-    def create(self, body):
+    def prepare(self, body):
         taskset = self.library.get("taskset", body.taskset_id)
         if not self.library.taskset(taskset)["valid"]:
             raise ValueError("任务集完整性检查失败")
@@ -199,6 +201,15 @@ class Arena:
                 for b in (run_budget, batch_budget)
             ):
                 raise ValueError("运行或批次费用预算不足以预留模型请求")
+        return taskset, skills, profile, model, run_budget, batch_budget
+
+    def create(self, body, connection=None, *, background=None, prepared=None):
+        # File validation is completed before taking the short dispatch lock.
+        # Background.claim independently rechecks the frozen database binding.
+        taskset, skills, profile, model, run_budget, batch_budget = (
+            self.prepare(body) if prepared is None else prepared
+        )
+        subscription = model["billing_mode"] == "subscription"
         identifier = str(uuid4())
         profile_record = {
             "id": profile.id,
@@ -250,9 +261,16 @@ class Arena:
                 "reserved_metered_cost_usd": 0.0,
             },
         }
+        if background:
+            if value["split"] != "tuning":
+                raise ValueError("后台只能执行调优任务集")
+            value["background"] = background
         # All planned children and their parent are committed together. The
         # worker only claims committed rows. Interleave arms across repeats.
-        with self.store.connect() as c:
+        with (
+            self.store.connect() if connection is None else nullcontext(connection)
+        ) as c:
+            dispatch_lock(c)
             c.execute(
                 "INSERT INTO arena_evaluations VALUES(%s,%s,%s)",
                 (identifier, "queued", Jsonb(value)),
@@ -299,6 +317,8 @@ class Arena:
                             "arena": binding,
                             "acceptance_version": 1,
                         }
+                        if background:
+                            request["background"] = background
                         run = self.store.create_run(request, connection=c)
                         value["attempts"].append(
                             {
@@ -313,7 +333,7 @@ class Arena:
                 "UPDATE arena_evaluations SET data=%s WHERE id=%s",
                 (Jsonb(value), identifier),
             )
-        return self.detail(identifier)
+        return self.detail(identifier) if connection is None else value
 
     def integrity(self, value, *, approval=False):
         errors = []
@@ -365,7 +385,7 @@ class Arena:
         if state in {"cancelling", "budget_exceeded"}:
             for attempt in children:
                 with self.store.locked(attempt["run_id"]) as (c, run):
-                    if run["state"] == "queued":
+                    if run["state"] in {"queued", "yielded"}:
                         run.update(
                             state="cancelled",
                             reason=reason,
@@ -447,9 +467,18 @@ class Arena:
         for run in children:
             if run["state"] not in {"paused", "interrupted"}:
                 continue
-            with self.store.locked(run["id"]) as (c, current):
+            with self.store.locked(run["id"], dispatch=True) as (c, current):
                 if current["state"] not in {"paused", "interrupted"}:
                     raise ValueError("子运行状态已变化，请重新核查")
+                if current["request"].get("background"):
+                    from doonex.background import Background
+
+                    Background(self.settings, self.store).preflight(
+                        c,
+                        current["request"]["background"]["authorization_id"],
+                        identifier,
+                    )
+                current.pop("scheduling", None)
                 if run["id"] in assistance:
                     current["arena_assisted"] = True
                     current.setdefault("arena_assistance", []).append(
@@ -459,6 +488,12 @@ class Arena:
                     state="queued",
                     requested_action=None,
                     reason="已核查批次恢复，预算不变",
+                    recovery={
+                        "remaining": [],
+                        "errors": [],
+                        "stopped": [],
+                        "confirmed_at": now(),
+                    },
                 )
                 active = current.get("assignments", {}).get(
                     current.get("active_assignment")
@@ -606,6 +641,8 @@ class Arena:
 
     def recommend(self, evaluation_id, position, arm_id, *, rollback_id=None):
         value = self.detail(evaluation_id)
+        if value.get("background"):
+            raise ValueError("后台调优结果不能推广为推荐")
         if arm_id not in value["metrics"]["recommendations"][position]:
             raise ValueError("该版本不满足当前场景的推荐门槛")
         self.library.freeze_skill(arm_id)

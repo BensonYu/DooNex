@@ -7,7 +7,7 @@ from uuid import UUID
 from psycopg.types.json import Jsonb
 
 from doonex.models import model_for_role
-from doonex.store import now
+from doonex.store import now, termination_unknown
 
 
 class Halt(RuntimeError):
@@ -145,9 +145,19 @@ def guard(run):
 
 
 class Ledger:
-    def __init__(self, store, run_id, owner=None, *, assignment_id=None, role=None):
+    def __init__(
+        self,
+        store,
+        run_id,
+        owner=None,
+        *,
+        assignment_id=None,
+        role=None,
+        dispatch_check=None,
+    ):
         self.store, self.run_id = store, run_id
         self.owner = owner
+        self.dispatch_check = dispatch_check
         if (assignment_id is None) != (role is None):
             raise ValueError("角色与分配标识必须同时提供")
         if role is None:
@@ -184,10 +194,14 @@ class Ledger:
         return [run["usage"], assignment["usage"]]
 
     def reserve(self, input_tokens, output_tokens):
-        with self.store.locked(self.run_id, self.owner) as (c, run):
+        with self.store.locked(self.run_id, self.owner, dispatch=True) as (c, run):
+            if termination_unknown(c):
+                raise Halt("存在终止状态不明的任务容器；禁止派发")
             guard(run)
             usages = self.usages(run, dispatch=True)
             batch = _locked_batch(c, run, dispatch=True)
+            if self.dispatch_check:
+                self.dispatch_check(c, run)
             model, limits, usage = (
                 model_for_role(run["request"], self.role),
                 run["request"]["budget"],
@@ -363,13 +377,24 @@ class Ledger:
                 c,
             )
 
-    def tool_intent(self, command):
-        with self.store.locked(self.run_id, self.owner) as (c, run):
+    def tool_intent(self, command, *, action_identity=None):
+        with self.store.locked(self.run_id, self.owner, dispatch=True) as (c, run):
+            if termination_unknown(c):
+                raise Halt("存在终止状态不明的任务容器；禁止派发")
             guard(run)
             self.usages(run, dispatch=True)
             _locked_batch(c, run, dispatch=True)
+            if self.dispatch_check:
+                self.dispatch_check(c, run)
             action_id = self.store.action(
-                self.run_id, "shell", {"command": command, **self.attribution()}, c
+                self.run_id,
+                "shell",
+                {
+                    "command": command,
+                    **self.attribution(),
+                    **({"sdk_action": action_identity} if action_identity else {}),
+                },
+                c,
             )
             self.store.event(
                 self.run_id,

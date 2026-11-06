@@ -253,9 +253,13 @@ class Background:
                     }
                 ),
             }
-        profile = ModelRegistry(self.settings).get(body.model_profile_id)
-        model = profile.model.model_dump()
-        if not self.settings.credential(model):
+        try:
+            profile = ModelRegistry(self.settings).get(body.model_profile_id)
+            model = profile.model.model_dump()
+            credential = self.settings.credential(model)
+        except (KeyError, ValueError, OSError):
+            raise BackgroundStopped("后台冻结模型配置或凭据引用不可用") from None
+        if not credential:
             raise BackgroundStopped("所选后台模型凭据不可用")
         if model["billing_mode"] == "subscription":
             body.run_budget.max_cost_usd = body.batch_budget.max_cost_usd = None
@@ -317,6 +321,7 @@ class Background:
         """
         with self.store.connect() as c:
             value = self.get(identifier, c)
+            self._window(value, waiting=True)
             self._unchanged(value, c)
         return {
             "authorization_id": value["id"],
@@ -324,6 +329,19 @@ class Background:
             "snapshot": value["snapshot"],
             "checked_at": self._now().isoformat(),
         }
+
+    def dispatch_status(self, identifier, state, reason):
+        """Persist an admission refusal once per distinct reason, without reauthorizing."""
+        with self.store.connect() as c:
+            value = self.get(identifier, c, lock=True)
+            if value["state"] != "enabled":
+                return value
+            status = {"state": state, "reason": reason}
+            previous = value.get("dispatch_status") or {}
+            if all(previous.get(k) == v for k, v in status.items()):
+                return value
+            value["dispatch_status"] = {**status, "at": self._now().isoformat()}
+            return self._save(c, value, "dispatch_" + state, reason=reason)
 
     def create(self, body):
         body = BackgroundInput.model_validate(body).model_copy(deep=True)
@@ -612,6 +630,13 @@ class Background:
         ).fetchone()
         if not allocation or allocation["state"] != "reserved":
             raise BackgroundStopped("后台日额度预留无效或已经结算")
+        duration = (
+            self._now() - datetime.fromisoformat(allocation["data"]["claimed_at"])
+        ).total_seconds()
+        if duration < 0 or duration >= allocation["data"]["reserved"]["seconds"]:
+            raise BackgroundStopped(
+                "后台分配累计时长已达上限或时钟倒退；排队和让出不延长日预留"
+            )
         ledger = self.day(value["date"], connection, lock=True)
         if ledger["budget"] != value["input"]["daily_budget"]:
             raise BackgroundStopped("后台日预算绑定已变化")

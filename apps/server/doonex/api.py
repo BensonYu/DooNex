@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from doonex.budget import elapsed
 from doonex.config import Settings, redact
 from doonex.models import Budget, ModelProfileInput, ProjectInput, ResumeInput, RunInput
-from doonex.store import Store
+from doonex.store import Store, now
 from doonex.worker import get_workspace, run_directory
 
 
@@ -403,9 +403,15 @@ def create_app(settings=None):
                 "pausing",
                 "paused",
                 "interrupted",
+                "yielded",
             }:
                 raise ValueError("该运行已经结束")
-            immediate = current["state"] in {"queued", "paused", "interrupted"}
+            immediate = current["state"] in {
+                "queued",
+                "paused",
+                "interrupted",
+                "yielded",
+            }
             if immediate and current["first_started_at"]:
                 from doonex.sandbox import Sandbox
                 from doonex.worker import stop_containers
@@ -506,7 +512,7 @@ def create_app(settings=None):
             raise ValueError("请核对未决动作并明确确认后续接")
         if elapsed(run) >= run["request"]["budget"]["max_seconds"]:
             raise ValueError("原运行的时长预算已用尽；请保留当前结果并创建新任务")
-        with store.locked(run["id"]) as (c, current):
+        with store.locked(run["id"], dispatch=True) as (c, current):
             if current["state"] not in {"paused", "interrupted"}:
                 raise ValueError("运行状态已变化")
             if uncertain:
@@ -531,7 +537,15 @@ def create_app(settings=None):
                     active["resume_session"] = bool(active.get("started_at"))
                 active["state"] = "pending"
             current.update(
-                state="queued", requested_action=None, reason="已核查，等待续接"
+                state="queued",
+                requested_action=None,
+                reason="已核查，等待续接",
+                recovery={
+                    "remaining": [],
+                    "errors": [],
+                    "stopped": [],
+                    "confirmed_at": now(),
+                },
             )
             store.event(
                 run["id"],
@@ -685,6 +699,9 @@ def create_app(settings=None):
     from doonex.arena import install_arena_routes
 
     install_arena_routes(app, settings, store, auth)
+    from doonex.scheduling import install_background_routes
+
+    install_background_routes(app, settings, store, auth)
 
     static_dir = Path(__file__).resolve().parents[2] / "web" / "dist"
     if static_dir.is_dir():

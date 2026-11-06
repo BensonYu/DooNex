@@ -206,7 +206,9 @@ def test_docker_failure_records_unknown_termination(
     monkeypatch.setattr(Sandbox, "stop_run", unavailable)
     with store.locked(run["id"]) as (_, current):
         current.update(state="running", first_started_at=now())
-    Worker(settings).run(once=True)
+    # Unknown container termination is now a durable global dispatch block.
+    with pytest.raises(RuntimeError, match="终止状态不明"):
+        Worker(settings).run(once=True)
     final = store.get(run["id"])
     assert final["state"] == "interrupted"
     assert final["recovery"]["remaining"] == ["unknown"]

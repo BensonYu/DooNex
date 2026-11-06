@@ -58,9 +58,13 @@ def get_workspace(run, directory):
 
 class Worker:
     def __init__(self, settings: Settings):
+        from doonex.scheduling import Scheduler
+
         self.settings, self.store = settings, Store(settings.database_url)
+        self.scheduler = Scheduler(settings, self.store)
         self.lock_connection = None
         self.stopping = False
+        self.cleanup_blocked = False
         self.owner = str(uuid4())
 
     def lease(self):
@@ -103,6 +107,8 @@ class Worker:
             with self.store.locked(run["id"]) as (c, current):
                 self.lease()
                 result = stop_containers(sandbox, run["id"])
+                if result.get("remaining") or result.get("errors"):
+                    self.cleanup_blocked = True
                 self.store.mark_pending_unknown(run["id"], c, current)
                 current.update(
                     state="interrupted",
@@ -123,10 +129,13 @@ class Worker:
         from doonex.evidence import Evidence
         from doonex.review import Review
         from doonex.sandbox import Sandbox, SandboxError
+        from doonex.scheduling import Yielded
         from doonex.sdk import (
             ModelCallError,
             ReviewReportError,
+            SchedulerYield,
             SessionRecoveryRequired,
+            SessionScheduling,
             parse_review_report,
             run_session,
         )
@@ -272,7 +281,12 @@ class Worker:
                     )
                     resume = (assignment or current).get("resume_session", False)
                     resume = resume and session_dir.exists()
-                ledger = Ledger(self.store, run_id, self.owner)
+                ledger = Ledger(
+                    self.store,
+                    run_id,
+                    self.owner,
+                    dispatch_check=self.scheduler.preflight,
+                )
                 attribution = ledger.attribution()
 
                 def role_stop():
@@ -301,7 +315,7 @@ class Worker:
                     self.lease()
                     ledger.settle(reservation, usage)
 
-                def shell(command):
+                def shell(command, action_identity=None):
                     self.fence()
                     if role_stop():
                         raise Halt("运行或角色已停止派发新动作")
@@ -331,7 +345,9 @@ class Worker:
                         raise PermissionViolation(
                             "模型请求触及未授权的检查器或宿主秘密路径"
                         )
-                    action_id = ledger.tool_intent(command)
+                    action_id = ledger.tool_intent(
+                        command, action_identity=action_identity
+                    )
                     remaining = max(
                         0.1,
                         request["budget"]["max_seconds"]
@@ -351,6 +367,8 @@ class Worker:
                             **options,
                         )
                         result = redact(result, secrets)
+                        if result.get("cleanup_error"):
+                            raise SandboxError("工具容器清理失败，不能确认执行已经终止")
                         self.lease()
                         if read_only:
                             saved_handoff = self.store.get(run_id).get("handoff")
@@ -417,6 +435,20 @@ class Worker:
                         + "\n".join(request.get("visible_checks", request["checks"]))
                     )
                 finishes = []
+                scheduling = None
+                if request.get("background"):
+                    saved = self.store.get(run_id).get("scheduling") or {}
+                    scheduling = SessionScheduling(
+                        generation=generation,
+                        should_yield=lambda: self.scheduler.should_yield(run_id),
+                        on_yield=lambda receipt: self.scheduler.save_yield(
+                            run_id, self.owner, receipt, workspace
+                        ),
+                        resume_receipt=saved.get("receipt") if resume else None,
+                        authorize_resume=lambda receipt: (
+                            self.scheduler.validate_receipt(run_id, receipt, workspace)
+                        ),
+                    )
                 result = run_session(
                     run_id=run_id,
                     state_dir=session_dir,
@@ -444,6 +476,11 @@ class Worker:
                     role=role,
                     on_finish=finishes.append,
                     **(
+                        {"scheduling": scheduling, "shell_with_action": shell}
+                        if scheduling
+                        else {}
+                    ),
+                    **(
                         {
                             "skill": {
                                 "version_id": skill_context.version_id,
@@ -455,6 +492,8 @@ class Worker:
                         else {}
                     ),
                 )
+                if result == "yielded" and scheduling:
+                    raise Yielded()
                 if role_stop():
                     raise Halt("运行已停止或时长用尽")
                 if result != "finished":
@@ -596,11 +635,80 @@ class Worker:
                 ]
             ):
                 raise ValueError("评测冻结上下文已变化，禁止生成通过证据")
+
+            class GuardedVerifier:
+                # The fixed tuning task has exactly one check. Admission is
+                # atomic with foreground enqueue; an admitted check may finish.
+                image = sandbox.image
+
+                def run(inner, *args, **kwargs):
+                    try:
+                        with self.store.locked(run_id, self.owner, dispatch=True) as (
+                            c,
+                            current,
+                        ):
+                            if current["state"] != "verifying" or current.get(
+                                "requested_action"
+                            ):
+                                raise Halt("验证已经停止")
+                            if elapsed(current) >= request["budget"]["max_seconds"]:
+                                raise Halt("原运行时长已达上限")
+                            from doonex.budget import _locked_batch
+                            from doonex.store import termination_unknown
+
+                            if termination_unknown(c):
+                                raise Halt("存在终止状态不明的任务容器；禁止验证派发")
+                            _locked_batch(c, current, dispatch=True)
+                            self.scheduler.preflight(c, current)
+                            action = self.store.action(
+                                run_id,
+                                "verification",
+                                {
+                                    "command": args[1],
+                                    "phase": "verification",
+                                    "dispatched_by": "controller",
+                                    **Ledger(
+                                        self.store, run_id, self.owner
+                                    ).attribution(),
+                                },
+                                c,
+                            )
+                            self.store.event(
+                                run_id,
+                                "verification_dispatched",
+                                {"action_id": action},
+                                c,
+                            )
+                    except SchedulerYield:
+                        self.scheduler.save_yield(run_id, self.owner, None, workspace)
+                        raise Yielded() from None
+                    try:
+                        result = sandbox.run(*args, **kwargs)
+                        if result.get("cleanup_error"):
+                            raise SandboxError("验证容器清理失败，不能确认执行已经终止")
+                        self.lease()
+                        self.store.finish_action(
+                            action,
+                            "completed",
+                            redact(result, secrets),
+                            owner=self.owner,
+                        )
+                        return result
+                    except BaseException:
+                        self.lease()
+                        self.store.finish_action(
+                            action,
+                            "unknown",
+                            {"reason": "验证结果未完整记录"},
+                            owner=self.owner,
+                        )
+                        raise
+
             report = Evidence.capture(
                 workspace,
                 directory,
                 request["checks"],
-                sandbox,
+                GuardedVerifier(),
                 min(60, remaining),
                 run_id,
                 should_stop=verify_stop,
@@ -716,6 +824,10 @@ class Worker:
                     },
                     c,
                 )
+        except Yielded:
+            # SDK observation, usage and product receipt have all been saved.
+            # A scheduling checkpoint must not pass through failure recovery.
+            self.lease()
         except BaseException as exc:  # noqa: BLE001 - record shutdown and clean task containers
             # A new lock holder owns cleanup after a connection loss.
             self.lease()
@@ -723,6 +835,7 @@ class Worker:
                 cleanup = stop_containers(sandbox, run_id)
                 reason = str(redact(str(exc), secrets))[:1500]
                 if cleanup.get("remaining") or cleanup.get("errors"):
+                    self.cleanup_blocked = True
                     state, reason = "interrupted", "任务进程终止状态不明，须核查容器"
                 elif current.get("requested_action") == "cancel":
                     state, reason = "cancelled", "已取消，任务容器已停止"
@@ -827,6 +940,37 @@ class Worker:
                     arena.sync(batch["id"])
             while not self.stopping:
                 self.fence()
+                from doonex.store import termination_unknown
+
+                with self.store.connect() as c:
+                    blocked = termination_unknown(c)
+                if self.cleanup_blocked or self.scheduler.cleanup_blocked or blocked:
+                    raise RuntimeError(
+                        "任务容器终止状态不明；执行服务阻止后续任务，须核查"
+                    )
+                self.scheduler.maintain()
+                from doonex.budget import BatchHalt
+
+                for run in self.store.list_runs(limit=None):
+                    if run["state"] != "yielded":
+                        continue
+                    try:
+                        self.scheduler.resume_yielded(
+                            run,
+                            get_workspace(run, run_directory(self.settings, run["id"])),
+                        )
+                        arena.sync(run["request"]["arena"]["evaluation_id"])
+                    except BatchHalt as error:
+                        arena.stop(
+                            run["request"]["arena"]["evaluation_id"],
+                            "budget_exceeded",
+                            str(error),
+                        )
+                    if self.scheduler.cleanup_blocked:
+                        raise RuntimeError(
+                            "后台检查点存在残留或未知容器；须核查后恢复服务"
+                        )
+                self.scheduler.claim_next()
                 queued = [
                     r
                     for r in reversed(self.store.list_runs(limit=None))
@@ -839,9 +983,15 @@ class Worker:
                     or arena.get(r["request"]["arena"]["evaluation_id"])["state"]
                     in {"queued", "running"}
                 ]
-                queued.sort(key=lambda r: bool(r["request"].get("arena")))
+                queued.sort(
+                    key=lambda r: (
+                        bool(r["request"].get("background")),
+                        bool(r["request"].get("arena")),
+                    )
+                )
                 if queued:
                     self.execute(queued[0]["id"])
+                self.scheduler.maintain()
                 if once:
                     break
                 time.sleep(0.5)

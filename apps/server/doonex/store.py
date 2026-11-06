@@ -55,6 +55,23 @@ CREATE TABLE IF NOT EXISTS actions (
 """
 
 
+DISPATCH_LOCK = 4142061110
+
+
+def dispatch_lock(connection):
+    connection.execute("SELECT pg_advisory_xact_lock(%s)", (DISPATCH_LOCK,))
+
+
+def termination_unknown(connection):
+    return bool(
+        connection.execute(
+            "SELECT 1 FROM runs WHERE "
+            "COALESCE(jsonb_array_length(data->'recovery'->'remaining'),0)>0 OR "
+            "COALESCE(jsonb_array_length(data->'recovery'->'errors'),0)>0 LIMIT 1"
+        ).fetchone()
+    )
+
+
 class Store:
     def __init__(self, database_url):
         self.database_url = database_url
@@ -66,6 +83,9 @@ class Store:
         with self.connect() as connection:
             connection.execute("SELECT pg_advisory_xact_lock(%s)", (4142061107,))
             connection.execute(SCHEMA)
+            from doonex.background import BACKGROUND_SCHEMA
+
+            connection.execute(BACKGROUND_SCHEMA)
             # Keep the M1 source row intact. Repeated startup never overwrites
             # updated M2 metadata, identities, runs or their private artifacts.
             connection.execute(
@@ -165,6 +185,7 @@ class Store:
         }
 
         def insert(c):
+            dispatch_lock(c)
             c.execute(
                 "INSERT INTO runs VALUES(%s,%s,%s)", (run_id, "queued", Jsonb(data))
             )
@@ -198,8 +219,10 @@ class Store:
             return [r["data"] for r in c.execute(query, values)]
 
     @contextmanager
-    def locked(self, run_id, owner=None):
+    def locked(self, run_id, owner=None, *, dispatch=False):
         with self.connect() as c:
+            if dispatch:
+                dispatch_lock(c)
             row = c.execute(
                 "SELECT data FROM runs WHERE id=%s FOR UPDATE", (run_id,)
             ).fetchone()
