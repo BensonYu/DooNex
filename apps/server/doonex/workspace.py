@@ -5,15 +5,21 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import selectors
 import stat
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 MAX_FILES = 10_000
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_TOTAL_BYTES = 100 * 1024 * 1024
+MAX_GIT_CONFIG_BYTES = 64 * 1024
+MAX_GIT_FILTERS = 256
+MAX_GIT_FILTER_NAME_BYTES = 16 * 1024
+GIT_CONFIG_TIMEOUT = 5
 GENERATED_NAMES = frozenset(
     {
         ".venv",
@@ -73,6 +79,45 @@ def _allowed_path(name: str) -> None:
             raise WorkspaceError(f"Sensitive or management path is excluded: {name}")
 
 
+def _git_config_names(command: list[str], environment: dict[str, str]) -> bytes:
+    """Inspect effective keys, including includes, without printing their values."""
+    with subprocess.Popen(
+        [*command, "config", "--includes", "--null", "--name-only", "--list"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=environment,
+    ) as process:
+        assert process.stdout is not None
+        deadline = time.monotonic() + GIT_CONFIG_TIMEOUT
+        content = bytearray()
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not selector.select(remaining):
+                        raise WorkspaceError("Git configuration inspection timed out")
+                    chunk = os.read(
+                        process.stdout.fileno(),
+                        min(8192, MAX_GIT_CONFIG_BYTES + 1 - len(content)),
+                    )
+                    if not chunk:
+                        break
+                    content.extend(chunk)
+                    if len(content) > MAX_GIT_CONFIG_BYTES:
+                        raise WorkspaceError("Git configuration key limit exceeded")
+            process.wait(timeout=max(deadline - time.monotonic(), 0.001))
+        except subprocess.TimeoutExpired as error:
+            raise WorkspaceError("Git configuration inspection timed out") from error
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+        if process.returncode:
+            raise WorkspaceError("Git configuration cannot be inspected safely")
+        return bytes(content)
+
+
 def _git(
     repository: Path, *arguments: str, check: bool = True
 ) -> subprocess.CompletedProcess:
@@ -85,19 +130,59 @@ def _git(
         GIT_CONFIG_GLOBAL="/dev/null",
         GIT_CONFIG_SYSTEM="/dev/null",
         GIT_TERMINAL_PROMPT="0",
+        GIT_ATTR_NOSYSTEM="1",
     )
+    command = [
+        "git",
+        "--no-pager",
+        "--no-replace-objects",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.attributesFile=/dev/null",
+        "-C",
+        str(repository),
+    ]
+    names = _git_config_names(command, environment).split(b"\0")
+    drivers = set()
+    for name in names:
+        section, separator, _ = name[7:].rpartition(b".")
+        if name.startswith(b"filter.") and separator:
+            drivers.add(section)
+    if (
+        len(drivers) > MAX_GIT_FILTERS
+        or sum(map(len, drivers)) > MAX_GIT_FILTER_NAME_BYTES
+    ):
+        raise WorkspaceError("Git content filter configuration limit exceeded")
+    # Environment key/value pairs preserve valid subsection names containing '='.
+    # Empty filters pass bytes through; required=false prevents inherited failures.
+    overrides = [
+        (f"filter.{os.fsdecode(driver)}.{setting}", value)
+        for driver in sorted(drivers)
+        for setting, value in (
+            ("clean", ""),
+            ("smudge", ""),
+            ("process", ""),
+            ("required", "false"),
+        )
+    ]
+    environment["GIT_CONFIG_COUNT"] = str(len(overrides))
+    for index, (key, value) in enumerate(overrides):
+        environment[f"GIT_CONFIG_KEY_{index}"] = key
+        environment[f"GIT_CONFIG_VALUE_{index}"] = value
+    if arguments and arguments[0] in (
+        "diff",
+        "diff-files",
+        "diff-index",
+        "diff-tree",
+        "show",
+        "log",
+    ):
+        arguments = (arguments[0], "--no-ext-diff", "--no-textconv", *arguments[1:])
     result = subprocess.run(
-        [
-            "git",
-            "--no-replace-objects",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            "-C",
-            str(repository),
-            *arguments,
-        ],
+        [*command, *arguments],
         capture_output=True,
         env=environment,
         timeout=30,
