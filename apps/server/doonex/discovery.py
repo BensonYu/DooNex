@@ -390,14 +390,15 @@ class Discovery:
             for item in value["requests"]
             if item["status"] != "completed"
         )
+        limits = value["limits"]
         result["budget"] = {
-            "max_requests": MAX_REQUESTS,
+            "max_requests": limits["max_requests"],
             "requests_used": len(value["requests"]),
-            "remaining_requests": MAX_REQUESTS - len(value["requests"]),
-            "max_bytes": MAX_BYTES,
+            "remaining_requests": limits["max_requests"] - len(value["requests"]),
+            "max_bytes": limits["max_bytes"],
             "bytes_used": used,
             "bytes_reserved": reserved,
-            "remaining_bytes": MAX_BYTES - used - reserved,
+            "remaining_bytes": limits["max_bytes"] - used - reserved,
         }
         result["requests"] = [
             {
@@ -558,6 +559,7 @@ class Discovery:
             "previews": {},
             "imported": None,
             "requests": [],
+            "limits": {"max_requests": MAX_REQUESTS, "max_bytes": MAX_BYTES},
             "error": None,
             "source_rate_limit": None,
             "entries": {},

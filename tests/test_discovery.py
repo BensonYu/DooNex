@@ -1265,3 +1265,25 @@ def test_stream_checks_original_saved_operation_deadline(
     assert saved["status"] == "failed" and saved["requests"][-1]["status"] == "unknown"
     assert saved["budget"]["bytes_reserved"] >= BLOB_BYTES
     assert len(public_git.calls) == count + 1
+
+
+def test_receipt_budget_limits_do_not_increase_with_controller_constants(
+    service, monkeypatch
+):
+    receipt = scan(service)
+    original = receipt["budget"]
+    monkeypatch.setattr(discovery, "MAX_REQUESTS", MAX_REQUESTS * 10)
+    monkeypatch.setattr(discovery, "MAX_BYTES", MAX_BYTES * 10)
+    assert service.get(receipt["id"])["budget"] == original
+
+    def exhaust(value):
+        while len(value["requests"]) < MAX_REQUESTS:
+            value["requests"].append(
+                {**value["requests"][0], "sequence": len(value["requests"]) + 1}
+            )
+
+    mutate_receipt(service, receipt["id"], exhaust)
+    current = service.get(receipt["id"])
+    assert current["budget"]["remaining_requests"] == 0
+    with pytest.raises(DiscoveryError, match="discovery_budget_exhausted"):
+        preview(service, current)
