@@ -61,6 +61,101 @@ export type AccountUsage = {
 };
 export type AccountUsageResult = MetadataResult & { usage: AccountUsage | null };
 
+export type SkillMetadata = {
+  source: string;
+  license_status: 'unknown' | 'declared' | 'verified' | 'restricted';
+  license_text: string | null;
+  commit: string | null;
+  scope: string[];
+  permissions: string[];
+};
+export type SkillVersion = {
+  version_id: string;
+  content_digest: string;
+  created_at: string;
+  metadata: SkillMetadata;
+  review_status: 'pending' | 'approved' | 'rejected';
+  integrity: { valid: boolean; errors: string[] };
+  files: { path: string; size: number; sha256: string; mode: number | string }[];
+  instructions?: string;
+};
+export type ArenaTaskset = {
+  id: string;
+  name: string;
+  category: string;
+  split: 'tuning' | 'heldout';
+  task_count: number;
+  tasks: { id: string; title: string; critical: boolean }[];
+  created_at: string;
+  valid: boolean;
+  errors: string[];
+};
+export type ArenaCounts = Record<'planned' | 'attempts' | 'completed' | 'valid' | 'passed' | 'failed' | 'environment_failure' | 'cancelled' | 'assisted' | 'pending' | 'evidence_invalid' | 'safety_violations' | 'regression_failures' | 'missing_slots', number>;
+export type ArenaStability = 'all_passed' | 'unstable' | 'all_failed' | 'incomplete';
+export type ArenaArm = {
+  id: string;
+  label: string;
+  counts: ArenaCounts;
+  tasks: {
+    task_id: string;
+    critical: boolean;
+    counts: ArenaCounts;
+    pass_rate: number | null;
+    stability: ArenaStability;
+    missing_repeats: number[];
+    attempts: {
+      run_id: string; repeat: number; classification: string; reported_classification?: string;
+      evidence_valid: boolean; safety_violation: boolean; regression_failed: boolean;
+      duration_seconds?: number | null; queued_seconds?: number | null;
+      usage?: { calls: number; tokens: number; reserved_tokens: number; unknown_calls: number; cost_usd: number | null };
+    }[];
+  }[];
+  pass_rate: number | null;
+  stability: ArenaStability;
+  usage: { calls: number; tokens: number; reserved_tokens: number; unknown_calls: number; cost_usd: number | null; unit_success_cost_usd: number | null };
+  timing: { successful_median_seconds: number | null; valid_median_seconds: number | null; queued_median_seconds: number | null };
+  eligibility: { eligible: boolean; reasons: string[] };
+};
+export type RecommendationPosition = 'reliable' | 'cost' | 'speed';
+export type ArenaMetrics = {
+  state: string;
+  split: ArenaTaskset['split'];
+  category: string;
+  fingerprint: string;
+  planned_attempts: number;
+  counts: ArenaCounts;
+  complete: boolean;
+  issues: string[];
+  arms: ArenaArm[];
+  usage: ArenaArm['usage'];
+  timing: ArenaArm['timing'];
+  recommendations: Record<RecommendationPosition, string[]>;
+};
+export type ArenaEvaluation = {
+  id: string;
+  state: string;
+  reason: string | null;
+  taskset_id: string;
+  model: ModelConfig;
+  run_budget?: Budget;
+  batch_budget?: Budget;
+  repeats?: number;
+  skill_version_ids?: string[];
+  usage: Usage;
+  metrics: ArenaMetrics;
+  attempts: { run_id: string; project_id: string; task_id: string; arm_id: string; repeat: number; classification: string; state: string; reason: string | null }[];
+};
+export type ArenaRecommendation = {
+  id: string;
+  position: RecommendationPosition;
+  arm_id: string;
+  evaluation_id: string;
+  fingerprint: string;
+  created_at: string;
+  previous_id: string | null;
+};
+export type ArenaRecommendations = { current: ArenaRecommendation[]; history: ArenaRecommendation[] };
+
 export type Project = { id: string; path: string; head: string; dirty: boolean; name?: string };
 export type Role = 'executor' | 'reviewer';
 export type Workflow = 'execute' | 'execute_review';
@@ -118,6 +213,7 @@ export type Run = {
     model: ModelConfig;
     role_models?: Partial<Record<Role, ModelConfig>>;
     model_profiles?: Partial<Record<Role, { id: string; name: string; revision: string | number }>>;
+    skill?: { version_id: string; content_digest: string; report_sha256: string; metadata: SkillMetadata } | null;
   };
   usage: Usage;
   evidence?: Record<string, unknown> | null;

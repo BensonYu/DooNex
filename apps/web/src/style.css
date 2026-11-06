@@ -42,8 +42,11 @@ pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px
 .wordmark span { font-size: 12px; letter-spacing: 0; font-weight: 450; color: var(--muted); }
 .app-header { height: 68px; display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 0 32px; background: #fff; border-bottom: 1px solid var(--line); }
 .header-actions { display: flex; align-items: center; gap: 18px; }
+.app-nav { display: flex; gap: 24px; padding: 0 32px; border-bottom: 1px solid var(--line); background: #fff; overflow-x: auto; }
+.app-nav button { border: 0; border-radius: 0; border-bottom: 2px solid transparent; padding: 12px 2px; background: transparent; color: var(--muted); }
+.app-nav button[aria-current="page"] { color: var(--blue); border-bottom-color: var(--blue); font-weight: 600; }
 .local-label { font-size: 12px; color: var(--muted); }
-.workspace-layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); min-height: calc(100dvh - 68px); }
+.workspace-layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); min-height: calc(100dvh - 115px); }
 .sidebar { border-right: 1px solid var(--line); background: #f9fafb; padding: 27px 16px; min-width: 0; }
 .sidebar-title { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; padding: 0 5px; }
 .sidebar-title h2 { margin: 0; font-size: 13px; color: #515b6b; }
@@ -147,6 +150,7 @@ div.notice:has(> button) { display: flex; justify-content: space-between; align-
 }
 @media (max-width: 800px) {
   .app-header { padding: 0 20px; }
+  .app-nav { padding: 0 20px; gap: 22px; }
   .wordmark { font-size: 20px; }
   .wordmark span, .local-label { display: none; }
   .workspace-layout { display: flex; flex-direction: column; }
@@ -243,6 +247,61 @@ div.notice:has(> button) { display: flex; justify-content: space-between; align-
 .frozen-model { margin-top: 20px; }
 .frozen-model h3 { overflow-wrap: anywhere; }
 .frozen-model dd { overflow-wrap: anywhere; }
+.import-panel { padding: 18px 0 22px; margin-bottom: 26px; border-bottom: 1px solid var(--line); }
+.import-panel > summary { font-weight: 600; font-size: 13px; }
+.skill-layout { margin-top: 24px; }
+.skill-detail { min-width: 0; }
+.skill-detail dd { overflow-wrap: anywhere; }
+.skill-content { border-top: 1px solid var(--line); padding-top: 18px; margin-top: 22px; }
+.skill-content pre { max-height: 460px; overflow: auto; background: #fff; padding: 16px; border: 1px solid var(--line); }
+.file-manifest { list-style: none; padding: 0; }
+.file-manifest li { display: flex; flex-direction: column; gap: 6px; font-size: 12px; padding: 12px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.file-manifest span { color: var(--muted); }
+.review-form { border-top: 1px solid var(--line); margin-top: 26px; padding-top: 22px; }
+.review-form .button-row { margin-top: 18px; }
+.frozen-skill { margin-bottom: 24px; border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; }
+.frozen-skill dd { overflow-wrap: anywhere; }
+.evaluation-nav { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 8px; margin-bottom: 24px; }
+.evaluation-nav button { display: flex; flex-direction: column; align-items: flex-start; text-align: left; gap: 7px; white-space: normal; min-width: 210px; max-width: 280px; flex-shrink: 0; }
+.evaluation-nav button.selected { border-color: #9cb0df; background: #fff; }
+.evaluation-nav span { font-size: 11px; color: var(--muted); }
+.evaluation-nav code { font-size: 10px; }
+.arena-create { border-top: 1px solid var(--line); padding-top: 24px; }
+.arena-create .model-fields { margin-top: 28px; }
+.arena-create .checkbox-label span { min-width: 0; overflow-wrap: anywhere; }
+.taskset-titles { font-size: 12px; line-height: 1.9; padding-left: 20px; }
+.taskset-titles code { color: var(--muted); font-size: 10px; }
+.arena-counts { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 14px; margin: 22px 0 16px; }
+.arena-counts dt { font-size: 10px; line-height: 1.5; }
+.arena-counts dd { font-size: 18px; margin-top: 6px; }
+.arena-summary { margin-top: 24px; }
+.frozen-evaluation { padding: 14px 16px; border: 1px solid var(--line); border-radius: 6px; margin: 18px 0; }
+.arena-summary strong { font-size: 16px; }
+.table-scroll { overflow-x: auto; margin: 24px 0; }
+.arena-comparison { min-width: 850px; }
+.arena-comparison caption { text-align: left; margin-bottom: 14px; font-size: 13px; font-weight: 600; }
+.arena-comparison th, .arena-comparison td { min-width: 115px; }
+.arena-arm { border-top: 1px solid var(--line); margin-top: 24px; padding-top: 18px; }
+.arena-arm > summary { font-weight: 600; font-size: 13px; }
+.metric-reasons { font-size: 12px; line-height: 1.8; color: #8b560a; padding-left: 20px; }
+.arena-task-result { padding: 18px 0 6px; border-top: 1px solid var(--line); margin-top: 18px; }
+.arena-task-result h3 { margin-bottom: 8px; }
+.attempt-list { padding: 0; list-style: none; }
+.attempt-list > li { display: flex; gap: 16px; align-items: flex-start; justify-content: space-between; padding: 14px 0; border-bottom: 1px solid var(--line); }
+.attempt-list li > div { min-width: 0; display: flex; flex-direction: column; gap: 7px; font-size: 12px; }
+.attempt-list span { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+.attempt-list p { margin: 0; font-size: 12px; }
+.raw-metrics { max-height: 500px; overflow: auto; margin-top: 20px; background: #fff; padding: 16px; border: 1px solid var(--line); }
+.recommendation-section { padding-top: 30px; margin-top: 30px; border-top: 1px solid var(--line); }
+.recommendation-row { padding: 22px 0; border-bottom: 1px solid var(--line); }
+.recommendation-row h3 { font-size: 14px; margin-bottom: 12px; }
+.recommendation-row p { margin-bottom: 12px; overflow-wrap: anywhere; }
+@media (max-width: 1100px) { .arena-counts { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+@media (max-width: 800px) {
+  .arena-counts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .attempt-list > li { flex-direction: column; gap: 10px; }
+  .arena-view > .page-heading { flex-wrap: wrap; }
+}
 @media (max-width: 1100px) { .profiles-layout { grid-template-columns: 155px minmax(0, 1fr); gap: 20px; } .settings-numbers { grid-template-columns: 1fr; } }
 @media (max-width: 800px) {
   .profiles-layout { grid-template-columns: 1fr; }

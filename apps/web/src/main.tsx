@@ -1,9 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Api, type ArtifactName, type Budget, type Diff, type ModelProfiles, type Project, type Recovery, type Run, type RunEvent, type Settings, type Workflow } from './api';
+import { Api, type ArtifactName, type Budget, type Diff, type ModelProfiles, type Project, type Recovery, type Run, type RunEvent, type Settings, type SkillVersion, type Workflow } from './api';
 import './style.css';
 import { ReviewReport, WorkflowProgress } from './workflow';
 import { FrozenModels, ModelSettings, RoleModelChoices } from './model-settings';
+import { FrozenSkill, SkillChoice, SkillsView, skillReady } from './skills';
+import { ArenaView } from './arena';
 
 const stateNames: Record<string, string> = {
   queued: '等待执行', running: '正在执行', pausing: '正在暂停', paused: '已暂停',
@@ -32,7 +34,7 @@ function writeStorage(storage: 'local' | 'session', key: string, value: string) 
 const selectionKey = (projectId: string) => `doonex.selectedRun.${projectId}`;
 const runPath = (projectId: string, id: string, suffix = '', query: Record<string, string> = {}) =>
   `/runs/${encodeURIComponent(id)}${suffix ? `/${suffix}` : ''}?${new URLSearchParams({ ...query, project_id: projectId })}`;
-type TaskDraft = { baseRef: string; prompt: string; checks: string; workflow: Workflow; executorProfileId?: string; reviewerProfileId?: string; budget?: Budget };
+type TaskDraft = { baseRef: string; prompt: string; checks: string; workflow: Workflow; executorProfileId?: string; reviewerProfileId?: string; skillVersionId?: string; budget?: Budget };
 const emptyDraft: TaskDraft = { baseRef: 'HEAD', prompt: '', checks: '', workflow: 'execute_review' };
 type ActionContext = { signal: AbortSignal; isCurrent: () => boolean };
 function readDrafts(): Record<string, TaskDraft> {
@@ -44,7 +46,7 @@ function readDrafts(): Record<string, TaskDraft> {
       if (!draft || typeof draft !== 'object') return false;
       const item = draft as Record<string, unknown>;
       if (typeof item.baseRef !== 'string' || typeof item.prompt !== 'string' || typeof item.checks !== 'string' || !['execute', 'execute_review'].includes(String(item.workflow))) return false;
-      if (['executorProfileId', 'reviewerProfileId'].some((key) => item[key] !== undefined && typeof item[key] !== 'string')) return false;
+      if (['executorProfileId', 'reviewerProfileId', 'skillVersionId'].some((key) => item[key] !== undefined && typeof item[key] !== 'string')) return false;
       if (item.budget == null) return true;
       const budget = item.budget as Record<string, unknown>;
       return ['max_calls', 'max_tokens', 'max_seconds'].every((key) => typeof budget[key] === 'number' && Number.isFinite(budget[key]))
@@ -89,7 +91,9 @@ function App() {
   const [tokenDraft, setTokenDraft] = useState('');
   const [settings, setSettings] = useState<Settings | null>(null);
   const [registry, setRegistry] = useState<ModelProfiles | null>(null);
-  const [view, setView] = useState<'workbench' | 'models'>('workbench');
+  const [view, setView] = useState<'workbench' | 'models' | 'skills' | 'arena'>('workbench');
+  const [skills, setSkills] = useState<SkillVersion[]>([]);
+  const [arenaEvaluationId, setArenaEvaluationId] = useState('');
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState(() => readStorage('local', 'doonex.selectedProject'));
   const [runs, setRuns] = useState<Run[]>([]);
@@ -173,10 +177,10 @@ function App() {
     const controller = new AbortController();
     setLoading(true); setError('');
     void Promise.all([
-      api.get<Settings>('/settings', controller.signal), api.get<Project[]>('/projects', controller.signal), api.get<ModelProfiles>('/model-profiles', controller.signal),
-    ]).then(([nextSettings, nextProjects, nextRegistry]) => {
+      api.get<Settings>('/settings', controller.signal), api.get<Project[]>('/projects', controller.signal), api.get<ModelProfiles>('/model-profiles', controller.signal), api.get<{ skills: SkillVersion[] }>('/skills', controller.signal),
+    ]).then(([nextSettings, nextProjects, nextRegistry, nextSkills]) => {
       if (controller.signal.aborted) return;
-      setSettings(nextSettings); setProjects(nextProjects); setRegistry(nextRegistry);
+      setSettings(nextSettings); setProjects(nextProjects); setRegistry(nextRegistry); setSkills(nextSkills.skills);
       const saved = readStorage('local', 'doonex.selectedProject');
       selectProject(nextProjects.some((item) => item.id === saved) ? saved : nextProjects[0]?.id ?? '', false);
     }).catch((err: unknown) => {
@@ -307,7 +311,8 @@ function App() {
     && (workflow !== 'execute_review' || !!reviewerModel && (reviewerProfile?.credential_available ?? (!reviewerProfileId && settings?.credential_available)));
   const isSubscription = models.every((model) => model?.billing_mode === 'subscription');
   const hasPrice = models.every((model) => model && (model.billing_mode === 'subscription' || model.input_price_per_million != null && model.output_price_per_million != null && !!model.price_source));
-  const canCreate = !!project && hasModel && hasPrice && !!budget && !busy;
+  const hasSkill = !draft.skillVersionId || skills.some((skill) => skill.version_id === draft.skillVersionId && skillReady(skill));
+  const canCreate = !!project && hasModel && hasPrice && hasSkill && !!budget && !busy;
   const selected = run?.id === selectedId && run.request.project_id === projectId ? run : null;
   const selectedModels = selected ? selected.request.workflow === 'execute_review'
     ? [selected.request.role_models?.executor ?? selected.request.model, selected.request.role_models?.reviewer ?? selected.request.model]
@@ -319,10 +324,11 @@ function App() {
   return <div className="app-shell">
     <header className="app-header">
       <div className="wordmark">DooNex<span>编程工作台</span></div>
-      <div className="header-actions"><button className="quiet" aria-pressed={view === 'models'} onClick={() => { setView((old) => old === 'models' ? 'workbench' : 'models'); setError(''); }}>模型设置</button><span className="local-label">本地 · 有限协作</span><button className="quiet" onClick={() => {
-        clearView(); active.current = { projectId: '', runId: '' }; writeStorage('session', 'doonex.token', ''); setToken(''); setSettings(null); setRegistry(null); setView('workbench'); setProjects([]); setProjectId(''); setSelectedId(''); setRuns([]);
+      <div className="header-actions"><span className="local-label">本地 · 有限协作</span><button className="quiet" onClick={() => {
+        clearView(); active.current = { projectId: '', runId: '' }; writeStorage('session', 'doonex.token', ''); setToken(''); setSettings(null); setRegistry(null); setSkills([]); setArenaEvaluationId(''); setView('workbench'); setProjects([]); setProjectId(''); setSelectedId(''); setRuns([]);
       }}>断开连接</button></div>
     </header>
+    <nav className="app-nav" aria-label="工作区页面">{([['workbench', '工作台'], ['skills', 'Skills'], ['arena', 'Skill Arena'], ['models', '模型设置']] as const).map(([id, label]) => <button key={id} aria-current={view === id ? 'page' : undefined} onClick={() => { setView(id); setError(''); }}>{label}</button>)}</nav>
     <div className="workspace-layout">
       <aside className="sidebar" aria-label="运行列表">
         <div className="project-picker"><label htmlFor="project-select">项目</label><select id="project-select" value={projectId} onChange={(event) => selectProject(event.target.value)} disabled={!projects.length}><option value="" disabled>尚未注册项目</option>{projects.map((item) => <option key={item.id} value={item.id}>{item.name || item.path}</option>)}</select><button className="quiet compact" onClick={() => { setView('workbench'); setShowCreate(true); setError(''); requestAnimationFrame(() => document.getElementById('project-path')?.focus()); }}>注册项目</button></div>
@@ -339,12 +345,16 @@ function App() {
       </aside>
       <main className="main-content">
         {error && <div className="notice error" role="alert"><span>{error}</span><button className="quiet" aria-label="关闭错误提示" onClick={() => setError('')}>关闭</button></div>}
-        <section className="project-strip" aria-label="当前项目">
+        {view === 'workbench' && <section className="project-strip" aria-label="当前项目">
           <div><span className="eyebrow">当前项目{project?.name ? ` · ${project.name}` : ''}</span><strong className="path-text">{project?.path ?? '尚未注册'}</strong>{project && <span className="muted small path-text">{project.id}</span>}</div>
           {project && <span className="muted small">{project.dirty ? '原工作区有未提交改动' : '原工作区干净'}</span>}
-        </section>
+        </section>}
 
-        {view === 'models' && registry ? <ModelSettings api={api} registry={registry} onRegistry={setRegistry} onClose={() => setView('workbench')} /> : showCreate ? <div className="create-view">
+        {view === 'models' && registry ? <ModelSettings api={api} registry={registry} onRegistry={setRegistry} onClose={() => setView('workbench')} /> : view === 'skills' ? <SkillsView api={api} skills={skills} onSkills={setSkills} onEvaluation={(id) => { setArenaEvaluationId(id); setView('arena'); }} /> : view === 'arena' && settings ? <ArenaView api={api} skills={skills} registry={registry} defaultBudget={settings.default_budget} initialEvaluationId={arenaEvaluationId} onOpenRun={(targetProject, id) => { void perform(async ({ signal, isCurrent }) => {
+          const next = await api.get<Project[]>('/projects', signal);
+          if (!isCurrent()) return;
+          setProjects(next); selectProject(targetProject); select(id);
+        }); }} /> : showCreate ? <div className="create-view">
           <div className="page-heading"><div><h1>开始一个可信的任务</h1><p className="muted">固定起始版本与验收条件，在隔离工作区中执行。</p></div>{selectedId && <button className="quiet" onClick={() => setShowCreate(false)}>返回运行</button>}</div>
           <section className="section-block">
             <h2>注册或重新校验项目</h2>
@@ -366,11 +376,12 @@ function App() {
           <RoleModelChoices registry={registry} workflow={workflow} executorId={executorProfileId} reviewerId={reviewerProfileId} onChange={(role, id) => updateDraft(role === 'executor' ? { executorProfileId: id } : { reviewerProfileId: id })} onSettings={() => setView('models')} fallback={settings} />
           {!hasModel && <p className="field-help warning-text">请选择有效配置，并在服务端提供每个角色所需的凭据引用。</p>}
           {!hasPrice && <p className="field-help warning-text">按量模型需要有来源的输入和输出价格。补齐后才能使用共享费用预算。</p>}
+          <SkillChoice skills={skills} value={draft.skillVersionId ?? ''} onChange={(id) => updateDraft({ skillVersionId: id })} onManage={() => setView('skills')} />
           <form onSubmit={(event) => {
             event.preventDefault();
             if (!canCreate || !budget) return;
             void perform(async ({ signal, isCurrent }) => {
-              const created = await api.post<Run>('/runs', { project_id: projectId, workflow, model_profile_id: executorProfileId || null, ...(workflow === 'execute_review' ? { reviewer_model_profile_id: reviewerProfileId || null } : {}), prompt: prompt.trim(), base_ref: baseRef.trim(), checks: checks.split('\n').map((line) => line.trim()).filter(Boolean), budget: { ...budget, max_cost_usd: isSubscription ? null : budget.max_cost_usd } }, signal);
+              const created = await api.post<Run>('/runs', { project_id: projectId, workflow, model_profile_id: executorProfileId || null, ...(workflow === 'execute_review' ? { reviewer_model_profile_id: reviewerProfileId || null } : {}), skill_version_id: draft.skillVersionId || null, prompt: prompt.trim(), base_ref: baseRef.trim(), checks: checks.split('\n').map((line) => line.trim()).filter(Boolean), budget: { ...budget, max_cost_usd: isSubscription ? null : budget.max_cost_usd } }, signal);
               if (!isCurrent()) return;
               setRuns((old) => [created, ...old.filter((item) => item.id !== created.id)]);
               updateDraft({ prompt: '', checks: '' }); select(created.id);
@@ -404,6 +415,7 @@ function App() {
           <div className="page-heading"><div><span className="eyebrow">运行 {selected.id}</span><h1 className="task-heading">{selected.request.prompt}</h1></div><Status state={selected.state} /></div>
           <div className="run-meta"><span className="path-text">项目 {selected.request.project_name || project?.name || selected.request.repo_path}</span><span>起始提交 <code>{selected.request.base_commit}</code></span><span>创建于 {fmtTime(selected.created_at)}</span></div>
           <FrozenModels run={selected} />
+          <FrozenSkill run={selected} />
           {selected.reason && <p className="notice">{selected.reason}</p>}
           {pollError && <p className="notice error" role="alert">{pollError} 当前显示最近一次已记录结果；会自动重连。</p>}
           <div className="run-toolbar">
