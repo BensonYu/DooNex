@@ -85,6 +85,30 @@ def _tar(files: dict[str, FileContent], target: Path) -> None:
             archive.addfile(member, io.BytesIO(content.data))
 
 
+def build_patch(before: dict[str, FileContent], after: dict[str, FileContent]) -> bytes:
+    """Generate the binary-capable patch from two already bounded file sets."""
+    with tempfile.TemporaryDirectory(prefix="doonex-diff-") as temporary:
+        temporary = Path(temporary)
+        write_files(before, temporary / "a")
+        write_files(after, temporary / "b")
+        diff = _git(
+            temporary,
+            "diff",
+            "--no-index",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--src-prefix=",
+            "--dst-prefix=",
+            "a",
+            "b",
+            check=False,
+        )
+        if diff.returncode not in (0, 1):
+            raise EvidenceError("Could not generate delivery diff")
+        return diff.stdout
+
+
 class Evidence:
     @staticmethod
     def capture(
@@ -113,30 +137,7 @@ class Evidence:
         write_files(files, snapshot)
         (root / "manifest.json").write_bytes(_json(entries))
         _tar(files, root / "snapshot.tar.gz")
-        with tempfile.TemporaryDirectory(prefix="doonex-diff-") as temporary:
-            temporary = Path(temporary)
-            if workspace.repository is None or workspace.base_commit is None:
-                raise EvidenceError("Delivery requires an explicit Git starting commit")
-            Workspace.create(
-                workspace.repository, workspace.base_commit, temporary / "a"
-            )
-            write_files(files, temporary / "b")
-            diff = _git(
-                temporary,
-                "diff",
-                "--no-index",
-                "--binary",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--src-prefix=",
-                "--dst-prefix=",
-                "a",
-                "b",
-                check=False,
-            )
-            if diff.returncode not in (0, 1):
-                raise EvidenceError("Could not generate delivery diff")
-            (root / "diff.patch").write_bytes(diff.stdout)
+        (root / "diff.patch").write_bytes(build_patch(workspace.base_files(), files))
         checks = []
         artifacts = ["manifest.json", "snapshot.tar.gz", "diff.patch"]
         for index, command in enumerate(tuple(commands)):

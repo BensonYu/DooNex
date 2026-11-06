@@ -87,6 +87,8 @@ class Sandbox:
         timeout: float,
         run_id: str,
         should_stop: Callable[[], bool] = lambda: False,
+        *,
+        read_only: bool = False,
     ) -> dict:
         run_id = _run_id(run_id)
         workspace = Path(workspace)
@@ -99,6 +101,8 @@ class Sandbox:
             raise SandboxError("A bounded shell command is required")
         if not isinstance(timeout, (float, int)) or not 0 < timeout <= 3600:
             raise SandboxError("Tool timeout must be between zero and 3600 seconds")
+        if not isinstance(read_only, bool):
+            raise SandboxError("Workspace access mode must be explicit")
         result = {
             "exit_code": None,
             "output": "",
@@ -140,7 +144,8 @@ class Sandbox:
             "--tmpfs",
             "/tmp:rw,noexec,nosuid,size=67108864",
             "--mount",
-            f"type=bind,src={workspace},dst=/workspace",
+            f"type=bind,src={workspace},dst=/workspace"
+            + (",readonly" if read_only else ""),
             "--workdir",
             "/workspace",
         ]

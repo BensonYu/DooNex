@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -137,9 +138,20 @@ class FileContent:
         }
 
 
-def read_files(path: Path) -> dict[str, FileContent]:
+def read_files(
+    path: Path,
+    *,
+    exclude_generated: bool = True,
+    max_files: int | None = None,
+    max_file_bytes: int | None = None,
+    max_total_bytes: int | None = None,
+    max_depth: int = 100,
+) -> dict[str, FileContent]:
     """Read with directory descriptors; no path component may become a symlink."""
     path = Path(path)
+    max_files = MAX_FILES if max_files is None else max_files
+    max_file_bytes = MAX_FILE_BYTES if max_file_bytes is None else max_file_bytes
+    max_total_bytes = MAX_TOTAL_BYTES if max_total_bytes is None else max_total_bytes
     files: dict[str, FileContent] = {}
     total = 0
     entry_count = 0
@@ -151,20 +163,20 @@ def read_files(path: Path) -> dict[str, FileContent]:
         with os.scandir(directory_fd) as iterator:
             for entry in iterator:
                 entry_count += 1
-                if entry_count > MAX_FILES:
+                if entry_count > max_files:
                     raise WorkspaceError("Project entry limit exceeded")
                 names.append(entry.name)
         for name in sorted(names):
             relative = prefix + name
             _allowed_path(relative)
-            if relative.count("/") > 100:
+            if relative.count("/") > max_depth:
                 raise WorkspaceError("Project directory depth limit exceeded")
             before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             if not (stat.S_ISDIR(before.st_mode) or stat.S_ISREG(before.st_mode)):
                 raise WorkspaceError(
                     f"Symlink or special file is forbidden: {relative}"
                 )
-            if _generated_path(relative):
+            if exclude_generated and _generated_path(relative):
                 continue
             if stat.S_ISDIR(before.st_mode):
                 child = os.open(name, flags | os.O_DIRECTORY, dir_fd=directory_fd)
@@ -178,9 +190,9 @@ def read_files(path: Path) -> dict[str, FileContent]:
             elif stat.S_ISREG(before.st_mode):
                 if before.st_mode & 0o7000:
                     raise WorkspaceError("Privileged file mode is forbidden")
-                if len(files) >= MAX_FILES or before.st_size > MAX_FILE_BYTES:
+                if len(files) >= max_files or before.st_size > max_file_bytes:
                     raise WorkspaceError("Project file limit exceeded")
-                if total + before.st_size > MAX_TOTAL_BYTES:
+                if total + before.st_size > max_total_bytes:
                     raise WorkspaceError("Project size limit exceeded")
                 descriptor = os.open(name, flags, dir_fd=directory_fd)
                 try:
@@ -191,7 +203,7 @@ def read_files(path: Path) -> dict[str, FileContent]:
                     ) != (before.st_dev, before.st_ino):
                         raise WorkspaceError("Project changed during snapshot")
                     with os.fdopen(descriptor, "rb", closefd=False) as source:
-                        content = source.read(MAX_FILE_BYTES + 1)
+                        content = source.read(max_file_bytes + 1)
                     after = os.fstat(descriptor)
                     if (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns) != (
                         after.st_size,
@@ -199,10 +211,10 @@ def read_files(path: Path) -> dict[str, FileContent]:
                         after.st_ctime_ns,
                     ):
                         raise WorkspaceError("Project changed during snapshot")
-                    if len(content) > MAX_FILE_BYTES or len(content) != opened.st_size:
+                    if len(content) > max_file_bytes or len(content) != opened.st_size:
                         raise WorkspaceError("Project changed or file limit exceeded")
                     total += len(content)
-                    if total > MAX_TOTAL_BYTES:
+                    if total > max_total_bytes:
                         raise WorkspaceError("Project size limit exceeded")
                     files[relative] = FileContent(content, stat.S_IMODE(opened.st_mode))
                 finally:
@@ -252,9 +264,18 @@ class Workspace:
     path: Path
     repository: Path | None = None
     base_commit: str | None = None
+    baseline_path: Path | None = None
+    baseline_digest: str | None = None
 
     @classmethod
-    def create(cls, repository: Path, commit: str, destination: Path) -> Workspace:
+    def create(
+        cls,
+        repository: Path,
+        commit: str,
+        destination: Path,
+        *,
+        baseline_path: Path | None = None,
+    ) -> Workspace:
         repository = validate_repository(repository)
         if not isinstance(commit, str) or not commit or commit.startswith("-"):
             raise WorkspaceError("An explicit starting commit is required")
@@ -297,8 +318,57 @@ class Workspace:
                 raise WorkspaceError("Git object size changed")
             total += size
             files[name] = FileContent(data, 0o755 if mode == b"100755" else 0o644)
+        baseline_digest = None
+        if baseline_path is not None:
+            baseline_path = Path(baseline_path)
+            destination = Path(destination)
+            base_location, task_location = (
+                baseline_path.resolve(),
+                destination.resolve(),
+            )
+            if (
+                base_location == task_location
+                or base_location in task_location.parents
+                or task_location in base_location.parents
+            ):
+                raise WorkspaceError(
+                    "Baseline must be separate from the writable workspace"
+                )
+            baseline_digest = manifest_digest(manifest(files))
+            if baseline_path.exists():
+                existing = read_files(baseline_path, exclude_generated=False)
+                if manifest_digest(manifest(existing)) != baseline_digest:
+                    raise WorkspaceError(
+                        "Existing baseline does not match the starting commit"
+                    )
+            else:
+                write_files(files, baseline_path)
+            baseline_path = baseline_path.resolve()
         write_files(files, Path(destination))
-        return cls(Path(destination).resolve(), repository, resolved)
+        return cls(
+            Path(destination).resolve(),
+            repository,
+            resolved,
+            baseline_path,
+            baseline_digest,
+        )
+
+    def base_files(self) -> dict[str, FileContent]:
+        """Read a database-bound initial copy, with a legacy M1 export fallback."""
+        if self.baseline_path is not None or self.baseline_digest is not None:
+            if self.baseline_path is None or not self.baseline_digest:
+                raise WorkspaceError("Baseline requires its persisted content digest")
+            files = read_files(self.baseline_path, exclude_generated=False)
+            if manifest_digest(manifest(files)) != self.baseline_digest:
+                raise WorkspaceError("Starting baseline was changed")
+            return files
+        if self.repository is None or self.base_commit is None:
+            raise WorkspaceError("Delivery requires an explicit Git starting commit")
+        with tempfile.TemporaryDirectory(prefix="doonex-baseline-") as temporary:
+            exported = Workspace.create(
+                self.repository, self.base_commit, Path(temporary) / "baseline"
+            )
+            return read_files(exported.path)
 
     @staticmethod
     def validate_repository(path: Path) -> Path:
