@@ -448,6 +448,10 @@ class Generation:
             binding["version_id"], binding["report_sha256"]
         )
         require(
+            all(content.mode in {0o644, 0o755} for content in files.values()),
+            "generation_parent_file_mode_unsupported",
+        )
+        require(
             len(files["SKILL.md"].data) <= MAX_PARENT_BYTES,
             "generation_parent_instructions_too_large",
         )

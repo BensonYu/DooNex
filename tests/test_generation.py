@@ -950,3 +950,26 @@ def test_generation_output_and_candidate_do_not_reset_unknown_reserves(
     service.build_candidate(run, directory)
     saved = service.store.get(run["id"])
     assert saved["usage"] == before and saved["first_started_at"] == started
+
+
+def test_parent_modes_unsupported_by_controlled_import_are_rejected_before_model(
+    setup_generation, tmp_path
+):
+    service, body, files, _taskset, _project = setup_generation
+    source = tmp_path / "local-parent-with-private-file"
+    source.mkdir(mode=0o700)
+    (source / "SKILL.md").write_bytes(files["SKILL.md"].data)
+    (source / "LICENSE").write_bytes(MIT)
+    (source / "reference.txt").write_bytes(b"A valid local asset with private mode")
+    (source / "reference.txt").chmod(0o600)
+    old = service.library.get("skill", body.parent_version_id)
+    imported = service.library.import_skill(str(source), old["metadata"])
+    service.library.review(imported["version_id"], "approved", "Synthetic local source")
+    changed = GenerationInput(
+        **{**body.model_dump(), "parent_version_id": imported["version_id"]}
+    )
+    with pytest.raises(
+        GenerationError, match="generation_parent_file_mode_unsupported"
+    ):
+        service.create(changed)
+    assert service.list() == [] and service.store.list_runs() == []
