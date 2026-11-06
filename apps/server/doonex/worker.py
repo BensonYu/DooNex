@@ -889,6 +889,9 @@ class Worker:
                             "APITimeoutError",
                             "APIConnectionError",
                             "ServiceUnavailableError",
+                            "LLMRateLimitError",
+                            "LLMTimeoutError",
+                            "LLMServiceUnavailableError",
                         }:
                             current["arena_outcome"].update(
                                 classification="environment_failure",
