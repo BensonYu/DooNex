@@ -1318,6 +1318,8 @@ def test_apache_appendix_identifying_fields_preserve_full_body(owner):
         "empty_owner",
         "unknown_year",
         "extra_line",
+        "appendix_newline_terms",
+        "appendix_inline_terms",
     ],
 )
 def test_populated_apache_appendix_does_not_relax_any_other_terms(change):
@@ -1338,6 +1340,14 @@ def test_populated_apache_appendix_does_not_relax_any_other_terms(change):
         text = text.replace("2026 Example Author, Inc.", "2026")
     elif change == "unknown_year":
         text = text.replace("2026 Example Author, Inc.", "[yyyy] Example Author, Inc.")
+    elif change in {"appendix_newline_terms", "appendix_inline_terms"}:
+        separator = "\n" if change == "appendix_newline_terms" else " "
+        text = text.replace(
+            "2026 Example Author, Inc.",
+            "2026 Example Author, Inc."
+            + separator
+            + "Use only for non-commercial research.",
+        )
     else:
         text = text.replace(
             "2026 Example Author, Inc.",

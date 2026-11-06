@@ -1070,40 +1070,43 @@ def check_license(files):
 
 
 def complete_apache(text):
-    """Match the entire license, allowing only its specified copyright fields.
-
-    The canonical appendix explicitly instructs an adopter to fill in these
-    fields. No terms, other notices or text outside that line are normalized.
-    """
+    """Match the entire body with a conventional single-line appendix notice."""
     normalized = " ".join(text.split())
     if hashlib.sha256(normalized.encode()).hexdigest() == APACHE_TEXT_SHA256:
         return True
-    appendix = " APPENDIX: How to apply the Apache License to your work. "
-    before, marker, after = normalized.partition(appendix)
-    if not marker:
+    lines = text.splitlines()
+    appendix = "APPENDIX: How to apply the Apache License to your work."
+    locations = [i for i, line in enumerate(lines) if line.strip() == appendix]
+    if len(locations) != 1:
         return False
-    instructions, copyright_marker, notice = after.partition(" Copyright ")
-    owner, license_marker, remaining = notice.partition(
-        " Licensed under the Apache License, Version 2.0"
+    notices = [
+        i
+        for i, line in enumerate(lines)
+        if i > locations[0] and line.strip().startswith("Copyright ")
+    ]
+    if len(notices) != 1:
+        return False
+    index = notices[0]
+    notice = lines[index].strip()
+    match = re.fullmatch(
+        r"Copyright (?:19|20)[0-9]{2}(?:[-–](?:19|20)[0-9]{2})? "
+        r"([\w][\w .,&'()/-]{0,199})",
+        notice,
     )
-    if (
-        not copyright_marker
-        or not license_marker
-        or not re.fullmatch(
-            r"(?:19|20)[0-9]{2}(?:[-–](?:19|20)[0-9]{2})? [\w][\w .,&'()/-]{0,199}",
-            owner,
-        )
+    if not match:
+        return False
+    # A notice is still untrusted data. Reject explicit terms in its identity
+    # field; unfamiliar forms remain preview-only for later manual handling.
+    if re.search(
+        r"\b(?:licen[cs](?:e|ed|ing)|rights?|commercial|noncommercial|proprietary|"
+        r"permission|permitted|restricted?|restriction|use|usage|only|must|shall|"
+        r"requires?|forbidden|provided|terms?|conditions?)\b",
+        match[1],
+        re.IGNORECASE,
     ):
         return False
-    canonical_text = (
-        before
-        + marker
-        + instructions
-        + copyright_marker
-        + "[yyyy] [name of copyright owner]"
-        + license_marker
-        + remaining
-    )
+    lines[index] = "Copyright [yyyy] [name of copyright owner]"
+    canonical_text = " ".join("\n".join(lines).split())
     return hashlib.sha256(canonical_text.encode()).hexdigest() == APACHE_TEXT_SHA256
 
 
