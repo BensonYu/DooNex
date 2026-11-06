@@ -14,6 +14,10 @@ WORKER_LOCK = 4142061106
 ACTIVE = {"running", "verifying", "pausing"}
 
 
+class PermissionViolation(RuntimeError):
+    """An explicit request targeted a controller-only mount or host secret."""
+
+
 def run_directory(settings, run_id):
     # IDs are database UUIDs; callers validate before constructing paths.
     return settings.home / "runs" / run_id
@@ -75,9 +79,18 @@ class Worker:
     def stop_requested(self, run_id):
         self.fence()
         run = self.store.get(run_id)
+        batch_stopped = False
+        if run["request"].get("arena"):
+            from doonex.arena import Arena
+
+            batch_stopped = Arena(self.settings, self.store).stopped(
+                run["request"]["arena"]["evaluation_id"]
+            )
         return (
             run["state"] != "running"
+            or bool(run.get("safety_violation"))
             or elapsed(run) >= run["request"]["budget"]["max_seconds"]
+            or batch_stopped
         )
 
     def reconcile(self):
@@ -109,8 +122,9 @@ class Worker:
     def execute(self, run_id):
         from doonex.evidence import Evidence
         from doonex.review import Review
-        from doonex.sandbox import Sandbox
+        from doonex.sandbox import Sandbox, SandboxError
         from doonex.sdk import (
+            ModelCallError,
             ReviewReportError,
             SessionRecoveryRequired,
             parse_review_report,
@@ -123,6 +137,16 @@ class Worker:
         sandbox = Sandbox()
         run = self.store.get(run_id)
         request = run["request"]
+        from doonex.library import Library
+
+        library = Library(self.settings, self.store)
+        arena = None
+        if request.get("arena"):
+            from doonex.arena import Arena
+
+            arena = Arena(self.settings, self.store)
+            if not arena.start(request["arena"]["evaluation_id"]):
+                return
         role_keys = {
             role: self.settings.credential(model_for_role(request, role))
             for role in run_roles(request)
@@ -145,15 +169,77 @@ class Worker:
             self.fence()
             if not all(role_keys.values()):
                 raise ValueError("worker 缺少运行所引用的模型凭据环境变量")
-            if not (directory / "workspace").exists():
-                workspace = Workspace.create(
-                    Path(request["repo_path"]),
-                    request["base_commit"],
-                    directory / "workspace",
-                    baseline_path=directory / "baseline",
+            skill_context = (
+                library.skill_context(request["skill"])
+                if request.get("skill")
+                else None
+            )
+            task_context = None
+            verification_context = None
+            if arena:
+                binding = request["arena"]
+                task_context = library.tasksets.context(
+                    binding["taskset_id"], binding["report_sha256"], binding["task_id"]
                 )
+                if (
+                    task_context.metadata["source_digest"] != binding["source_digest"]
+                    or task_context.metadata["verifier_digest"]
+                    != binding["verifier_digest"]
+                ):
+                    raise ValueError("任务集冻结上下文与运行不一致")
+                if (
+                    request["checks"] != [task_context.metadata["verifier_command"]]
+                    or request.get("visible_checks")
+                    != task_context.metadata["visible_checks"]
+                ):
+                    raise ValueError("运行检查器绑定已变化")
+                verification_context = {
+                    key: binding[key]
+                    for key in (
+                        "taskset_id",
+                        "task_id",
+                        "report_sha256",
+                        "verifier_digest",
+                    )
+                }
+            if not (directory / "workspace").exists():
+                if task_context:
+                    from doonex.workspace import manifest, manifest_digest, write_files
+
+                    files = read_files(
+                        task_context.source_path, exclude_generated=False
+                    )
+                    baseline_digest = manifest_digest(manifest(files))
+                    for target in (directory / "baseline", directory / "workspace"):
+                        if target.exists():
+                            if Workspace.snapshot_digest(target) != baseline_digest:
+                                raise ValueError("不完整的起始快照已变化，不能自动覆盖")
+                        else:
+                            write_files(files, target)
+                            for relative in task_context.metadata["source_directories"]:
+                                (target / relative).mkdir(
+                                    mode=0o700, parents=True, exist_ok=True
+                                )
+                    workspace = Workspace(
+                        directory / "workspace",
+                        Path(request["repo_path"]),
+                        request["base_commit"],
+                        directory / "baseline",
+                        baseline_digest,
+                    )
+                else:
+                    workspace = Workspace.create(
+                        Path(request["repo_path"]),
+                        request["base_commit"],
+                        directory / "workspace",
+                        baseline_path=directory / "baseline",
+                    )
                 with self.store.locked(run_id, self.owner) as (_, current):
                     current["baseline_digest"] = workspace.baseline_digest
+                    if arena:
+                        current["workspace_checkpoint_digest"] = (
+                            Workspace.execution_digest(workspace.path)
+                        )
             else:
                 workspace = get_workspace(self.store.get(run_id), directory)
                 Workspace.scan(workspace.path)
@@ -219,6 +305,32 @@ class Worker:
                     self.fence()
                     if role_stop():
                         raise Halt("运行或角色已停止派发新动作")
+                    # These references have no legitimate model-tool purpose.
+                    # This detects explicit probes; Docker remains the actual
+                    # boundary for indirect/obfuscated commands and scripts.
+                    if any(
+                        target in command
+                        for target in (
+                            "/verifier",
+                            "/var/run/docker.sock",
+                            "/.ssh/",
+                            str(self.settings.home),
+                        )
+                    ):
+                        with self.store.locked(run_id, self.owner) as (c, current):
+                            current["safety_violation"] = True
+                            self.store.event(
+                                run_id,
+                                "permission_denied",
+                                {
+                                    "reason": "模型工具不可访问检查器或宿主秘密",
+                                    **attribution,
+                                },
+                                c,
+                            )
+                        raise PermissionViolation(
+                            "模型请求触及未授权的检查器或宿主秘密路径"
+                        )
                     action_id = ledger.tool_intent(command)
                     remaining = max(
                         0.1,
@@ -227,6 +339,9 @@ class Worker:
                     )
                     try:
                         options = {"read_only": True} if read_only else {}
+                        if role == "executor" and skill_context:
+                            fresh_skill = library.skill_context(request["skill"])
+                            options["skill_path"] = fresh_skill.path
                         result = sandbox.run(
                             shell_path,
                             command,
@@ -237,10 +352,6 @@ class Worker:
                         )
                         result = redact(result, secrets)
                         self.lease()
-                        self.store.finish_action(
-                            action_id, "completed", result, owner=self.owner
-                        )
-                        role_event("tool_finished", {"action_id": action_id, **result})
                         if read_only:
                             saved_handoff = self.store.get(run_id).get("handoff")
                             if not Review.inspect(workspace, directory, saved_handoff)[
@@ -251,6 +362,26 @@ class Worker:
                                 )
                         else:
                             Workspace.scan(shell_path)
+                            if skill_context:
+                                library.skill_context(request["skill"])
+                        with self.store.locked(run_id, self.owner) as (c, current):
+                            self.store.finish_action(
+                                action_id,
+                                "completed",
+                                result,
+                                connection=c,
+                                owner=self.owner,
+                            )
+                            if arena and not read_only:
+                                current["workspace_checkpoint_digest"] = (
+                                    Workspace.execution_digest(workspace.path)
+                                )
+                            self.store.event(
+                                run_id,
+                                "tool_finished",
+                                {"action_id": action_id, **result, **attribution},
+                                c,
+                            )
                         return result
                     except BaseException:
                         self.lease()
@@ -267,14 +398,14 @@ class Worker:
                     if resume
                     else request["prompt"]
                     + "\n预先约定的验收命令：\n"
-                    + "\n".join(request["checks"])
+                    + "\n".join(request.get("visible_checks", request["checks"]))
                 )
                 if role == "reviewer" and not resume:
                     prompt = (
                         "只读审查执行者的固定代码快照。原始任务：\n"
                         + request["prompt"]
                         + "\n预先约定的验收命令（审查结论不替代实际验证）：\n"
-                        + "\n".join(request["checks"])
+                        + "\n".join(request.get("visible_checks", request["checks"]))
                         + "\n上下文：/workspace/before、/workspace/after、"
                         "/workspace/diff.patch、/workspace/handoff.json。"
                         "依照系统格式用 finish 返回结构化审查，不做修改。"
@@ -283,7 +414,7 @@ class Worker:
                     prompt = (
                         (prompt or request["prompt"])
                         + "\n这是经用户确认后的中断续接。上下文已保留。先检查现有状态，勿盲目重放上次动作。验收条件：\n"
-                        + "\n".join(request["checks"])
+                        + "\n".join(request.get("visible_checks", request["checks"]))
                     )
                 finishes = []
                 result = run_session(
@@ -312,6 +443,17 @@ class Worker:
                     resume=resume,
                     role=role,
                     on_finish=finishes.append,
+                    **(
+                        {
+                            "skill": {
+                                "version_id": skill_context.version_id,
+                                "instructions": skill_context.instructions,
+                                "assets": skill_context.assets,
+                            }
+                        }
+                        if skill_context and role == "executor"
+                        else {}
+                    ),
                 )
                 if role_stop():
                     raise Halt("运行已停止或时长用尽")
@@ -432,6 +574,10 @@ class Worker:
                 return (
                     current["state"] != "verifying"
                     or elapsed(current) >= request["budget"]["max_seconds"]
+                    or (
+                        arena is not None
+                        and arena.stopped(request["arena"]["evaluation_id"])
+                    )
                 )
 
             remaining = max(0.1, request["budget"]["max_seconds"] - elapsed(current))
@@ -441,6 +587,15 @@ class Worker:
                 archive = directory / ("evidence-attempt-" + str(time.time_ns()))
                 evidence_path.rename(archive)
                 event("verification_restarted", {"previous_evidence": archive.name})
+            if skill_context:
+                library.skill_context(request["skill"])
+            if (
+                arena
+                and not arena.integrity(arena.get(request["arena"]["evaluation_id"]))[
+                    "valid"
+                ]
+            ):
+                raise ValueError("评测冻结上下文已变化，禁止生成通过证据")
             report = Evidence.capture(
                 workspace,
                 directory,
@@ -449,9 +604,45 @@ class Worker:
                 min(60, remaining),
                 run_id,
                 should_stop=verify_stop,
+                **(
+                    {
+                        "verifier_path": task_context.verifier_path,
+                        "verification_context": verification_context,
+                    }
+                    if task_context
+                    else {}
+                ),
             )
+            with self.store.locked(run_id, self.owner) as (_, current):
+                current["evidence"] = report
+                if (
+                    arena
+                    and not current.get("arena_assisted")
+                    and any(
+                        (
+                            check.get("exit_code") not in (0, None)
+                            or check.get("timed_out")
+                        )
+                        and not check.get("cancelled")
+                        for check in report.get("checks", [])
+                    )
+                ):
+                    current.setdefault(
+                        "arena_observed_failure",
+                        {
+                            "report_sha256": report["report_sha256"],
+                            "recorded_at": now(),
+                        },
+                    )
             inspection = Evidence.inspect(
-                workspace, directory, expected_report_sha256=report["report_sha256"]
+                workspace,
+                directory,
+                expected_report_sha256=report["report_sha256"],
+                **(
+                    {"verification_context": verification_context}
+                    if task_context
+                    else {}
+                ),
             )
             current = self.store.get(run_id)
             if current["state"] != "verifying" or verify_stop():
@@ -504,7 +695,18 @@ class Worker:
                     if passed and review_required
                     else "检查未通过或证据尚不完整",
                     evidence=report,
+                    ended_at=now(),
                 )
+                if arena:
+                    current["arena_outcome"] = {
+                        "classification": "passed" if verified else "failed",
+                        "kind": "fixed_verifier",
+                        "report_sha256": report["report_sha256"],
+                        "regression_failed": not passed,
+                        "safety_violation": bool(current.get("safety_violation")),
+                        "recorded_at": now(),
+                    }
+
                 self.store.event(
                     run_id,
                     state,
@@ -526,6 +728,11 @@ class Worker:
                     state, reason = "cancelled", "已取消，任务容器已停止"
                 elif current.get("requested_action") == "pause":
                     state, reason = "paused", "已暂停，保留工作区与会话"
+                elif current.get("safety_violation"):
+                    state, reason = (
+                        "failed",
+                        "检测到未授权访问请求；已停止后续模型及工具动作",
+                    )
                 elif exception_cause(exc, SessionRecoveryRequired):
                     state, reason = (
                         "interrupted",
@@ -544,10 +751,63 @@ class Worker:
                 if assignment and assignment["state"] != "completed":
                     assignment["state"] = state
                 current.update(state=state, reason=reason, recovery=cleanup)
+                if state in {"failed", "cancelled", "budget_exceeded"}:
+                    current["ended_at"] = now()
+                if arena:
+                    current["arena_outcome"] = {
+                        "classification": "cancelled"
+                        if state == "cancelled"
+                        else "failed",
+                        "kind": "controller_stop",
+                        "safety_violation": bool(current.get("safety_violation")),
+                        "recorded_at": now(),
+                    }
+                    provider_error = exception_cause(exc, ModelCallError)
+                    provider_type = getattr(provider_error, "provider_error_type", None)
+                    if state == "failed" and not current.get("safety_violation"):
+                        if exception_cause(exc, SandboxError):
+                            current["arena_outcome"].update(
+                                classification="environment_failure",
+                                kind="docker_control_failure",
+                            )
+                        elif provider_type in {
+                            "RateLimitError",
+                            "Timeout",
+                            "APITimeoutError",
+                            "APIConnectionError",
+                            "ServiceUnavailableError",
+                        }:
+                            current["arena_outcome"].update(
+                                classification="environment_failure",
+                                kind="provider_transport",
+                                provider_error_type=provider_type,
+                            )
                 self.store.event(run_id, state, {"reason": reason}, c)
                 self.store.event(run_id, "cleanup", cleanup, c)
+            if arena:
+                from doonex.budget import BatchHalt
+
+                if exception_cause(exc, BatchHalt):
+                    arena.stop(
+                        request["arena"]["evaluation_id"],
+                        "budget_exceeded",
+                        str(exception_cause(exc, BatchHalt)),
+                    )
+                elif (
+                    arena.stopped(request["arena"]["evaluation_id"])
+                    and arena.get(request["arena"]["evaluation_id"])["state"]
+                    == "running"
+                ):
+                    arena.stop(
+                        request["arena"]["evaluation_id"],
+                        "budget_exceeded",
+                        "批次时长预算已用尽",
+                    )
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 self.stopping = True
+        finally:
+            if arena:
+                arena.sync(request["arena"]["evaluation_id"])
 
     def run(self, once=False):
         self.store.initialize()
@@ -559,6 +819,12 @@ class Worker:
                 raise RuntimeError("已有 worker 持有执行权")
             self.lock_connection = connection
             self.reconcile()
+            from doonex.arena import Arena
+
+            arena = Arena(self.settings, self.store)
+            for batch in arena.list():
+                if batch["state"] in {"running", "cancelling"}:
+                    arena.sync(batch["id"])
             while not self.stopping:
                 self.fence()
                 queued = [
@@ -566,6 +832,14 @@ class Worker:
                     for r in reversed(self.store.list_runs(limit=None))
                     if r["state"] == "queued"
                 ]
+                queued = [
+                    r
+                    for r in queued
+                    if not r["request"].get("arena")
+                    or arena.get(r["request"]["arena"]["evaluation_id"])["state"]
+                    in {"queued", "running"}
+                ]
+                queued.sort(key=lambda r: bool(r["request"].get("arena")))
                 if queued:
                     self.execute(queued[0]["id"])
                 if once:

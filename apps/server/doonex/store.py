@@ -26,6 +26,19 @@ CREATE TABLE IF NOT EXISTS project (
 CREATE TABLE IF NOT EXISTS projects (
  id uuid PRIMARY KEY, path text UNIQUE NOT NULL, data jsonb NOT NULL
 );
+CREATE TABLE IF NOT EXISTS library_versions (
+ kind text NOT NULL, id text NOT NULL, data jsonb NOT NULL, PRIMARY KEY(kind,id)
+);
+CREATE TABLE IF NOT EXISTS arena_evaluations (
+ id uuid PRIMARY KEY, state text NOT NULL, data jsonb NOT NULL
+);
+CREATE TABLE IF NOT EXISTS arena_recommendations (
+ id uuid PRIMARY KEY, data jsonb NOT NULL
+);
+CREATE TABLE IF NOT EXISTS arena_current (
+ fingerprint text NOT NULL, position text NOT NULL, recommendation_id uuid NOT NULL
+ REFERENCES arena_recommendations(id), PRIMARY KEY(fingerprint,position)
+);
 CREATE TABLE IF NOT EXISTS runs (
  id uuid PRIMARY KEY, state text NOT NULL, data jsonb NOT NULL
 );
@@ -99,7 +112,7 @@ class Store:
             )
         return data
 
-    def create_run(self, request):
+    def create_run(self, request, connection=None):
         run_id = str(uuid.uuid4())
         roles = run_roles(request)
 
@@ -150,11 +163,18 @@ class Store:
             }
             for role in roles
         }
-        with self.connect() as c:
+
+        def insert(c):
             c.execute(
                 "INSERT INTO runs VALUES(%s,%s,%s)", (run_id, "queued", Jsonb(data))
             )
             self.event(run_id, "queued", {"acceptance_version": 1}, connection=c)
+
+        if connection is not None:
+            insert(connection)
+        else:
+            with self.connect() as c:
+                insert(c)
         return data
 
     def get(self, run_id):
@@ -265,6 +285,9 @@ class Store:
             (run_id,),
         ).fetchall()
         run["usage"]["unknown_calls"] += len(pending)
+        from doonex.budget import mark_batch_unknown
+
+        mark_batch_unknown(connection, run, len(pending))
         assignments = {item["id"]: item for item in run.get("assignments", {}).values()}
         for row in pending:
             assignment = assignments.get(row["data"].get("assignment_id"))

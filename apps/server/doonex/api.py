@@ -135,13 +135,43 @@ def create_app(settings=None):
             from doonex.evidence import Evidence
 
             directory = run_directory(settings, run_id)
+            binding = run["request"].get("arena")
+            verification_context = (
+                {
+                    key: binding[key]
+                    for key in (
+                        "taskset_id",
+                        "task_id",
+                        "report_sha256",
+                        "verifier_digest",
+                    )
+                }
+                if binding
+                else None
+            )
             result = Evidence.inspect(
                 get_workspace(run, directory),
                 directory,
                 expected_report_sha256=(run.get("evidence") or {}).get("report_sha256"),
+                **({"verification_context": verification_context} if binding else {}),
             )
+            frozen_valid = True
+            if run["request"].get("skill") or binding:
+                from doonex.library import Library
+
+                library = Library(settings, store)
+                try:
+                    if run["request"].get("skill"):
+                        library.skill_context(run["request"]["skill"])
+                    if binding:
+                        frozen_valid = library.tasksets.inspect(
+                            binding["taskset_id"], binding["report_sha256"]
+                        )["valid"]
+                except (OSError, ValueError, KeyError):
+                    frozen_valid = False
             if (
-                not result.get("verified")
+                not frozen_valid
+                or not result.get("verified")
                 or not (run.get("evidence") or {}).get("report_sha256")
                 or (result.get("report") or {}).get("commands")
                 != run["request"]["checks"]
@@ -335,6 +365,23 @@ def create_app(settings=None):
         # A mixed run has unknown total cost, but still caps its priced subtotal.
         if all(p.model.billing_mode == "subscription" for p in selected.values()):
             request["budget"]["max_cost_usd"] = None
+        from doonex.library import Library
+
+        if body.recommendation_id:
+            from doonex.arena import Arena
+
+            recommendation, skill = Arena(settings, store).select_for_run(
+                body.recommendation_id, request["model"]
+            )
+            if body.skill_version_id and body.skill_version_id != skill["version_id"]:
+                raise ValueError("所选 Skill 与推荐版本不一致")
+            request["skill_version_id"] = skill["version_id"]
+            request["skill"] = skill
+            request["recommendation"] = recommendation
+        else:
+            request["skill"] = Library(settings, store).freeze_skill(
+                body.skill_version_id
+            )
         return store.create_run(request)
 
     @app.get("/api/runs/{run_id}", dependencies=auth)
@@ -445,6 +492,10 @@ def create_app(settings=None):
     @app.post("/api/runs/{run_id}/resume", dependencies=auth)
     def resume(run_id: str, body: ResumeInput):
         run = load_run(run_id)
+        if run["request"].get("arena"):
+            raise ValueError(
+                "请在 Arena 中核查并恢复整个批次；单独恢复不能绕过批次预算"
+            )
         if run["state"] not in {"paused", "interrupted"}:
             raise ValueError("仅暂停或中断的运行可以续接")
         report = recovery(run_id)
@@ -627,6 +678,13 @@ def create_app(settings=None):
             if result.returncode == 0
             else "补丁存在冲突，禁止自动覆盖",
         }
+
+    from doonex.library import install_library_routes
+
+    install_library_routes(app, settings, store, auth)
+    from doonex.arena import install_arena_routes
+
+    install_arena_routes(app, settings, store, auth)
 
     static_dir = Path(__file__).resolve().parents[2] / "web" / "dist"
     if static_dir.is_dir():

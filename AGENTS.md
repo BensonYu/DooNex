@@ -66,7 +66,7 @@
 pnpm --dir apps/web build
 ```
 
-`test_local.py` 使用一次性 PostgreSQL，包含真实 Docker 边界测试；模拟 SDK 响应不代表真实模型接通。真实 API 验收只能在用户已确认的凭据、模型与预算范围内显式运行 `scripts/live_acceptance.py --confirm-model-usage`；M2 两角色验收使用 `--workflow execute_review` 和独立的 `m2-sample-...` 样例名称，保留已有样例。用户已授权包月验收 campaign 不设累计上限，脚本用 `--authorize-subscription-campaign` 明确记录授权变更；按量模式不得使用该授权。每个产品 Run 仍限制调用、token 和时长，两个角色共享上限；失败、未知用量和中断预留不得通过重置账本绕过。费用未知显示 `null`，不能写成免费。
+`test_local.py` 使用一次性 PostgreSQL，包含真实 Docker 边界测试；模拟 SDK 响应不代表真实模型接通。真实 API 验收只能在用户已确认的凭据、模型与预算范围内显式运行 `scripts/live_acceptance.py --confirm-model-usage`；M2 两角色验收使用 `--workflow execute_review` 和独立的 `m2-sample-...` 样例名称，保留已有样例。用户已授权包月验收 campaign 不设累计上限，脚本用 `--authorize-subscription-campaign` 明确记录授权变更；按量模式不得使用该授权。每个产品 Run 仍限制调用、token 和时长，两个角色共享上限；失败、未知用量和中断预留不得通过重置账本绕过。费用未知显示 `null`，不能写成免费。M3 的已冻结批次使用 `scripts/live_arena.py --confirm-model-usage --evaluation-id UUID --model ACTUAL_API_MODEL_ID`；它要求已有包月 campaign 授权并复用原账本，同时限制批次及各子运行。不得重启脚本来重放未知批次，不得把环境故障、辅助运行或缺失次数算作有效重复。
 
 文档改动至少执行：
 

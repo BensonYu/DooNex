@@ -231,6 +231,7 @@ def read_files(
     max_file_bytes: int | None = None,
     max_total_bytes: int | None = None,
     max_depth: int = 100,
+    directories: list[dict] | None = None,
 ) -> dict[str, FileContent]:
     """Read with directory descriptors; no path component may become a symlink."""
     path = Path(path)
@@ -244,6 +245,14 @@ def read_files(
 
     def walk(directory_fd: int, prefix: str = "") -> None:
         nonlocal total, entry_count
+        directory_before = os.fstat(directory_fd)
+        if directories is not None:
+            directories.append(
+                {
+                    "path": prefix.rstrip("/"),
+                    "mode": stat.S_IMODE(directory_before.st_mode),
+                }
+            )
         names = []
         with os.scandir(directory_fd) as iterator:
             for entry in iterator:
@@ -308,6 +317,13 @@ def read_files(
                 raise WorkspaceError(
                     f"Symlink or special file is forbidden: {relative}"
                 )
+        if directories is not None:
+            directory_after = os.fstat(directory_fd)
+            if (directory_before.st_mtime_ns, directory_before.st_ctime_ns) != (
+                directory_after.st_mtime_ns,
+                directory_after.st_ctime_ns,
+            ):
+                raise WorkspaceError("Project directory changed during snapshot")
 
     try:
         directory_fd = os.open(path, flags | os.O_DIRECTORY)
@@ -466,3 +482,16 @@ class Workspace:
     @staticmethod
     def snapshot_digest(path: Path) -> str:
         return manifest_digest(Workspace.scan(path))
+
+    @staticmethod
+    def execution_digest(path: Path) -> str:
+        """Bind all tool-visible files and directory names/modes for recovery."""
+        directories = []
+        files = read_files(path, exclude_generated=False, directories=directories)
+        return hashlib.sha256(
+            json.dumps(
+                {"files": manifest(files), "directories": directories},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()

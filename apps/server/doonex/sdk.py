@@ -95,7 +95,11 @@ class SessionRecoveryRequired(RuntimeError):
 
 
 class ModelCallError(RuntimeError):
-    """A provider failed; the raw exception may contain credentials."""
+    """A provider failed; expose only its class, never raw credential-bearing text."""
+
+    def __init__(self, message, provider_error_type=None):
+        super().__init__(message)
+        self.provider_error_type = provider_error_type
 
 
 class ReviewReportError(ValueError):
@@ -390,7 +394,8 @@ class GuardedLLM(LLM):
         except Exception as error:  # noqa: BLE001 -- providers expose heterogeneous exceptions
             self._after(reservation, None)
             raise ModelCallError(
-                f"Model request failed ({type(error).__name__})"
+                f"Model request failed ({type(error).__name__})",
+                provider_error_type=type(error).__name__,
             ) from None
         usage = getattr(response.raw_response, "usage", None)
         names = (

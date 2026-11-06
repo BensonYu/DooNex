@@ -67,6 +67,8 @@ class ModelConfig(StrictModel):
 
 
 class RunInput(StrictModel):
+    recommendation_id: str | None = Field(default=None, min_length=36, max_length=36)
+    skill_version_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     project_id: str | None = Field(default=None, min_length=36, max_length=36)
     model_profile_id: str | None = Field(
         default=None, pattern=r"^[a-z][a-z0-9_-]{0,63}$"
