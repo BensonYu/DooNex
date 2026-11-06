@@ -27,6 +27,40 @@ export type Settings = {
   default_budget: Budget;
 };
 
+export type ModelProfile = {
+  id: string;
+  name: string;
+  model: ModelConfig;
+  revision: string;
+  read_only: boolean;
+  usage_adapter: 'none' | 'gateway_v1';
+  credential_available: boolean;
+};
+export type ModelProfiles = { profiles: ModelProfile[]; default_profile_id: string | null };
+
+export type MetadataStatus = 'ok' | 'not_configured' | 'unsupported' | 'unauthorized' | 'rate_limited' | 'unavailable' | 'invalid_response';
+export type MetadataResult = {
+  status: MetadataStatus;
+  profile_id: string;
+  revision: string;
+  source: string | null;
+  queried_at: string;
+  http_status: number | null;
+  error: string | null;
+};
+export type ModelsResult = MetadataResult & { models: string[] };
+export type AccountUsage = {
+  is_valid: boolean | null;
+  mode: string | null;
+  plan_name: string | null;
+  remaining: number | null;
+  unit: string | null;
+  unrestricted: boolean;
+  metrics: Record<string, number>;
+  windows: { name: string; used: number | null; limit: number | null; remaining: number | null; unit: string | null; reset_at: string | null }[];
+};
+export type AccountUsageResult = MetadataResult & { usage: AccountUsage | null };
+
 export type Project = { id: string; path: string; head: string; dirty: boolean; name?: string };
 export type Role = 'executor' | 'reviewer';
 export type Workflow = 'execute' | 'execute_review';
@@ -37,6 +71,8 @@ export type Usage = {
   reserved_tokens: number;
   reserved_cost_usd: number | null;
   unknown_calls: number;
+  metered_cost_usd?: number;
+  reserved_metered_cost_usd?: number;
 };
 export type Assignment = {
   id: string;
@@ -80,6 +116,8 @@ export type Run = {
     checks: string[];
     budget: Budget;
     model: ModelConfig;
+    role_models?: Partial<Record<Role, ModelConfig>>;
+    model_profiles?: Partial<Record<Role, { id: string; name: string; revision: string | number }>>;
   };
   usage: Usage;
   evidence?: Record<string, unknown> | null;
@@ -155,6 +193,10 @@ export class Api {
 
   async post<T>(path: string, body: unknown = {}, signal?: AbortSignal): Promise<T> {
     return (await this.response(path, { method: 'POST', body: JSON.stringify(body), signal })).json() as Promise<T>;
+  }
+
+  async put<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
+    return (await this.response(path, { method: 'PUT', body: JSON.stringify(body), signal })).json() as Promise<T>;
   }
 
   async download(projectId: string, runId: string, name: ArtifactName, signal?: AbortSignal): Promise<void> {

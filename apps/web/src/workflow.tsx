@@ -21,11 +21,12 @@ export function WorkflowProgress({ run }: { run: Run }) {
         const assignment = run.assignments?.[role];
         const usage = assignment?.usage ?? run.role_usage?.[role] ?? (!enabled && role === 'executor' ? run.usage : undefined);
         const legacyState = run.state.startsWith('completed_') || run.state === 'verifying' ? 'completed' : run.state;
+        const model = run.request.role_models?.[role] ?? run.request.model;
         const state = assignment?.state ?? (role === 'executor' ? legacyState : 'pending');
         return <tr key={role}>
           <th scope="row"><strong>{names[role]}</strong><span>{states[state] ?? state}</span>{assignment?.id && <small className="path-text">{assignment.id}</small>}</th>
           <td>{usage ? usage.calls : '—'}</td><td>{usage ? usage.tokens.toLocaleString() : '—'}{usage && usage.unknown_calls > 0 && <small>{usage.unknown_calls} 次调用用量未知</small>}</td>
-          <td>{usage ? money(usage.cost_usd) : '—'}</td>
+          <td>{usage ? model.billing_mode === 'subscription' ? '包月，金额未知' : money(usage.cost_usd) : '—'}<small>{model.model_id}</small></td>
         </tr>;
       })}</tbody>
     </table></div>
