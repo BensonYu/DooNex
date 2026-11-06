@@ -137,6 +137,30 @@ def test_adoption_rejects_switch_to_another_branch_at_same_commit(client, tmp_pa
     assert "分支名称" in result["reason"]
 
 
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("get", ""),
+        ("get", "/events"),
+        ("get", "/artifact?name=patch"),
+        ("post", "/pause"),
+        ("post", "/cancel"),
+        ("post", "/resume"),
+        ("post", "/adoption-check"),
+    ],
+)
+def test_multi_project_run_access_requires_explicit_context(
+    client, store, tmp_path, method, path
+):
+    first, _ = two_projects(client, tmp_path)
+    run = client.post(
+        "/api/runs", json={"project_id": first[0]["id"], "prompt": "explicit context"}
+    ).json()
+    response = getattr(client, method)(f"/api/runs/{run['id']}{path}")
+    assert response.status_code == 400
+    assert store.get(run["id"]) == run
+
+
 def test_pending_unknown_is_attributed_to_role_without_double_count(
     store, request_data
 ):

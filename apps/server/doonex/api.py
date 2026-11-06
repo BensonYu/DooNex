@@ -83,6 +83,12 @@ def create_app(settings=None):
         # mutable server-wide selection. Reject a stale/wrong context before any
         # run read, control action or artifact access.
         project_id = request.query_params.get("project_id")
+        if (
+            request.path_params.get("run_id")
+            and project_id is None
+            and len(store.list_projects()) > 1
+        ):
+            raise HTTPException(400, "存在多个项目，运行请求必须包含项目上下文")
         if project_id is not None:
             project_id = identifier(project_id)
             store.project(project_id)
