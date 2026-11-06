@@ -1287,3 +1287,60 @@ def test_receipt_budget_limits_do_not_increase_with_controller_constants(
     assert current["budget"]["remaining_requests"] == 0
     with pytest.raises(DiscoveryError, match="discovery_budget_exhausted"):
         preview(service, current)
+
+
+@pytest.mark.parametrize(
+    "owner", ["2026 Example Author, Inc.", "2024-2026 Example Contributors"]
+)
+def test_apache_appendix_identifying_fields_preserve_full_body(owner):
+    from doonex.discovery import check_license, complete_apache
+
+    populated = APACHE.replace(b"[yyyy] [name of copyright owner]", owner.encode())
+    assert complete_apache(populated.decode())
+    files = {
+        "SKILL.md": FileContent(
+            b"---\nlicense: LICENSE.txt\n---\nRead the guide.\n", 0o644
+        ),
+        "LICENSE.txt": FileContent(populated, 0o644),
+    }
+    result = check_license(files)
+    assert result["status"] == "supported" and result["spdx"] == "Apache-2.0"
+    assert result["files"][0]["text"].encode() == populated
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "term",
+        "missing_section",
+        "extra_term",
+        "before_appendix",
+        "empty_owner",
+        "unknown_year",
+        "extra_line",
+    ],
+)
+def test_populated_apache_appendix_does_not_relax_any_other_terms(change):
+    from doonex.discovery import complete_apache
+
+    text = APACHE.decode().replace(
+        "[yyyy] [name of copyright owner]", "2026 Example Author, Inc."
+    )
+    if change == "term":
+        text = text.replace("perpetual", "temporary", 1)
+    elif change == "missing_section":
+        text = text.replace("3. Grant of Patent License.", "", 1)
+    elif change == "extra_term":
+        text += "\nUse only for non-commercial research."
+    elif change == "before_appendix":
+        text = "Copyright 2026 Extra Person\n" + text
+    elif change == "empty_owner":
+        text = text.replace("2026 Example Author, Inc.", "2026")
+    elif change == "unknown_year":
+        text = text.replace("2026 Example Author, Inc.", "[yyyy] Example Author, Inc.")
+    else:
+        text = text.replace(
+            "2026 Example Author, Inc.",
+            "2026 Example Author, Inc.\nLicense: proprietary",
+        )
+    assert not complete_apache(text)
