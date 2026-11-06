@@ -741,6 +741,15 @@ class _M1Agent(Agent):
                 return
             finally:
                 scheduling.active_action = None
+            if not ConversationState.get_unmatched_actions(
+                conversation.state.active_branch()
+            ):
+                # SDK 1.60.1 rebuilds its derived view on load, dropping
+                # pending actions until they have observations. Its incremental
+                # append then adds only the resumed observations, leaving tool
+                # outputs without their calls. Rebuild once the saved batch is
+                # complete so the next request includes both original events.
+                conversation.state.rebuild_view()
             if (
                 conversation.state.execution_status
                 == ConversationExecutionStatus.FINISHED
