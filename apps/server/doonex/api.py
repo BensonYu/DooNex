@@ -742,6 +742,9 @@ def create_app(settings=None):
     from doonex.scheduling import install_background_routes
 
     install_background_routes(app, settings, store, auth)
+    from doonex.community import install_community_routes
+
+    install_community_routes(app, settings, store, auth)
 
     static_dir = Path(__file__).resolve().parents[2] / "web" / "dist"
     if static_dir.is_dir():

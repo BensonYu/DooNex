@@ -92,6 +92,9 @@ class Store:
             from doonex.generation import GENERATION_SCHEMA
 
             connection.execute(GENERATION_SCHEMA)
+            from doonex.community import COMMUNITY_SCHEMA
+
+            connection.execute(COMMUNITY_SCHEMA)
             # Keep the M1 source row intact. Repeated startup never overwrites
             # updated M2 metadata, identities, runs or their private artifacts.
             connection.execute(
