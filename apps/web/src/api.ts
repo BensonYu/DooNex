@@ -163,6 +163,55 @@ export type ArenaRecommendation = {
 };
 export type ArenaRecommendations = { current: ArenaRecommendation[]; history: ArenaRecommendation[] };
 
+export type BackgroundInput = {
+  name?: string;
+  taskset_id: string;
+  skill_version_ids: string[];
+  model_profile_id: string;
+  repeats: number;
+  run_budget: Budget;
+  batch_budget: Budget;
+  daily_budget: Budget;
+  window_start: string;
+  window_end: string;
+};
+export type BackgroundAuthorization = {
+  id: string;
+  name: string;
+  state: 'draft' | 'enabled' | 'consumed' | 'disabled';
+  revision: number;
+  created_at: string;
+  updated_at: string;
+  enabled_at: string | null;
+  disabled_at: string | null;
+  consumed_at: string | null;
+  evaluation_id: string | null;
+  evaluation?: Pick<ArenaEvaluation, 'id' | 'state' | 'reason' | 'usage'> | null;
+  date: string;
+  window_start: string;
+  window_end: string;
+  expires_at: string;
+  input: BackgroundInput;
+  snapshot: {
+    taskset_id: string;
+    taskset_report_sha256: string;
+    skills: Record<string, unknown>;
+    model: ModelConfig;
+    model_profile: { id: string; name: string; revision: string };
+    environment: unknown;
+  };
+  history: { event: string; at: string; revision?: number; [key: string]: unknown }[];
+};
+export type BackgroundDayUsage = { calls: number; tokens: number; seconds: number; cost_usd: number | null; metered_cost_usd: number };
+export type BackgroundDay = {
+  date: string;
+  budget: Budget;
+  used: BackgroundDayUsage;
+  reserved: BackgroundDayUsage;
+  created_at: string;
+  updated_at: string;
+};
+
 export type Project = { id: string; path: string; head: string; dirty: boolean; name?: string };
 export type Role = 'executor' | 'reviewer';
 export type Workflow = 'execute' | 'execute_review';
@@ -260,6 +309,10 @@ function errorMessage(value: unknown): string | null {
   return null;
 }
 
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) { super(message); }
+}
+
 export class Api {
   constructor(private readonly token: string) {}
 
@@ -281,12 +334,12 @@ export class Api {
     }
     if (!response.ok) {
       if (response.status === 401 || response.status === 403) {
-        throw new Error('访问令牌无效或无权执行此操作。请检查令牌与本地服务配置。');
+        throw new ApiError('访问令牌无效或无权执行此操作。请检查令牌与本地服务配置。', response.status);
       }
       const text = await response.text();
       let detail: string | null = null;
       try { detail = errorMessage(JSON.parse(text)); } catch { /* Non-JSON errors use a bounded fallback. */ }
-      throw new Error(detail ?? `请求失败（HTTP ${response.status}）${text ? `：${text.slice(0, 300)}` : ''}`);
+      throw new ApiError(detail ?? `请求失败（HTTP ${response.status}）${text ? `：${text.slice(0, 300)}` : ''}`, response.status);
     }
     return response;
   }

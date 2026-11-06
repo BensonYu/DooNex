@@ -6,14 +6,15 @@ import { ReviewReport, WorkflowProgress } from './workflow';
 import { FrozenModels, ModelSettings, RoleModelChoices } from './model-settings';
 import { FrozenSkill, RecommendationChoice, SkillChoice, SkillsView, sameModelConfig, skillReady } from './skills';
 import { ArenaView } from './arena';
+import { BackgroundView } from './background';
 
 const stateNames: Record<string, string> = {
-  queued: '等待执行', running: '正在执行', pausing: '正在暂停', paused: '已暂停',
+  queued: '等待执行', running: '正在执行', pausing: '正在暂停', paused: '已暂停', yielded: '已安全让出',
   verifying: '正在验证', completed_verified: '已验证完成', completed_unverified: '待检查',
   failed: '失败', cancelled: '已取消', interrupted: '意外中断', budget_exceeded: '预算已用尽',
   awaiting_input: '等待输入', awaiting_approval: '等待授权', cancelling: '正在取消',
 };
-const activeStates = new Set(['queued', 'running', 'pausing', 'verifying', 'cancelling']);
+const activeStates = new Set(['queued', 'running', 'pausing', 'verifying', 'cancelling', 'yielded']);
 const fmtTime = (value: string) => {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN', { hour12: false });
@@ -91,7 +92,7 @@ function App() {
   const [tokenDraft, setTokenDraft] = useState('');
   const [settings, setSettings] = useState<Settings | null>(null);
   const [registry, setRegistry] = useState<ModelProfiles | null>(null);
-  const [view, setView] = useState<'workbench' | 'models' | 'skills' | 'arena'>('workbench');
+  const [view, setView] = useState<'workbench' | 'models' | 'skills' | 'arena' | 'background'>('workbench');
   const [skills, setSkills] = useState<SkillVersion[]>([]);
   const [recommendations, setRecommendations] = useState<ArenaRecommendation[]>([]);
   const [recommendationLoading, setRecommendationLoading] = useState(false);
@@ -346,7 +347,7 @@ function App() {
         clearView(); active.current = { projectId: '', runId: '' }; writeStorage('session', 'doonex.token', ''); setToken(''); setSettings(null); setRegistry(null); setSkills([]); setRecommendations([]); setArenaEvaluationId(''); setView('workbench'); setProjects([]); setProjectId(''); setSelectedId(''); setRuns([]);
       }}>断开连接</button></div>
     </header>
-    <nav className="app-nav" aria-label="工作区页面">{([['workbench', '工作台'], ['skills', 'Skills'], ['arena', 'Skill Arena'], ['models', '模型设置']] as const).map(([id, label]) => <button key={id} aria-current={view === id ? 'page' : undefined} onClick={() => { setView(id); setError(''); }}>{label}</button>)}</nav>
+    <nav className="app-nav" aria-label="工作区页面">{([['workbench', '工作台'], ['skills', 'Skills'], ['arena', 'Skill Arena'], ['background', '后台调优'], ['models', '模型设置']] as const).map(([id, label]) => <button key={id} aria-current={view === id ? 'page' : undefined} onClick={() => { setView(id); setError(''); }}>{label}</button>)}</nav>
     <div className="workspace-layout">
       <aside className="sidebar" aria-label="运行列表">
         <div className="project-picker"><label htmlFor="project-select">项目</label><select id="project-select" value={projectId} onChange={(event) => selectProject(event.target.value)} disabled={!projects.length}><option value="" disabled>尚未注册项目</option>{projects.map((item) => <option key={item.id} value={item.id}>{item.name || item.path}</option>)}</select><button className="quiet compact" onClick={() => { setView('workbench'); setShowCreate(true); setError(''); requestAnimationFrame(() => document.getElementById('project-path')?.focus()); }}>注册项目</button></div>
@@ -368,7 +369,7 @@ function App() {
           {project && <span className="muted small">{project.dirty ? '原工作区有未提交改动' : '原工作区干净'}</span>}
         </section>}
 
-        {view === 'models' && registry ? <ModelSettings api={api} registry={registry} onRegistry={setRegistry} onClose={() => setView('workbench')} /> : view === 'skills' ? <SkillsView api={api} skills={skills} onSkills={setSkills} onEvaluation={(id) => { setArenaEvaluationId(id); setView('arena'); }} /> : view === 'arena' && settings ? <ArenaView api={api} skills={skills} registry={registry} defaultBudget={settings.default_budget} initialEvaluationId={arenaEvaluationId} onOpenRun={(targetProject, id) => { void perform(async ({ signal, isCurrent }) => {
+        {view === 'background' && settings ? <BackgroundView api={api} skills={skills} registry={registry} defaultBudget={settings.default_budget} onEvaluation={(id) => { setArenaEvaluationId(id); setView('arena'); }} /> : view === 'models' && registry ? <ModelSettings api={api} registry={registry} onRegistry={setRegistry} onClose={() => setView('workbench')} /> : view === 'skills' ? <SkillsView api={api} skills={skills} onSkills={setSkills} onEvaluation={(id) => { setArenaEvaluationId(id); setView('arena'); }} /> : view === 'arena' && settings ? <ArenaView api={api} skills={skills} registry={registry} defaultBudget={settings.default_budget} initialEvaluationId={arenaEvaluationId} onOpenRun={(targetProject, id) => { void perform(async ({ signal, isCurrent }) => {
           const next = await api.get<Project[]>('/projects', signal);
           if (!isCurrent()) return;
           setProjects(next); selectProject(targetProject); select(id);

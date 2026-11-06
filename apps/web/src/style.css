@@ -313,3 +313,20 @@ div.notice:has(> button) { display: flex; justify-content: space-between; align-
   .header-actions { gap: 6px; }
   .header-actions button { padding: 7px; }
 }
+
+.background-draft { border-top: 1px solid var(--line); padding-top: 24px; }
+.background-draft .model-fields { margin-top: 28px; }
+.background-draft .checkbox-label span, .background-detail dd { min-width: 0; overflow-wrap: anywhere; }
+.background-window { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.background-day { padding-top: 24px; margin-top: 28px; border-top: 1px solid var(--line); }
+.background-day h2 { line-height: 1.7; }
+.background-day .table-scroll { margin: 12px 0; }
+.background-ledger { min-width: 460px; margin: 0; }
+.background-ledger caption { text-align: left; margin-bottom: 10px; font-size: 12px; color: var(--muted); }
+.background-enable { margin: 24px 0; padding: 20px; border: 1px solid #c7d3ee; border-radius: 6px; background: #f0f4fd; }
+.background-enable > p { margin-bottom: 12px; }
+.background-enable > .warning-text { margin: 14px 0 0; }
+.background-skill-id { display: block; margin-top: 5px; }
+.background-detail .section-heading { align-items: flex-start; flex-wrap: wrap; }
+.background-detail .section-block { margin-top: 22px; }
+@media (max-width: 800px) { .background-window { grid-template-columns: 1fr; } .background-view > .page-heading { flex-wrap: wrap; } }

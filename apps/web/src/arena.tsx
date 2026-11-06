@@ -5,12 +5,12 @@ import { skillReady } from './skills';
 
 const positions: Record<RecommendationPosition, string> = { reliable: '可靠优先', cost: '成本优先', speed: '速度优先' };
 const stability: Record<ArenaStability, string> = { all_passed: '全部通过', unstable: '不稳定：重复结果有成有败', all_failed: '全部失败', incomplete: '重复证据不完整' };
-const states: Record<string, string> = { queued: '等待执行', running: '正在评测', cancelling: '正在取消', complete: '批次已跑完', completed: '批次已跑完', failed: '评测失败', cancelled: '已取消', budget_exceeded: '已达到批次预算', interrupted: '已中断' };
+const states: Record<string, string> = { queued: '等待执行', running: '正在评测', yielded: '已安全让出', cancelling: '正在取消', complete: '批次已跑完', completed: '批次已跑完', failed: '评测失败', cancelled: '已取消', budget_exceeded: '已达到批次预算', interrupted: '已中断' };
 const outcomeNames: Record<string, string> = { passed: '验收通过', pass: '验收通过', failed: '验收失败', failure: '验收失败', environment_failure: '环境故障', cancelled: '取消', assisted: '辅助运行（自主性未证实）', pending: '待完成', running: '执行中', evidence_invalid: '证据无效' };
 const reasonNames: Record<string, string> = {
   not_heldout: '不是保留评测集', evaluation_not_complete: '评测尚未结束', batch_incomplete: '批次证据不完整', insufficient_repeats: '独立重复次数不足', cancelled_attempts: '包含取消记录', assisted_attempts: '包含人工介入或自主性无法证明的辅助运行', pending_attempts: '还有未完成尝试', invalid_attempt_records: '尝试记录无效', missing_evidence: '缺少有效证据', safety_violation: '发生权限边界违规', insufficient_valid_attempts: '有效尝试次数不足', task_without_success: '存在从未通过的任务', critical_task_failed: '关键任务未全部通过', below_threshold: '任务等权通过率低于门槛', below_baseline: '通过率低于同轮基线', baseline_ineligible: '同轮基线不满足门槛', duplicate_run_id: '存在重复运行记录', unknown_task: '记录引用了未知任务', unknown_arm: '记录引用了未知候选', invalid_repeat: '重复序号无效', invalid_attempt_fields: '尝试记录字段无效',
 };
-const activeEvaluation = (state: string) => ['queued', 'running', 'cancelling'].includes(state);
+const activeEvaluation = (state: string) => ['queued', 'running', 'cancelling', 'yielded'].includes(state);
 const percentage = (value: number | null) => value == null ? '不可计算' : `${(value * 100).toFixed(1)}%`;
 const seconds = (value: number | null) => value == null ? '未知' : `${value.toFixed(1)} 秒`;
 const successCost = (value: number | null, passed: number) => passed === 0 ? '不可计算' : formatMoney(value);
