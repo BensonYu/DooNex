@@ -143,7 +143,12 @@ export type ArenaEvaluation = {
   skill_version_ids?: string[];
   usage: Usage;
   metrics: ArenaMetrics;
-  attempts: { run_id: string; project_id: string; task_id: string; arm_id: string; repeat: number; classification: string; state: string; reason: string | null }[];
+  attempts: {
+    run_id: string; project_id: string; task_id: string; arm_id: string; repeat: number;
+    classification: string; state: string; reason: string | null;
+    evidence_valid?: boolean; safety_violation?: boolean; regression_failed?: boolean;
+    assistance?: { reason: string; at: string; snapshot_digest: string }[];
+  }[];
 };
 export type ArenaRecommendation = {
   id: string;
