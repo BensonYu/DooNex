@@ -22,6 +22,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any, ClassVar
@@ -58,6 +59,7 @@ SDK_VERSION = "1.60.1"
 _SUPPORTED_PROVIDERS = frozenset({"openai", "anthropic"})
 _RUN_LOCK = threading.Lock()
 _CALLBACKS: dict[str, tuple[Callable[[str], dict], Callable[[], bool], str]] = {}
+_SCHEDULING: dict[str, _SchedulingRuntime] = {}
 
 
 def _assert_private_runtime() -> None:
@@ -92,6 +94,171 @@ class SessionStopped(Exception):
 
 class SessionRecoveryRequired(RuntimeError):
     """An action without a recorded outcome needs explicit reconciliation."""
+
+
+class SchedulerYield(BaseException):
+    """The controller proved that this model/tool action was not dispatched.
+
+    Only raise from ``before_model`` (before reserving) or ``shell_with_action``
+    (before dispatching). BaseException deliberately bypasses SDK 1.60.1's
+    ordinary tool/provider exception conversion. Other BaseExceptions never
+    constitute a scheduler checkpoint.
+    """
+
+
+class _AcceptedSchedulerYield(SchedulerYield):
+    def __init__(self, runtime):
+        super().__init__("Scheduler yield before dispatch")
+        self.runtime = runtime
+
+
+@dataclass(frozen=True)
+class SessionScheduling:
+    """Optional scheduling contract; the product owns durable authorization.
+
+    ``on_yield`` must persist the receipt only after checking that all product
+    actions and model budget reservations are settled. ``authorize_resume``
+    must compare the exact durable receipt and current product authorization;
+    only the literal True permits continuation. Neither callback may infer
+    action identity from a command string.
+    """
+
+    generation: int
+    should_yield: Callable[[], bool]
+    on_yield: Callable[[dict], None]
+    resume_receipt: dict | None = None
+    authorize_resume: Callable[[dict], bool] | None = None
+
+
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value, sort_keys=True, ensure_ascii=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _action_identity(event, session_id: str, generation: int, secret: str = ""):
+    data = _redact(event.model_dump(mode="json"), secret)
+    return {
+        "schema": 1,
+        "session_id": session_id,
+        "session_generation": generation,
+        "action_id": data["id"],
+        "tool_call_id": data.get("tool_call_id"),
+        "tool_name": data["tool_name"],
+        "action_sha256": _canonical_sha256(data.get("action")),
+        "event_sha256": _canonical_sha256(data),
+        "llm_response_id": data.get("llm_response_id"),
+    }
+
+
+@dataclass
+class _SchedulingRuntime:
+    hooks: SessionScheduling
+    session_id: str
+    secret: str = field(repr=False)
+    shell_with_action: Callable[[str, dict], dict] | None
+    settled_responses: dict[str, dict] = field(default_factory=dict)
+    unknown_response: bool = False
+    active_action: dict | None = None
+    yielded: bool = False
+
+    def record_response(self, response, usage: dict | None) -> None:
+        response_id = _redact(getattr(response.raw_response, "id", None), self.secret)
+        if not isinstance(response_id, str) or not response_id or usage is None:
+            self.unknown_response = True
+            return
+        self.settled_responses[response_id] = {
+            "response_id": response_id,
+            **usage,
+        }
+
+    def pause(self, conversation) -> None:
+        if conversation.state.execution_status != ConversationExecutionStatus.FINISHED:
+            conversation.pause()
+            self.yielded = True
+
+    def maybe_pause(self, conversation) -> bool:
+        if (
+            conversation.state.execution_status != ConversationExecutionStatus.FINISHED
+            and self.hooks.should_yield()
+        ):
+            self.pause(conversation)
+            return True
+        return False
+
+    def receipt(self, conversation) -> dict:
+        events = list(conversation.state.active_branch())
+        pending = ConversationState.get_unmatched_actions(events)
+        identities = [
+            _action_identity(event, self.session_id, self.hooks.generation)
+            for event in pending
+        ]
+        if self.unknown_response or any(
+            item["llm_response_id"] not in self.settled_responses for item in identities
+        ):
+            raise SessionRecoveryRequired(
+                "Scheduling checkpoint has an unsettled or unknown model response"
+            )
+        return {
+            "schema": 1,
+            "sdk_version": SDK_VERSION,
+            "session_id": self.session_id,
+            "session_generation": self.hooks.generation,
+            "execution_status": conversation.state.execution_status.value,
+            "leaf_event_id": conversation.state.leaf_event_id,
+            "branch_sha256": _canonical_sha256(
+                [event.model_dump(mode="json") for event in events]
+            ),
+            "pending_actions": identities,
+            "settled_responses": [
+                self.settled_responses[key] for key in sorted(self.settled_responses)
+            ],
+        }
+
+    def verify_resume(self, conversation) -> None:
+        receipt = self.hooks.resume_receipt
+        try:
+            if (
+                not isinstance(receipt, dict)
+                or conversation.state.execution_status
+                != ConversationExecutionStatus.PAUSED
+                or not callable(self.hooks.authorize_resume)
+            ):
+                raise ValueError
+            responses = receipt["settled_responses"]
+            if not isinstance(responses, list):
+                raise TypeError
+            for response in responses:
+                if (
+                    not isinstance(response, dict)
+                    or set(response) != {"response_id", "input_tokens", "output_tokens"}
+                    or not isinstance(response["response_id"], str)
+                    or not response["response_id"]
+                    or any(
+                        type(response[key]) is not int or response[key] < 0
+                        for key in ("input_tokens", "output_tokens")
+                    )
+                    or response["response_id"] in self.settled_responses
+                ):
+                    raise ValueError
+                self.settled_responses[response["response_id"]] = dict(response)
+            expected = self.receipt(conversation)
+            # Canonical serialization also distinguishes bool from int. Do not
+            # let Python's True == 1 weaken generation or schema comparisons.
+            if json.dumps(receipt, sort_keys=True) != json.dumps(
+                expected, sort_keys=True
+            ):
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            raise SessionRecoveryRequired(
+                "Scheduling resume receipt is missing or does not match SDK state"
+            ) from None
+        if self.hooks.authorize_resume(json.loads(json.dumps(expected))) is not True:
+            raise SessionRecoveryRequired(
+                "Scheduling resume was not authorized by the product ledger"
+            )
 
 
 class ModelCallError(RuntimeError):
@@ -333,6 +500,7 @@ class GuardedLLM(LLM):
     _before: Callable[[int, int], object] = PrivateAttr()
     _after: Callable[[object, dict | None], None] = PrivateAttr()
     _stop: Callable[[], bool] = PrivateAttr()
+    _scheduling: _SchedulingRuntime | None = PrivateAttr(default=None)
 
     def _model_name_for_capabilities(self) -> str:
         model = super()._model_name_for_capabilities()
@@ -368,8 +536,9 @@ class GuardedLLM(LLM):
     async def aresolve_runtime_metadata(self, *, force: bool = False):
         return None
 
-    def bind(self, before, after, should_stop) -> None:
+    def bind(self, before, after, should_stop, scheduling=None) -> None:
         self._before, self._after, self._stop = before, after, should_stop
+        self._scheduling = scheduling
 
     def _guarded_request(self, call, mode, messages, tools, kwargs):
         if self._stop():
@@ -388,7 +557,12 @@ class GuardedLLM(LLM):
         estimate = len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) + 1024
         if estimate > self.max_input_tokens:
             raise ValueError("Conversation exceeds the configured input token bound")
-        reservation = self._before(estimate, self.max_output_tokens)
+        try:
+            reservation = self._before(estimate, self.max_output_tokens)
+        except SchedulerYield:
+            if self._scheduling is None:
+                raise
+            raise _AcceptedSchedulerYield(self._scheduling) from None
         try:
             response = call(messages=messages, tools=tools, **kwargs)
         except Exception as error:  # noqa: BLE001 -- providers expose heterogeneous exceptions
@@ -415,6 +589,8 @@ class GuardedLLM(LLM):
             # subtract it or assume a provider's cache discount.
             measured = {"input_tokens": input_tokens, "output_tokens": output_tokens}
         self._after(reservation, measured)
+        if self._scheduling is not None:
+            self._scheduling.record_response(response, measured)
         response.message = type(response.message).model_validate(
             _redact(
                 response.message.model_dump(mode="json"),
@@ -459,13 +635,24 @@ class ShellObservation(Observation):
 
 
 class _ShellExecutor(ToolExecutor):
-    def __init__(self, callback, stop):
-        self.callback, self.stop = callback, stop
+    def __init__(self, callback, stop, scheduling=None):
+        self.callback, self.stop, self.scheduling = callback, stop, scheduling
 
     def __call__(self, action, conversation=None):
         if self.stop():
             raise SessionStopped("Execution stopped before a shell action")
-        result = self.callback(action.command)
+        scheduling = self.scheduling
+        if scheduling is not None and scheduling.shell_with_action is not None:
+            if scheduling.active_action is None:
+                raise SessionRecoveryRequired("SDK shell action identity is missing")
+            try:
+                result = scheduling.shell_with_action(
+                    action.command, dict(scheduling.active_action)
+                )
+            except SchedulerYield:
+                raise _AcceptedSchedulerYield(scheduling) from None
+        else:
+            result = self.callback(action.command)
         return ShellObservation.from_text(
             json.dumps(result, ensure_ascii=False),
             exit_code=result.get("exit_code"),
@@ -483,7 +670,7 @@ class ShellTool(ToolDefinition[ShellAction, ShellObservation]):
             cls(
                 action_type=ShellAction,
                 observation_type=ShellObservation,
-                executor=_ShellExecutor(callback, stop),
+                executor=_ShellExecutor(callback, stop, _SCHEDULING.get(run_id)),
                 description=(
                     "Execute one bounded shell command in the isolated task container. "
                     "The current directory is /workspace. Each call starts a fresh shell. "
@@ -513,6 +700,54 @@ class _M1Agent(Agent):
     def get_all_llms(self):
         # Upstream's default excludes LLM subclasses, including GuardedLLM.
         yield self.llm
+
+    def _step(self, conversation, on_event, stream):
+        scheduling = _SCHEDULING.get(self.tools[0].params["run_id"])
+        if scheduling is not None and scheduling.maybe_pause(conversation):
+            return
+        super()._step(conversation, on_event, stream)
+        if scheduling is not None:
+            scheduling.maybe_pause(conversation)
+
+    def _execute_actions(self, conversation, action_events, on_event):
+        scheduling = _SCHEDULING.get(self.tools[0].params["run_id"])
+        if scheduling is None:
+            return super()._execute_actions(conversation, action_events, on_event)
+        # Upstream 1.60.1 prepares a whole batch before emitting observations.
+        # Keep its execution/finish semantics, but persist one result at a time
+        # so every yield boundary follows the previous tool's saved outcome.
+        for action in action_events:
+            if scheduling.maybe_pause(conversation):
+                return
+            # append_event stamps parent_id on a copy. Bind the persisted
+            # branch event rather than the pre-storage ActionEvent instance.
+            persisted_action = next(
+                event
+                for event in reversed(conversation.state.active_branch())
+                if event.id == action.id
+            )
+            scheduling.active_action = _action_identity(
+                persisted_action,
+                scheduling.session_id,
+                scheduling.hooks.generation,
+                scheduling.secret,
+            )
+            try:
+                super()._execute_actions(conversation, [action], on_event)
+            except _AcceptedSchedulerYield as signal:
+                if signal.runtime is not scheduling:
+                    raise
+                scheduling.pause(conversation)
+                return
+            finally:
+                scheduling.active_action = None
+            if (
+                conversation.state.execution_status
+                == ConversationExecutionStatus.FINISHED
+            ):
+                return
+            if scheduling.maybe_pause(conversation):
+                return
 
 
 class _M1Conversation(LocalConversation):
@@ -545,6 +780,8 @@ def run_session(
     role: str = "executor",
     on_finish: Callable[[str], None] | None = None,
     skill: dict | None = None,
+    scheduling: SessionScheduling | None = None,
+    shell_with_action: Callable[[str, dict], dict] | None = None,
 ) -> str:
     """Run/resume one SDK conversation; model credentials remain in this process.
 
@@ -553,11 +790,25 @@ def run_session(
     without its observation blocks SDK resume to prevent automatic replay.
     The caller verifies frozen Skill files and mounts them read-only at /skills;
     this adapter consumes only opaque instructions and container-relative names.
+
+    Scheduling is opt-in and returns ``yielded`` only after ``on_yield`` has
+    persisted an exact receipt. Its resume path additionally requires the
+    product's explicit ledger authorization. Unknown crash actions still block
+    ordinary resume. ``shell_with_action`` receives SDK identity when scheduling
+    is enabled; SchedulerYield is legal only before actual dispatch.
     """
     if role not in {"executor", "reviewer"}:
         raise ValueError("Only the executor and reviewer roles are supported")
     if role == "reviewer" and skill is not None:
         raise ValueError("Skills are supported only for the executor role")
+    if scheduling is not None and (
+        type(scheduling.generation) is not int or scheduling.generation < 0
+    ):
+        raise ValueError("Scheduling requires a nonnegative session generation")
+    if shell_with_action is not None and scheduling is None:
+        raise ValueError("SDK action identity requires the scheduling contract")
+    if scheduling is not None and resume and prompt is not None:
+        raise ValueError("Scheduling resume cannot append a new prompt")
     selected_skill = _runtime_skill(_redact(skill, api_key))
     if version("openhands-sdk") != SDK_VERSION:
         raise RuntimeError(f"OpenHands SDK must be pinned to {SDK_VERSION}")
@@ -582,6 +833,11 @@ def run_session(
         f"doonex:{run_id}" + (":reviewer" if role == "reviewer" else ""),
     )
     saved_path = Path(LocalConversation.get_persistence_dir(state_dir, conversation_id))
+    scheduling_runtime = (
+        _SchedulingRuntime(scheduling, str(conversation_id), api_key, shell_with_action)
+        if scheduling is not None
+        else None
+    )
     exists = (saved_path / "base_state.json").is_file()
     if resume != exists:
         raise ValueError("SDK resume flag does not match persisted conversation state")
@@ -612,7 +868,7 @@ def run_session(
             max_input_tokens=model["max_input_tokens"],
             max_output_tokens=model["max_output_tokens"],
         )
-        llm.bind(before_model, after_model, should_stop)
+        llm.bind(before_model, after_model, should_stop, scheduling_runtime)
         agent = _M1Agent(
             llm=llm,
             tools=[Tool(name=ShellTool.name, params={"run_id": run_id})],
@@ -659,6 +915,8 @@ def run_session(
         )
 
         _CALLBACKS[run_id] = (shell, should_stop, role)
+        if scheduling_runtime is not None:
+            _SCHEDULING[run_id] = scheduling_runtime
         conversation = None
         try:
             conversation = _M1Conversation(
@@ -687,12 +945,19 @@ def run_session(
                 original_on_event(type(event).model_validate(cleaned))
 
             conversation._on_event = safe_event
-            if resume and ConversationState.get_unmatched_actions(
-                conversation.state.active_branch()
-            ):
-                raise SessionRecoveryRequired(
-                    "An SDK action has no recorded outcome; reconcile it before resuming"
-                )
+            if resume:
+                if (
+                    scheduling_runtime is not None
+                    and conversation.state.execution_status
+                    != ConversationExecutionStatus.FINISHED
+                ):
+                    scheduling_runtime.verify_resume(conversation)
+                elif ConversationState.get_unmatched_actions(
+                    conversation.state.active_branch()
+                ):
+                    raise SessionRecoveryRequired(
+                        "An SDK action has no recorded outcome; reconcile it before resuming"
+                    )
             if prompt:
                 conversation.send_message(prompt)
             if should_stop():
@@ -704,6 +969,13 @@ def run_session(
                     != ConversationExecutionStatus.FINISHED
                 ):
                     conversation.run()
+            except _AcceptedSchedulerYield as signal:
+                if (
+                    scheduling_runtime is None
+                    or signal.runtime is not scheduling_runtime
+                ):
+                    raise
+                scheduling_runtime.pause(conversation)
             except Exception:
                 if should_stop():
                     with conversation._state:
@@ -713,6 +985,14 @@ def run_session(
                     return "paused"
                 raise
             status = conversation.state.execution_status.value
+            if (
+                status != "finished"
+                and scheduling_runtime is not None
+                and scheduling_runtime.yielded
+            ):
+                receipt = scheduling_runtime.receipt(conversation)
+                scheduling_runtime.hooks.on_yield(json.loads(json.dumps(receipt)))
+                return "yielded"
             if status == "finished" and on_finish is not None:
                 # Read persisted events, including a finish recorded just before
                 # a crash. Never publish an unfinished/paused model conclusion.
@@ -729,3 +1009,4 @@ def run_session(
             if conversation is not None:
                 conversation.close()
             _CALLBACKS.pop(run_id, None)
+            _SCHEDULING.pop(run_id, None)
