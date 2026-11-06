@@ -159,3 +159,46 @@ def test_two_projects_complete_isolated_reviewed_deliveries(
             ).json()["state"]
             == "completed_verified"
         )
+
+
+@pytest.mark.docker
+def test_budget_stop_keeps_review_handoff_diff_visible_without_verification(
+    settings, store, tmp_path, monkeypatch
+):
+    from test_worker import scripted_model
+
+    model = settings.model.model_copy(update={"model_id": "gpt-4.1-mini"})
+    settings = Settings(settings.home, settings.database_url, settings.token, model)
+    repo, _ = repository(tmp_path)
+    scripted_model(monkeypatch, ["printf 'answer = 42\\n' > hello.py"])
+    with TestClient(create_app(settings)) as client:
+        client.headers["Authorization"] = "Bearer " + settings.token
+        project = client.post("/api/projects", json={"path": str(repo)}).json()
+        created = client.post(
+            "/api/runs",
+            json={
+                "project_id": project["id"],
+                "workflow": "execute_review",
+                "prompt": "Fix fixture",
+                "checks": ["python -c 'from hello import answer; assert answer == 42'"],
+                "budget": {
+                    "max_calls": 2,
+                    "max_tokens": 100000,
+                    "max_cost_usd": 2,
+                    "max_seconds": 600,
+                },
+            },
+        )
+        assert created.status_code == 200, created.text
+        run = created.json()
+        Worker(settings).run(once=True)
+        final = store.get(run["id"])
+        assert final["state"] == "budget_exceeded"
+        assert final["evidence"] is None and final["review"] is None
+        diff = client.get(
+            f"/api/runs/{run['id']}/diff?project_id={project['id']}"
+        ).json()
+        assert diff["source"] == "review_handoff" and diff["verified"] is False
+        assert "+answer = 42" in diff["diff"]
+        assert diff["snapshot_digest"] == final["handoff"]["snapshot_digest"]
+        assert store.get(run["id"])["state"] == "budget_exceeded"

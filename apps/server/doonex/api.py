@@ -459,9 +459,23 @@ def create_app(settings=None):
             content = _read_artifact(
                 run_directory(settings, run["id"]) / "evidence", "diff.patch"
             )
-            return {"diff": content.decode("utf-8", errors="replace")}
+            return {
+                "diff": content.decode("utf-8", errors="replace"),
+                "source": "evidence",
+            }
         except OSError:
-            return {"diff": "尚未生成可读取的最终差异"}
+            if run.get("handoff") and (run.get("review_integrity") or {}).get("valid"):
+                content = _read_artifact(
+                    run_directory(settings, run["id"]) / "review" / "context",
+                    "diff.patch",
+                )
+                return {
+                    "diff": content.decode("utf-8", errors="replace"),
+                    "source": "review_handoff",
+                    "snapshot_digest": run["handoff"]["snapshot_digest"],
+                    "verified": False,
+                }
+            return {"diff": "尚未生成可读取的最终差异", "source": "unavailable"}
 
     @app.get("/api/runs/{run_id}/artifact", dependencies=auth)
     def artifact(run_id: str, name: str):
