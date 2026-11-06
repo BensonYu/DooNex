@@ -1053,6 +1053,47 @@ class Community:
 def install_community_routes(app, settings, store, auth):
     service = Community(settings, store)
 
+    def evidence_service():
+        from doonex.community_evidence import CommunityEvidence
+
+        return CommunityEvidence(settings, store, community=service)
+
+    def public_releases():
+        releases = service.releases()
+        evidence = evidence_service().public_evidence()
+        for release in releases:
+            matching = [e for e in evidence if e["release_id"] == release["id"]]
+            release["quality"] = {
+                "controller_verified": bool(matching),
+                "evidence_count": len(matching),
+                "eligible_evidence_count": sum(e["eligible"] for e in matching),
+            }
+        return releases
+
+    def public_release(release_id):
+        # First enforce the exact release lookup so missing IDs remain 404.
+        release = service.release(release_id)
+        matching = [
+            e
+            for e in evidence_service().public_evidence()
+            if e["release_id"] == release["id"]
+        ]
+        release["quality"] = {
+            "controller_verified": bool(matching),
+            "evidence_count": len(matching),
+            "eligible_evidence_count": sum(e["eligible"] for e in matching),
+        }
+        return release
+
+    def public_site():
+        value = service.public_site()
+        groups = evidence_service().leaderboard()["groups"]
+        return {
+            **value,
+            "verified_leaderboard": groups,
+            "leaderboard_reason": None if groups else "no_eligible_controller_evidence",
+        }
+
     def call(function, *args, **kwargs):
         try:
             return function(*args, **kwargs)
@@ -1145,15 +1186,15 @@ def install_community_routes(app, settings, store, auth):
 
     @app.get("/api/community/public/site")
     def site():
-        return call(service.public_site)
+        return call(public_site)
 
     @app.get("/api/community/public/releases")
     def releases():
-        return {"releases": call(service.releases)}
+        return {"releases": call(public_releases)}
 
     @app.get("/api/community/public/releases/{release_id}")
     def release(release_id: str):
-        return call(service.release, release_id)
+        return call(public_release, release_id)
 
     @app.post("/api/community/public/releases/{release_id}/distributions")
     def distribute(release_id: str, body: DistributionInput):

@@ -184,7 +184,15 @@ def test_installed_publication_download_and_withdrawal_are_separate_from_workben
         release = checked("POST", root + "/publish", publish, admin)
         assert release["identity_status"] == "self_reported"
         public = "/api/community/public/releases/" + release["id"]
-        assert checked("GET", public) == release
+        shown = checked("GET", public)
+        assert shown == {
+            **release,
+            "quality": {
+                "controller_verified": False,
+                "evidence_count": 0,
+                "eligible_evidence_count": 0,
+            },
+        }
         distribution_body = {"request_id": str(uuid4())}
         distribution = checked("POST", public + "/distributions", distribution_body)
         duplicate = checked("POST", public + "/distributions", distribution_body)
@@ -266,4 +274,63 @@ def test_installed_publication_download_and_withdrawal_are_separate_from_workben
         )
         assert secret in json.dumps(
             connection.execute("SELECT data FROM library_versions").fetchall()
+        )
+
+
+from test_community_evidence import product as product  # noqa: PLC0414 - pytest fixture export
+
+
+def test_public_site_release_and_evidence_agree_without_private_reads(
+    product, request_data, monkeypatch
+):
+    from doonex.community_evidence import WithdrawEvidenceInput
+    from test_community_evidence import prepare, publication, synthetic_batch
+
+    service, release, skill = product
+    batch = synthetic_batch(product, request_data, monkeypatch)
+    preview = prepare(service, release, skill, batch)
+    published = publication(service, preview)
+    path = "/api/community/public/releases/" + release["id"]
+    with TestClient(create_app(service.settings)) as client:
+        # Public requests must use only frozen public projections after publication.
+        def forbidden(*args, **kwargs):
+            raise AssertionError("Public route read private Arena/Run data")
+
+        from doonex.arena import Arena
+        from doonex.store import Store
+
+        monkeypatch.setattr(Arena, "get", forbidden)
+        monkeypatch.setattr(Arena, "detail", forbidden)
+        monkeypatch.setattr(Store, "get", forbidden)
+        detail = client.get(path).json()
+        assert detail["quality"] == {
+            "controller_verified": True,
+            "evidence_count": 1,
+            "eligible_evidence_count": 1,
+        }
+        assert (
+            client.get("/api/community/public/releases").json()["releases"][0][
+                "quality"
+            ]
+            == detail["quality"]
+        )
+        site = client.get("/api/community/public/site").json()
+        groups = client.get("/api/community/public/leaderboard").json()["groups"]
+        assert (
+            site["verified_leaderboard"] == groups
+            and site["leaderboard_reason"] is None
+        )
+        assert len(groups) == 1 and len(groups[0]["entries"]) == 1
+        assert client.get("/api/community/public/evidence").status_code == 200
+        usage = client.get(path + "/usage")
+        assert usage.status_code == 200 and "run_id" not in usage.text
+        service.withdraw(
+            published["id"],
+            WithdrawEvidenceInput(expected_revision=published["revision"]),
+        )
+        assert client.get(path).json()["quality"]["evidence_count"] == 0
+        site = client.get("/api/community/public/site").json()
+        assert (
+            site["verified_leaderboard"] == []
+            and site["leaderboard_reason"] == "no_eligible_controller_evidence"
         )

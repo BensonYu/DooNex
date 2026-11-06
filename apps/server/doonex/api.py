@@ -745,6 +745,9 @@ def create_app(settings=None):
     from doonex.community import install_community_routes
 
     install_community_routes(app, settings, store, auth)
+    from doonex.community_evidence import install_community_evidence_routes
+
+    install_community_evidence_routes(app, settings, store, auth)
 
     static_dir = Path(__file__).resolve().parents[2] / "web" / "dist"
     if static_dir.is_dir():
