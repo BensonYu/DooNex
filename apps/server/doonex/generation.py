@@ -371,7 +371,8 @@ class Generation:
                 profile.model_dump() for profile in ModelRegistry(self.settings).list()
             ],
             "projects": [
-                {k: p[k] for k in ("id", "name")} for p in self.store.list_projects()
+                {"id": p["id"], "name": p.get("name", Path(p["path"]).name)}
+                for p in self.store.list_projects()
             ],
         }
 
@@ -557,7 +558,10 @@ class Generation:
             "schema_version": SCHEMA_VERSION,
             "policy": POLICY,
             "input": body.model_dump(),
-            "project": {k: project[k] for k in ("id", "name")},
+            "project": {
+                "id": project["id"],
+                "name": project.get("name", Path(project["path"]).name),
+            },
             "parent": parent,
             "parent_manifest": identity,
             "license": license_receipt,
