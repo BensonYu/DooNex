@@ -466,6 +466,27 @@ def create_app(settings=None):
                 workspace_ok = True
         except ValueError as exc:
             notes.append(str(exc))
+        if run["request"].get("purpose") == "skill_generation":
+            from doonex.generation import Generation
+
+            try:
+                executor = run.get("assignments", {}).get("executor", {})
+                prepared = bool(
+                    run.get("baseline_digest")
+                    or executor.get("started_at")
+                    or run.get("generation_output")
+                    or run["usage"]["calls"]
+                )
+                Generation(settings, store).validate_run(
+                    run, directory, require_workspace=prepared
+                )
+                # first_started_at precedes atomic baseline/workspace publish.
+                # Verified absence before any model action can safely resume
+                # that same Run's preparation without inventing a new attempt.
+                workspace_ok = True
+            except (ValueError, OSError, KeyError):
+                workspace_ok = False
+                notes.append("生成来源、工具策略或完整父基线校验失败")
         # Read-only container reconciliation; no code is started by this route.
         result = subprocess.run(
             [
@@ -512,10 +533,18 @@ def create_app(settings=None):
             raise ValueError("请核对未决动作并明确确认后续接")
         if elapsed(run) >= run["request"]["budget"]["max_seconds"]:
             raise ValueError("原运行的时长预算已用尽；请保留当前结果并创建新任务")
+        # A completed SDK finish can precede the product completion record.
+        # Keep that original generation session when no external action is
+        # unknown; its persisted finish must recover without another request.
+        preserve_generation_session = (
+            run["request"].get("purpose") == "skill_generation"
+            and not report["pending_actions"]
+        )
+        reset_session = uncertain and not preserve_generation_session
         with store.locked(run["id"], dispatch=True) as (c, current):
             if current["state"] not in {"paused", "interrupted"}:
                 raise ValueError("运行状态已变化")
-            if uncertain:
+            if reset_session:
                 current["session_generation"] = current.get("session_generation", 0) + 1
                 current["resume_session"] = False
                 c.execute(
@@ -528,7 +557,7 @@ def create_app(settings=None):
                 current.get("active_assignment")
             )
             if active and active.get("state") != "completed":
-                if uncertain:
+                if reset_session:
                     active["session_generation"] = (
                         active.get("session_generation", 0) + 1
                     )
@@ -641,6 +670,11 @@ def create_app(settings=None):
     @app.post("/api/runs/{run_id}/adoption-check", dependencies=auth)
     def adoption(run_id: str):
         run = load_run(run_id)
+        if run["request"].get("purpose") == "skill_generation":
+            return {
+                "safe": False,
+                "reason": "生成候选须经 Skills 预览与导入审核；没有 Git 采纳目标",
+            }
         target = run["request"]["repo_path"]
         if git(target, "rev-parse", "HEAD") != run["request"]["base_commit"]:
             return {"safe": False, "reason": "目标分支已变化，请手动比较与整合"}
@@ -693,6 +727,9 @@ def create_app(settings=None):
             else "补丁存在冲突，禁止自动覆盖",
         }
 
+    from doonex.generation import install_generation_routes
+
+    install_generation_routes(app, settings, store, auth)
     from doonex.discovery import install_discovery_routes
 
     install_discovery_routes(app, settings, store, auth)

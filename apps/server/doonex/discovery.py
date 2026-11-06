@@ -1028,6 +1028,22 @@ def check_license(files):
             )
         ):
             reasons.append("restrictive_file_declaration")
+        # Conventional copyright identities are not a license override. A
+        # recognizable prohibition anywhere in a UTF-8 file makes automated
+        # import ambiguous even when the complete standard body also appears.
+        # This is a conservative text gate, not a natural-language rights proof.
+        if re.search(
+            r"\b(?:re[- ]?distribution|distribut(?:e|ion|ing)|copying|modification|"
+            r"commercial\s+use)\s+(?:is\s+|are\s+)?(?:strictly\s+)?"
+            r"(?:prohibited|forbidden|banned|not\s+(?:allowed|permitted))\b|"
+            r"\b(?:do\s+not|must\s+not|may\s+not|cannot)\s+"
+            r"(?:(?:re[- ]?)?distribute|copy|modify(?!\s+the\s+licen[cs]e\b)|sell)\b|"
+            r"\bno\s+(?:re[- ]?distribution|copying|modification)\b|"
+            r"禁止(?:复制|修改|分发|再分发|商用)",
+            text,
+            re.IGNORECASE,
+        ):
+            reasons.append("restrictive_file_declaration")
         declarations = re.findall(
             r"SPDX-License-Identifier\s*:\s*([^\r\n]+)", text, flags=re.IGNORECASE
         )

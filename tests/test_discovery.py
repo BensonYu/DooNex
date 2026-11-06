@@ -1354,3 +1354,41 @@ def test_populated_apache_appendix_does_not_relax_any_other_terms(change):
             "2026 Example Author, Inc.\nLicense: proprietary",
         )
     assert not complete_apache(text)
+
+
+@pytest.mark.parametrize("license_kind", ["apache", "mit"])
+@pytest.mark.parametrize(
+    "prohibition",
+    [
+        "Distribution prohibited.",
+        "Redistribution is strictly forbidden.",
+        "Distribution not permitted.",
+        "Do not distribute.",
+        "You may not modify this work.",
+        "No copying.",
+        "禁止分发。",
+    ],
+)
+@pytest.mark.parametrize("location", ["copyright", "other_file"])
+def test_explicit_prohibition_cannot_hide_in_identity_or_other_file(
+    license_kind, prohibition, location
+):
+    from doonex.discovery import MIT_BODY, check_license
+
+    owner = "2026 Example Authors."
+    if location == "copyright":
+        owner += " " + prohibition
+    text = (
+        APACHE.decode().replace("[yyyy] [name of copyright owner]", owner)
+        if license_kind == "apache"
+        else "MIT License\nCopyright " + owner + "\n\n" + MIT_BODY
+    )
+    files = {
+        "SKILL.md": FileContent(b"---\nlicense: LICENSE\n---\nRead carefully.", 0o644),
+        "LICENSE": FileContent(text.encode(), 0o644),
+    }
+    if location == "other_file":
+        files["README.md"] = FileContent(prohibition.encode(), 0o644)
+    result = check_license(files)
+    assert result["status"] == "preview_only"
+    assert "restrictive_file_declaration" in result["reasons"]

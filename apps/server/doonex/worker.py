@@ -49,7 +49,11 @@ def get_workspace(run, directory):
 
     return Workspace(
         path=directory / "workspace",
-        repository=Path(run["request"]["repo_path"]),
+        repository=(
+            None
+            if run["request"].get("purpose") == "skill_generation"
+            else Path(run["request"]["repo_path"])
+        ),
         base_commit=run["request"]["base_commit"],
         baseline_path=directory / "baseline" if run.get("baseline_digest") else None,
         baseline_digest=run.get("baseline_digest"),
@@ -149,6 +153,11 @@ class Worker:
         from doonex.library import Library
 
         library = Library(self.settings, self.store)
+        generation_service = None
+        if request.get("purpose") == "skill_generation":
+            from doonex.generation import Generation
+
+            generation_service = Generation(self.settings, self.store)
         arena = None
         if request.get("arena"):
             from doonex.arena import Arena
@@ -176,6 +185,8 @@ class Worker:
                     current["first_started_at"] = now()
                 self.store.event(run_id, "running", {}, c)
             self.fence()
+            if generation_service:
+                generation_service.validate_run(self.store.get(run_id), directory)
             if not all(role_keys.values()):
                 raise ValueError("worker 缺少运行所引用的模型凭据环境变量")
             skill_context = (
@@ -211,7 +222,13 @@ class Worker:
                         "verifier_digest",
                     )
                 }
-            if not (directory / "workspace").exists():
+            if generation_service:
+                workspace = generation_service.prepare_workspace(
+                    self.store.get(run_id), directory
+                )
+                with self.store.locked(run_id, self.owner) as (_, current):
+                    current["baseline_digest"] = workspace.baseline_digest
+            elif not (directory / "workspace").exists():
                 if task_context:
                     from doonex.workspace import manifest, manifest_digest, write_files
 
@@ -316,6 +333,8 @@ class Worker:
                     ledger.settle(reservation, usage)
 
                 def shell(command, action_identity=None):
+                    if generation_service:
+                        raise PermissionViolation("候选生成没有 shell 工具权限")
                     self.fence()
                     if role_stop():
                         raise Halt("运行或角色已停止派发新动作")
@@ -418,6 +437,8 @@ class Worker:
                     + "\n预先约定的验收命令：\n"
                     + "\n".join(request.get("visible_checks", request["checks"]))
                 )
+                if generation_service:
+                    prompt = None if resume else request["prompt"]
                 if role == "reviewer" and not resume:
                     prompt = (
                         "只读审查执行者的固定代码快照。原始任务：\n"
@@ -428,7 +449,7 @@ class Worker:
                         "/workspace/diff.patch、/workspace/handoff.json。"
                         "依照系统格式用 finish 返回结构化审查，不做修改。"
                     )
-                if generation and not resume:
+                if generation and not resume and not generation_service:
                     prompt = (
                         (prompt or request["prompt"])
                         + "\n这是经用户确认后的中断续接。上下文已保留。先检查现有状态，勿盲目重放上次动作。验收条件：\n"
@@ -476,6 +497,11 @@ class Worker:
                     role=role,
                     on_finish=finishes.append,
                     **(
+                        {"execution_policy": "finish_only"}
+                        if generation_service
+                        else {}
+                    ),
+                    **(
                         {"scheduling": scheduling, "shell_with_action": shell}
                         if scheduling
                         else {}
@@ -521,10 +547,28 @@ class Worker:
             if run.get("phase", "execution") == "execution":
                 executor = run.get("assignments", {}).get("executor", {})
                 if executor.get("state") != "completed":
-                    execute_role("executor", workspace.path)
-                    # Persist completion before preparing another role. A crash
-                    # here must not rerun a completed executor.
-                    complete_role("executor")
+                    finish_message = execute_role("executor", workspace.path)
+                    completion = {}
+                    if generation_service:
+                        self.fence()
+                        completion["generation_output"] = (
+                            generation_service.save_output(
+                                self.store.get(run_id), directory, finish_message
+                            )
+                        )
+                    # Persist output binding and completion together. The SDK
+                    # also retains finish for recovery before this transaction.
+                    complete_role("executor", **completion)
+                if generation_service:
+                    self.fence()
+                    candidate = generation_service.build_candidate(
+                        self.store.get(run_id), directory
+                    )
+                    with self.store.locked(run_id, self.owner) as (_, current):
+                        guard(current)
+                        current["generation_candidate"] = candidate
+                    if not candidate["valid"]:
+                        raise ValueError("生成输出未通过候选结构检查；保留原始输出")
                 if review_required:
                     handoff = Review.prepare(workspace, directory, run_id)
                     if not Review.inspect(workspace, directory, handoff)["valid"]:
@@ -621,7 +665,16 @@ class Worker:
 
             remaining = max(0.1, request["budget"]["max_seconds"] - elapsed(current))
             evidence_path = directory / "evidence"
-            if evidence_path.exists():
+            saved_generation_evidence = None
+            if generation_service and run.get("evidence"):
+                saved = run["evidence"]
+                saved_inspection = Evidence.inspect(
+                    workspace, directory, expected_report_sha256=saved["report_sha256"]
+                )
+                if not saved_inspection.get("valid"):
+                    raise ValueError("已绑定的生成交付证据失效；禁止自动重新生成")
+                saved_generation_evidence = saved
+            if evidence_path.exists() and saved_generation_evidence is None:
                 # Preserve incomplete prior validation; never silently overwrite it.
                 archive = directory / ("evidence-attempt-" + str(time.time_ns()))
                 evidence_path.rename(archive)
@@ -704,7 +757,7 @@ class Worker:
                         )
                         raise
 
-            report = Evidence.capture(
+            report = saved_generation_evidence or Evidence.capture(
                 workspace,
                 directory,
                 request["checks"],
@@ -752,6 +805,16 @@ class Worker:
                     else {}
                 ),
             )
+            final_candidate = None
+            if generation_service:
+                if not inspection.get("valid"):
+                    raise ValueError("生成候选的通用交付证据无效")
+                self.fence()
+                final_candidate = generation_service.finalize_candidate(
+                    self.store.get(run_id), directory, report
+                )
+                if not final_candidate["valid"]:
+                    raise ValueError("生成候选的完整结构证据无效")
             current = self.store.get(run_id)
             if current["state"] != "verifying" or verify_stop():
                 raise Halt("验证期间收到停止请求或时长用尽")
@@ -805,6 +868,11 @@ class Worker:
                     evidence=report,
                     ended_at=now(),
                 )
+                if generation_service:
+                    current["generation_candidate"] = final_candidate
+                    current["reason"] = (
+                        "候选已生成并保留结构证据，等待人工审核与独立评测"
+                    )
                 if arena:
                     current["arena_outcome"] = {
                         "classification": "passed" if verified else "failed",
