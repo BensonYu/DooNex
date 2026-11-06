@@ -179,14 +179,14 @@ export type BackgroundAuthorization = {
   id: string;
   name: string;
   state: 'draft' | 'enabled' | 'consumed' | 'disabled';
-  revision: number;
+  revision: string;
   created_at: string;
   updated_at: string;
   enabled_at: string | null;
   disabled_at: string | null;
   consumed_at: string | null;
   evaluation_id: string | null;
-  evaluation?: Pick<ArenaEvaluation, 'id' | 'state' | 'reason' | 'usage'> | null;
+  evaluation?: Pick<ArenaEvaluation, 'id' | 'state' | 'reason' | 'usage'> & { yielded_runs?: number } | null;
   date: string;
   window_start: string;
   window_end: string;
@@ -200,7 +200,7 @@ export type BackgroundAuthorization = {
     model_profile: { id: string; name: string; revision: string };
     environment: unknown;
   };
-  history: { event: string; at: string; revision?: number; [key: string]: unknown }[];
+  history: { event: string; at: string; [key: string]: unknown }[];
 };
 export type BackgroundDayUsage = { calls: number; tokens: number; seconds: number; cost_usd: number | null; metered_cost_usd: number };
 export type BackgroundDay = {
