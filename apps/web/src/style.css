@@ -261,6 +261,26 @@ div.notice:has(> button) { display: flex; justify-content: space-between; align-
 .review-form .button-row { margin-top: 18px; }
 .frozen-skill { margin-bottom: 24px; border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; }
 .frozen-skill dd { overflow-wrap: anywhere; }
+.discovery-heading { margin-top: 30px; align-items: center; }
+.discovery-heading h2 { margin: 0; }
+.discovery-layout { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 24px; margin-top: 22px; }
+.discovery-records { min-width: 0; border-right: 1px solid var(--line); padding-right: 16px; max-height: 620px; overflow-y: auto; }
+.discovery-detail, .discovery-detail dd { min-width: 0; overflow-wrap: anywhere; }
+.discovery-detail > .section-heading { align-items: center; flex-wrap: wrap; }
+.discovery-detail > .section-heading h3 { margin: 0; }
+.discovery-detail > label { margin-top: 24px; }
+.discovery-detail .skill-content { margin-top: 18px; padding-top: 14px; }
+.discovery-preview, .discovery-confirm { border-top: 1px solid var(--line); margin-top: 24px; padding-top: 20px; }
+.discovery-preview h3, .discovery-preview h4 { margin-bottom: 14px; }
+.discovery-preview .skill-content > details + details { margin-top: 16px; }
+.discovery-confirm .checkbox-label { margin: 16px 0; }
+.discovery-confirm .checkbox-label span { min-width: 0; overflow-wrap: anywhere; }
+.discovery-detail .notice p { margin-bottom: 12px; }
+@media (max-width: 800px) {
+  .discovery-layout { grid-template-columns: 1fr; }
+  .discovery-records { border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 16px; max-height: 300px; }
+  .discovery-heading { flex-wrap: wrap; }
+}
 .evaluation-nav { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 8px; margin-bottom: 24px; }
 .evaluation-nav button { display: flex; flex-direction: column; align-items: flex-start; text-align: left; gap: 7px; white-space: normal; min-width: 210px; max-width: 280px; flex-shrink: 0; }
 .evaluation-nav button.selected { border-color: #9cb0df; background: #fff; }

@@ -1,11 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
-import { Api, type ArenaEvaluation, type ArenaRecommendation, type ModelConfig, type RecommendationPosition, type Run, type SkillMetadata, type SkillVersion } from './api';
+import { Api, ApiError, type ArenaEvaluation, type ArenaRecommendation, type ModelConfig, type RecommendationPosition, type Run, type SkillDiscovery, type SkillMetadata, type SkillVersion } from './api';
 
 export const skillReady = (skill: SkillVersion) => skill.review_status === 'approved' && skill.integrity.valid;
 const reviewNames = { pending: '待审核', approved: '已批准', rejected: '已拒绝' };
 const licenseNames: Record<SkillMetadata['license_status'], string> = { unknown: '许可未知', declared: '已声明许可', verified: '许可已核对', restricted: '限制使用' };
 const lines = (text: string) => text.split('\n').map((item) => item.trim()).filter(Boolean);
-const when = (value: string) => new Date(value).toLocaleString('zh-CN', { hour12: false });
+const when = (value: string | number) => {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '未知' : date.toLocaleString('zh-CN', { hour12: false });
+};
 const recommendationPositions: Record<RecommendationPosition, string> = { reliable: '可靠优先', cost: '成本优先', speed: '速度优先' };
 const modelIdentity = (model: ModelConfig) => JSON.stringify(Object.entries(model).sort(([left], [right]) => left.localeCompare(right)));
 export const sameModelConfig = (left: ModelConfig, right: ModelConfig) => modelIdentity(left) === modelIdentity(right);
@@ -70,6 +73,150 @@ export function FrozenSkill({ run }: { run: Run }) {
   </details>;
 }
 
+const discoveryNames: Record<SkillDiscovery['status'], string> = {
+  scanning: '发现中', ready: '候选已冻结', previewing: '预览中', preview_ready: '预览已保存',
+  importing: '导入中', imported: '已导入', failed: '失败', interrupted: '中断待核查',
+};
+const requestNames: Record<SkillDiscovery['requests'][number]['status'], string> = { reserved: '已预留', completed: '已完成', failed: '失败', unknown: '结果未知' };
+const bytes = (value: number) => `${value.toLocaleString()} bytes`;
+const validDeclarations = (items: string[]) => items.length <= 100 && items.every((item) => item.length <= 512 && !/[\x00-\x1f\x7f]/.test(item));
+
+function GithubDiscovery({ api, onImported }: { api: Api; onImported: (skill: SkillVersion) => void }) {
+  const [repository, setRepository] = useState('');
+  const [ref, setRef] = useState('main');
+  const [prefix, setPrefix] = useState('');
+  const [records, setRecords] = useState<SkillDiscovery[]>([]);
+  const [selectedId, setSelectedId] = useState('');
+  const [candidateId, setCandidateId] = useState('');
+  const [scope, setScope] = useState('');
+  const [permissions, setPermissions] = useState('');
+  const [confirmSource, setConfirmSource] = useState(false);
+  const [confirmLicense, setConfirmLicense] = useState(false);
+  const [busy, setBusy] = useState('');
+  const [error, setError] = useState('');
+  const [loaded, setLoaded] = useState(false);
+  const [needsRead, setNeedsRead] = useState(false);
+  const operation = useRef({ generation: 0, controller: null as AbortController | null });
+  const selected = records.find((record) => record.id === selectedId);
+  const candidate = selected?.candidates.find((item) => item.id === candidateId);
+  const preview = selected?.preview?.candidate_id === candidateId ? selected.preview : null;
+  const mutable = !needsRead && (selected?.status === 'ready' || selected?.status === 'preview_ready');
+  const resetConfirmation = () => { setConfirmSource(false); setConfirmLicense(false); setScope(''); setPermissions(''); };
+  const save = (record: SkillDiscovery) => setRecords((old) => [record, ...old.filter((item) => item.id !== record.id)]);
+  const show = (record: SkillDiscovery) => {
+    save(record); setSelectedId(record.id);
+    setCandidateId(record.imported?.candidate_id ?? record.preview?.candidate_id ?? record.candidates[0]?.id ?? '');
+    resetConfirmation(); setNeedsRead(false);
+  };
+  const perform = async (kind: string, action: (signal: AbortSignal, current: () => boolean) => Promise<void>) => {
+    operation.current.controller?.abort();
+    const controller = new AbortController(), generation = ++operation.current.generation;
+    operation.current.controller = controller;
+    const current = () => !controller.signal.aborted && operation.current.generation === generation;
+    setBusy(kind); setError('');
+    try { await action(controller.signal, current); }
+    catch (error) {
+      if (!current()) return;
+      setError(error instanceof Error ? error.message : String(error));
+      if (['create', 'preview', 'import'].includes(kind)) { setNeedsRead(true); resetConfirmation(); }
+      if (error instanceof ApiError && error.discoveryId) {
+        try {
+          const record = await api.get<SkillDiscovery>(`/skills/discoveries/${encodeURIComponent(error.discoveryId)}`, controller.signal);
+          if (current()) show(record);
+        } catch { /* Keep the original failure; the user can read saved receipts explicitly. */ }
+      }
+    } finally { if (current()) { setBusy(''); operation.current.controller = null; } }
+  };
+  const loadRecords = () => perform('list', async (signal, current) => {
+    const result = await api.get<{ discoveries: SkillDiscovery[] }>('/skills/discoveries', signal);
+    if (!current()) return;
+    setRecords(result.discoveries); setLoaded(true);
+    const record = result.discoveries.find((item) => item.id === selectedId) ?? result.discoveries[0];
+    if (record) show(record);
+    else { setSelectedId(''); setCandidateId(''); resetConfirmation(); setNeedsRead(false); }
+  });
+  useEffect(() => {
+    void loadRecords();
+    return () => { operation.current.generation += 1; operation.current.controller?.abort(); };
+  }, [api]);
+
+  return <details className="import-panel discovery-panel">
+    <summary>从公开 GitHub 仓库发现 Skill</summary>
+    <p className="field-help">一次读取一个公开仓库的有限目录，解析后固定完整提交。发现与导入不调用模型、不执行上游脚本；新版本仍须人工审核。</p>
+    <form onSubmit={(event) => { event.preventDefault(); if (busy || needsRead) return; void perform('create', async (signal, current) => {
+      const record = await api.post<SkillDiscovery>('/skills/discoveries', { repository: repository.trim(), ref: ref.trim(), prefix: prefix.trim() }, signal);
+      if (current()) { show(record); setLoaded(true); }
+    }); }}>
+      <div className="settings-grid"><div><label htmlFor="discovery-repository">公开仓库（owner/repo）</label><input id="discovery-repository" value={repository} onChange={(event) => setRepository(event.target.value)} required pattern="[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+" maxLength={201} placeholder="owner/repo" autoComplete="off" spellCheck={false} /></div>
+        <div><label htmlFor="discovery-ref">分支、tag 或完整 commit</label><input id="discovery-ref" value={ref} onChange={(event) => setRef(event.target.value)} required maxLength={255} autoComplete="off" spellCheck={false} /></div></div>
+      <label htmlFor="discovery-prefix">仓库内目录（可选）</label><input id="discovery-prefix" value={prefix} onChange={(event) => setPrefix(event.target.value)} maxLength={1024} placeholder="skills/example" autoComplete="off" spellCheck={false} />
+      <div className="form-footer"><span className="muted small">只使用公开 GitHub API；不读取 GitHub 登录或模型凭据。</span><button className="primary" disabled={!!busy || needsRead} type="submit">{busy === 'create' ? '正在有限发现…' : '开始一次有限发现'}</button></div>
+    </form>
+    <div className="section-heading discovery-heading"><h2>已保存的发现回执</h2><button type="button" className="quiet compact" disabled={!!busy} onClick={() => { void loadRecords(); }}>读取已保存回执</button></div>
+    <p className="field-help">读取回执只访问本机记录。页面中止或离开不代表服务端操作已经停止；未知结果须核查原回执，不自动重试。</p>
+    {error && <p className="notice error" role="alert">{error}</p>}
+    {needsRead && <p className="warning-text small" role="status">上次写操作尚未核对，请先读取已保存回执，再决定后续操作。</p>}
+    {busy && <p className="muted small" role="status">{busy === 'list' || busy === 'detail' || busy === 'open' ? '正在读取本机记录…' : '操作进行中，结果将保存在原回执…'}</p>}
+    {loaded && !records.length && <p className="muted small">尚无发现回执。</p>}
+    {!!records.length && <div className="discovery-layout"><nav className="discovery-records" aria-label="GitHub 发现回执">{records.map((record) => <button key={record.id} type="button" className={`profile-item ${record.id === selectedId ? 'selected' : ''}`} aria-current={record.id === selectedId ? 'page' : undefined} onClick={() => {
+      setSelectedId(record.id); setCandidateId(record.imported?.candidate_id ?? record.preview?.candidate_id ?? record.candidates[0]?.id ?? ''); resetConfirmation();
+      void perform('detail', async (signal, current) => {
+        const next = await api.get<SkillDiscovery>(`/skills/discoveries/${encodeURIComponent(record.id)}`, signal);
+        if (current() && next.id === record.id) show(next);
+      });
+    }}><strong>{record.input.repository}</strong><span>{record.input.ref} · {record.input.prefix || '仓库根目录'}</span><small>{discoveryNames[record.status]} · {when(record.created_at)}</small><code>{record.id}</code></button>)}</nav>
+      {selected && <section className="discovery-detail" aria-label="GitHub 发现详情">
+        <div className="section-heading"><h3>{discoveryNames[selected.status]}</h3><button type="button" className="compact" disabled={!!busy} onClick={() => { void perform('detail', async (signal, current) => {
+          const next = await api.get<SkillDiscovery>(`/skills/discoveries/${encodeURIComponent(selected.id)}`, signal);
+          if (current() && next.id === selected.id) show(next);
+        }); }}>读取此回执</button></div>
+        <p className="small path-text">回执 <code>{selected.id}</code> · 更新于 {when(selected.updated_at)}<br />修订 <code>{selected.revision}</code></p>
+        {selected.error && <p className="notice error" role="alert">操作未完成：<code>{selected.error.code}</code>。原请求消耗和未知预留仍保留。</p>}
+        {['scanning', 'previewing', 'importing', 'interrupted'].includes(selected.status) && <p className="warning-text small">此记录尚无已确认的完整结果。可读取保存状态核查；页面不会重放操作。</p>}
+        <dl className="config-list"><div><dt>原始定位</dt><dd>{selected.input.repository} · {selected.input.ref} · {selected.input.prefix || '仓库根目录'}</dd></div>
+          {selected.source && <><div><dt>固定 commit</dt><dd><code>{selected.source.commit}</code></dd></div><div><dt>固定树</dt><dd>root <code>{selected.source.root_tree}</code><br />目录 <code>{selected.source.prefix_tree}</code></dd></div><div><dt>来源身份</dt><dd>{selected.source.repository} · GitHub ID {selected.source.repository_id}<br />解析于 {when(selected.source.resolved_at)} · API {selected.source.api_version}</dd></div></>}
+          <div><dt>请求用量</dt><dd>已用 {selected.budget.requests_used} / {selected.budget.max_requests}，剩余 {selected.budget.remaining_requests} 次</dd></div>
+          <div><dt>接收字节</dt><dd>已知 {bytes(selected.budget.bytes_used)} · 未决预留 {bytes(selected.budget.bytes_reserved)}<br />剩余 {bytes(selected.budget.remaining_bytes)} / 上限 {bytes(selected.budget.max_bytes)}</dd></div>
+          <div><dt>GitHub 来源限额</dt><dd>{selected.source_rate_limit ? <>剩余 {selected.source_rate_limit.remaining ?? '未知'} 次 · 重置 {selected.source_rate_limit.reset == null ? '未知' : when(selected.source_rate_limit.reset * 1000)}</> : '尚无来源限额记录'}<br /><span className="muted small">来源限额与本份回执的请求预算分别计算。</span></dd></div>
+        </dl>
+        <details className="skill-content"><summary>有限请求记录（{selected.requests.length}）</summary><ul className="file-manifest">{selected.requests.map((request) => <li key={request.sequence}><strong>{request.sequence}. {request.kind} · {requestNames[request.status]}</strong><span>HTTP {request.http_status ?? '未知'} · 已接收 {bytes(request.received_bytes)}</span>{request.error && <code>{request.error}</code>}</li>)}</ul></details>
+        {!!selected.candidates.length && <><label htmlFor="discovery-candidate">候选目录</label><select id="discovery-candidate" value={candidateId} disabled={!!busy || !!selected.imported} onChange={(event) => { setCandidateId(event.target.value); resetConfirmation(); }}>{selected.candidates.map((item) => <option key={item.id} value={item.id}>{item.path || '仓库根目录'} · {item.file_count} 个文件</option>)}</select>
+          {candidate && <p className="small path-text">路径 {candidate.path || '仓库根目录'} · {candidate.entry_count} 个条目 · {bytes(candidate.total_bytes)}<br />候选树 <code>{candidate.tree_sha}</code></p>}
+          <button type="button" className="compact" disabled={!!busy || !mutable || !candidateId} onClick={() => { void perform('preview', async (signal, current) => {
+            const record = await api.post<SkillDiscovery>(`/skills/discoveries/${encodeURIComponent(selected.id)}/preview`, { candidate_id: candidateId, expected_revision: selected.revision }, signal);
+            if (current() && record.id === selected.id) show(record);
+          }); }}>预览固定候选</button>
+        </>}
+        {selected.status === 'ready' && !selected.candidates.length && <p className="muted small">此固定目录中没有符合边界的 Skill 候选。</p>}
+        {preview && <section className="discovery-preview" aria-label="固定候选预览"><h3>固定候选预览</h3><p className="small path-text">预览摘要 <code>{preview.sha256}</code></p>
+          <p className={preview.importable ? 'small' : 'warning-text small'}>{preview.importable ? `许可正文可核对：${preview.license.spdx ?? '未识别'}。导入后仍需人工审核。` : '仅供预览：来源、内容或许可条件不满足，不能远程导入。'}</p>
+          <p className="small">许可状态：{preview.license.status === 'supported' ? '支持的正文' : '仅预览'} · {preview.license.spdx ?? '许可未知'}</p>
+          {!!preview.license.reasons.length && <ul className="metric-reasons">{preview.license.reasons.map((reason, index) => <li key={index}>{reason}</li>)}</ul>}
+          <details className="skill-content"><summary>查看候选指令原文</summary><pre>{preview.instructions}</pre></details>
+          <div className="skill-content"><h4>许可正文与依据</h4>{preview.license.files.length ? preview.license.files.map((file) => <details key={file.path}><summary>{file.path}</summary><p className="small path-text">blob <code>{file.blob_sha}</code><br />SHA-256 <code>{file.sha256}</code></p><pre>{file.text}</pre></details>) : <p className="muted small">没有可核对的候选内许可正文。</p>}</div>
+          <details className="skill-content"><summary>文件清单与摘要（{preview.files.length}）</summary><ul className="file-manifest">{preview.files.map((file) => <li key={file.path}><strong>{file.path}</strong><span>{bytes(file.size)} · mode {file.mode}</span><code>blob {file.blob_sha}</code><code>SHA-256 {file.sha256}</code></li>)}</ul>{!!preview.directories.length && <><h4>目录</h4><ul className="file-manifest">{preview.directories.map((directory) => <li key={directory}>{directory}</li>)}</ul></>}</details>
+          {!selected.imported && <form className="discovery-confirm" onSubmit={(event) => { event.preventDefault(); if (!mutable || !preview.importable || preview.license.status !== 'supported' || !confirmSource || !confirmLicense) return;
+            if (!validDeclarations(lines(scope)) || !validDeclarations(lines(permissions))) { setError('适用范围和权限声明各最多 100 项，每项最多 512 个字符，不能包含控制字符。'); return; }
+            void perform('import', async (signal, current) => {
+              const result = await api.post<{ discovery: SkillDiscovery; skill: SkillVersion }>(`/skills/discoveries/${encodeURIComponent(selected.id)}/import`, { candidate_id: candidateId, expected_revision: selected.revision, preview_sha256: preview.sha256, confirm_source: true, confirm_license: true, scope: lines(scope), permissions: lines(permissions) }, signal);
+              if (current() && result.discovery.id === selected.id) { show(result.discovery); onImported(result.skill); }
+            });
+          }}><h4>确认冻结导入</h4><div className="settings-grid"><div><label htmlFor="discovery-scope">适用范围（每行一项）</label><textarea id="discovery-scope" value={scope} onChange={(event) => setScope(event.target.value)} maxLength={52000} disabled={!!busy || !preview.importable} /></div><div><label htmlFor="discovery-permissions">声明权限（每行一项）</label><textarea id="discovery-permissions" value={permissions} onChange={(event) => setPermissions(event.target.value)} maxLength={52000} disabled={!!busy || !preview.importable} /></div></div>
+            <label className="checkbox-label"><input type="checkbox" checked={confirmSource} onChange={(event) => setConfirmSource(event.target.checked)} disabled={!!busy || !preview.importable} /><span>我已核对固定 commit、候选路径和文件清单。</span></label>
+            <label className="checkbox-label"><input type="checkbox" checked={confirmLicense} onChange={(event) => setConfirmLicense(event.target.checked)} disabled={!!busy || !preview.importable} /><span>我已阅读候选内许可正文及适用范围依据，确认本次导入。</span></label>
+            <p className="field-help">新版本进入待审核；同一固定版本已存在时保留原审核记录。声明权限不会增加运行授权，导入不会创建评测或启用后台任务。</p>
+            <button className="primary" type="submit" disabled={!!busy || !mutable || !preview.importable || preview.license.status !== 'supported' || !confirmSource || !confirmLicense}>导入固定候选</button>
+          </form>}
+        </section>}
+        {selected.imported && <div className="notice" role="status"><p>已关联固定版本 <code>{selected.imported.version_id}</code>。</p><button type="button" className="compact" disabled={!!busy} onClick={() => { void perform('open', async (signal, current) => {
+          const skill = await api.get<SkillVersion>(`/skills/${encodeURIComponent(selected.imported!.version_id)}`, signal);
+          if (current() && skill.version_id === selected.imported!.version_id) onImported(skill);
+        }); }}>打开版本并审核</button></div>}
+      </section>}
+    </div>}
+  </details>;
+}
+
 export function SkillsView({ api, skills, onSkills, onEvaluation }: { api: Api; skills: SkillVersion[]; onSkills: (next: SkillVersion[]) => void; onEvaluation: (id: string) => void }) {
   const [selectedId, setSelectedId] = useState(skills[0]?.version_id ?? '');
   const [detail, setDetail] = useState<SkillVersion | null>(null);
@@ -85,6 +232,8 @@ export function SkillsView({ api, skills, onSkills, onEvaluation }: { api: Api; 
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [history, setHistory] = useState<ArenaEvaluation[] | null>(null);
+  const latestSkills = useRef(skills);
+  latestSkills.current = skills;
   const operation = useRef({ generation: 0, controller: null as AbortController | null });
   const perform = async (kind: string, action: (signal: AbortSignal, current: () => boolean) => Promise<void>) => {
     operation.current.controller?.abort();
@@ -104,10 +253,10 @@ export function SkillsView({ api, skills, onSkills, onEvaluation }: { api: Api; 
     });
     return () => { operation.current.generation += 1; operation.current.controller?.abort(); };
   }, [api, selectedId]);
-  const store = (record: SkillVersion) => onSkills([...skills.filter((skill) => skill.version_id !== record.version_id), record]);
+  const store = (record: SkillVersion) => onSkills([...latestSkills.current.filter((skill) => skill.version_id !== record.version_id), record]);
 
   return <div className="skills-view">
-    <div className="page-heading"><div><h1>Skills</h1><p className="muted">导入本地内容，核对来源、许可与权限，再批准具体版本。</p></div><button disabled={!!busy} onClick={() => { void perform('refresh', async (signal, current) => {
+    <div className="page-heading"><div><h1>Skills</h1><p className="muted">导入固定内容，核对来源、许可与权限，再批准具体版本。</p></div><button disabled={!!busy} onClick={() => { void perform('refresh', async (signal, current) => {
       const result = await api.get<{ skills: SkillVersion[] }>('/skills', signal);
       if (!current()) return;
       onSkills(result.skills); setSelectedId((old) => result.skills.some((skill) => skill.version_id === old) ? old : result.skills[0]?.version_id ?? ''); setDetail(null);
@@ -117,6 +266,7 @@ export function SkillsView({ api, skills, onSkills, onEvaluation }: { api: Api; 
       }
     }); }}>刷新版本</button></div>
     {error && <p className="notice error" role="alert">{error}</p>}{notice && <p className="notice" role="status">{notice}</p>}
+    <GithubDiscovery api={api} onImported={(record) => { store(record); setSelectedId(record.version_id); setDetail(record); setNotice(`已打开固定版本，审核状态：${reviewNames[record.review_status]}。`); }} />
     <details className="import-panel"><summary>导入本地 Skill</summary>
       <p className="field-help">服务端读取本机目录并保存不可变版本；导入不会运行其中的脚本。内容改变后再次导入会产生新版本。</p>
       <form onSubmit={(event) => { event.preventDefault(); void perform('import', async (signal, current) => {

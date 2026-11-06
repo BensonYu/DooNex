@@ -79,6 +79,36 @@ export type SkillVersion = {
   files: { path: string; size: number; sha256: string; mode: number | string }[];
   instructions?: string;
 };
+export type SkillDiscoveryPreview = {
+  candidate_id: string;
+  sha256: string;
+  instructions: string;
+  files: { path: string; mode: number; size: number; sha256: string; blob_sha: string }[];
+  directories: string[];
+  license: {
+    status: 'supported' | 'preview_only';
+    spdx: 'MIT' | 'Apache-2.0' | null;
+    files: { path: string; text: string; sha256: string; blob_sha: string }[];
+    reasons: string[];
+  };
+  importable: boolean;
+};
+export type SkillDiscovery = {
+  id: string;
+  revision: string;
+  status: 'scanning' | 'ready' | 'previewing' | 'preview_ready' | 'importing' | 'imported' | 'failed' | 'interrupted';
+  created_at: string;
+  updated_at: string;
+  input: { repository: string; ref: string; prefix: string };
+  source: null | { repository_id: number; repository: string; commit: string; root_tree: string; prefix_tree: string; resolved_at: string; api_version: string };
+  candidates: { id: string; path: string; tree_sha: string; file_count: number; entry_count: number; total_bytes: number }[];
+  preview: SkillDiscoveryPreview | null;
+  imported: { candidate_id: string; version_id: string } | null;
+  budget: { max_requests: number; requests_used: number; remaining_requests: number; max_bytes: number; bytes_used: number; bytes_reserved: number; remaining_bytes: number };
+  requests: { sequence: number; kind: string; status: 'reserved' | 'completed' | 'failed' | 'unknown'; received_bytes: number; http_status: number | null; error: string | null }[];
+  error: { code: string } | null;
+  source_rate_limit: { remaining: number | null; reset: number | null } | null;
+};
 export type ArenaTaskset = {
   id: string;
   name: string;
@@ -311,7 +341,7 @@ function errorMessage(value: unknown): string | null {
 }
 
 export class ApiError extends Error {
-  constructor(message: string, readonly status: number) { super(message); }
+  constructor(message: string, readonly status: number, readonly code: string | null = null, readonly discoveryId: string | null = null) { super(message); }
 }
 
 export class Api {
@@ -339,8 +369,20 @@ export class Api {
       }
       const text = await response.text();
       let detail: string | null = null;
-      try { detail = errorMessage(JSON.parse(text)); } catch { /* Non-JSON errors use a bounded fallback. */ }
-      throw new ApiError(detail ?? `请求失败（HTTP ${response.status}）${text ? `：${text.slice(0, 300)}` : ''}`, response.status);
+      let code: string | null = null, discoveryId: string | null = null;
+      try {
+        const payload: unknown = JSON.parse(text);
+        detail = errorMessage(payload);
+        if (payload && typeof payload === 'object' && 'detail' in payload && payload.detail && typeof payload.detail === 'object') {
+          const value = payload.detail as Record<string, unknown>;
+          if (typeof value.code === 'string' && /^[a-zA-Z0-9_]{1,100}$/.test(value.code)) code = value.code;
+          if (typeof value.discovery_id === 'string' && /^[a-fA-F0-9-]{36}$/.test(value.discovery_id)) discoveryId = value.discovery_id;
+        }
+      } catch { /* Non-JSON errors use a bounded fallback. */ }
+      const fallback = path.startsWith('/skills/discoveries')
+        ? `发现操作未完成（HTTP ${response.status}${code ? ` · ${code}` : ''}）。请读取保存回执核对。`
+        : `请求失败（HTTP ${response.status}）${text ? `：${text.slice(0, 300)}` : ''}`;
+      throw new ApiError(path.startsWith('/skills/discoveries') ? fallback : detail ?? fallback, response.status, code, discoveryId);
     }
     return response;
   }
