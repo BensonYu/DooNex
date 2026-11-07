@@ -40,10 +40,10 @@ M5 面向自托管单站点，范围与实际检查见 [M5 记录](docs/M5_IMPLE
 
 首个验证环境为 Apple Silicon Mac mini、macOS、Docker 与 Python 3.12。系统 Python 3.9 不用于应用运行；`uv` 根据项目约束创建 Python 3.12 环境。还需可用的 Git、Node.js 和 `pnpm`，前端包管理器锁定为 `pnpm@11.1.1`。这些命令供本机开发使用，不代表已验证其他硬件或公网部署。
 
-当前整合成果位于 `codex/m4-bounded-waits` 分支，`main` 暂保留 M3，等待 M4 完整退出条件通过。本轮等待控制补强通过 **1350 项本机测试**，常驻服务仍使用先前 M5 验收版本；实际范围与限制见 [M4 记录](docs/M4_IMPLEMENTATION.md)。以下命令检出当前整合分支。
+当前整合成果位于 `codex/responses-transport` 分支，`main` 暂保留 M3，等待 M4 完整退出条件通过。等待控制与可选 Responses 传输整合版本通过 **1650 项本机测试**，常驻服务仍使用先前 M5 验收版本；实际范围与限制见 [M4 记录](docs/M4_IMPLEMENTATION.md)。以下命令检出当前整合分支。
 
 ```bash
-git clone --branch codex/m4-bounded-waits git@github.com:BensonYu/DooNex.git doonex
+git clone --branch codex/responses-transport git@github.com:BensonYu/DooNex.git doonex
 cd doonex
 python3 -m venv .bootstrap
 .bootstrap/bin/pip install uv==0.13.7
@@ -75,6 +75,8 @@ docker pull python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0
 初始模型配置保存在私有数据目录的 `model.json`，在界面中显示为只读 `legacy`；「模型设置」可复制或创建独立配置档，保存到私有 `profiles.json`。创建 Run 时冻结各角色完整配置和版本，后续编辑不改写历史。以 [model.example.json](model.example.json) 为模板，填写实际供应商、API 模型 ID、接口模式、输入/输出上限与超时。当前适配器限定 `openai`、`anthropic`；OpenAI 适配器支持显式选择 Chat/Responses，已真实验证 `gpt-6.1-sol` 执行及 `gpt-6.1-terra` 审查的 Responses 受控闭环；列表中的 `gpt-5.4-mini` 在相同接口返回 NotFound，不能视为可用。Anthropic Chat 尚未真实调用验证。实际可用性仍须逐个模型和接口验证。远程地址默认要求 HTTPS；已授权私网 HTTP 需要显式开启 `allow_private_http`。
 
 凭据由 `credential_env` 指定的服务端环境变量读取，也可保存到私有 `credentials.json`：它是以该环境变量名为键、密钥为值的 JSON 映射，文件权限须为 `0600`。模型密钥不交给浏览器或任务容器。`service.json` 保存数据库连接配置，也可用 `DOONEX_DATABASE_URL` 覆盖；`DOONEX_MODEL_CONFIG` 可指定模型配置文件。
+
+OpenAI Responses 可显式选择「独立传输进程（直连）」，旧配置继续使用现有 SDK 传输。新模式仅支持 HTTPS 或已授权私网 HTTP，不支持代理、自定义 CA、流式或自动重试；传输进程时限不等于整请求或前台等待上界。未决进程会阻止新执行，可在「模型设置 → 模型传输恢复核查」核对，未知用量继续保留。预算预留后、进程身份登记前硬退出的缺记录窗口尚不能由该入口恢复。实际验证及限制见 [Responses 记录](docs/M4_RESPONSES_TRANSPORT.md)；该可选模式尚未验证真实网关或切换常驻服务。
 
 计费模式有两种：
 

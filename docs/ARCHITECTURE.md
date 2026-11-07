@@ -1,6 +1,6 @@
 # DooNex 首版架构
 
-更新：2026-11-06 · 状态：M1–M3、M4 发现/生成切片和 M5 自托管社区均有受控验收证据；后续等待控制整合版本通过 1350 项本机测试，尚未切换常驻服务。M4 的 SDK 续接缺陷已修复并获真实续接证据，后续真实 60 秒及 180 秒模型请求均超时，整批和前台等待上界验收仍未完成，完整未知日预留保留，见 [M4 实施记录](M4_IMPLEMENTATION.md)。社区本机验收及未公开部署边界见 [M5 实施记录](M5_IMPLEMENTATION.md)，私有竞技见 [M3 实施记录](M3_IMPLEMENTATION.md)，多项目与单 Agent 历史分别见 [M2](M2_IMPLEMENTATION.md)、[M1](M1_IMPLEMENTATION.md)。
+更新：2026-11-06 · 状态：M1–M3、M4 发现/生成切片和 M5 自托管社区均有受控验收证据；后续等待控制与可选 Responses 传输整合版本通过 1650 项本机测试，尚未切换常驻服务。M4 的 SDK 续接缺陷已修复并获真实续接证据，后续真实 60 秒及 180 秒模型请求均超时，整批和前台等待上界验收仍未完成，完整未知日预留保留，见 [M4 实施记录](M4_IMPLEMENTATION.md)。社区本机验收及未公开部署边界见 [M5 实施记录](M5_IMPLEMENTATION.md)，私有竞技见 [M3 实施记录](M3_IMPLEMENTATION.md)，多项目与单 Agent 历史分别见 [M2](M2_IMPLEMENTATION.md)、[M1](M1_IMPLEMENTATION.md)。
 
 ## 1. 选择与边界
 
@@ -49,6 +49,10 @@ flowchart LR
 - **验证器**：在 Agent 写入停止后生成覆盖新增/删除、文件内容和文件权限的固定快照，并为每条预先保存的验收命令创建全新检查副本，避免前一检查污染后一检查。验证控制器只负责调度和收集结果；安装脚本、测试命令和被测代码均在受限验证环境执行，不继承控制器的数据库或秘密凭据。Arena 的最终验收器来自已冻结的独立目录，仅验证期只读挂载到 `/verifier`；模型执行期不挂载，也不向模型发送隐藏检查命令。验证上下文与检查器摘要绑定报告。
 
 SDK 接口和内部持久化结构可能变化。DooNex 保存自己的产品状态和关联 ID，不重写 SDK 的模型协议、Agent 循环或事件格式。当前适配层包含针对 1.60.1 的私有覆盖：禁用宿主技能/插件/记忆发现、默认额外工具、模型元数据探测，控制预算前置与秘密序列化边界，并实现逐工具暂停、SDK 事件/动作回执与安全续接。它们不是稳定的上游扩展合同，升级 SDK 必须重跑隐私、工具、预算、持久化、调度让出及拒绝重放测试。
+
+显式 `isolated_direct_v1` 模式将同步 Responses 的一次 HTTP 传输交给固定子进程，使用有限直连 HTTP 适配器和严格 JSON 协议；SDK 继续完成消息与工具转换、Agent 循环和会话持久化。旧 `direct` 模式保持默认，升级不改写既有模型配置摘要。新模式没有代理、自定义 CA、流式、重试或 Chat 回退；真实网关尚未验证。该局部传输期限不覆盖父端 SDK、数据库和文件等待，不能替代前台端到端验收。
+
+helper 身份及回收证据保存在原模型 action，严格 JSONB 摘要与局部索引共同判断终态，未决记录全局阻止后续派发。私有恢复接口要求 worker 停止、版本/nonce 绑定和同 inode 空闲锁，只写人工核查状态且保留未知预算。预算预留后、helper 登记前的父进程硬退出可能留下缺记录阻止，当前恢复入口无法解除；此限制及实际验证见 [Responses 记录](M4_RESPONSES_TRANSPORT.md)。
 
 SDK 导入前，独立 worker 删除继承的 `LMNR_PROJECT_API_KEY`、`OTEL_ENDPOINT`、`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`、`OTEL_EXPORTER_OTLP_ENDPOINT`，固定 `LITELLM_MODE=PRODUCTION`、`LITELLM_LOCAL_MODEL_COST_MAP=True`、`OTEL_SDK_DISABLED=true`，防止隐式 `.env` 发现、远程价格表下载与遥测外发。若进程已初始化 tracing 或 LiteLLM 回调则拒绝复用；这不修改用户 shell 的环境。细节以 `apps/server/doonex/sdk.py` 为准。
 
