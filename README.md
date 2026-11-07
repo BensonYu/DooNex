@@ -40,10 +40,10 @@ M5 面向自托管单站点，范围与实际检查见 [M5 记录](docs/M5_IMPLE
 
 首个验证环境为 Apple Silicon Mac mini、macOS、Docker 与 Python 3.12。系统 Python 3.9 不用于应用运行；`uv` 根据项目约束创建 Python 3.12 环境。还需可用的 Git、Node.js 和 `pnpm`，前端包管理器锁定为 `pnpm@11.1.1`。这些命令供本机开发使用，不代表已验证其他硬件或公网部署。
 
-当前整合成果位于 `codex/delivery-documentation` 分支，`main` 暂保留 M3，等待 M4 完整退出条件通过。以下命令检出当前整合分支。
+当前整合成果位于 `codex/m4-bounded-waits` 分支，`main` 暂保留 M3，等待 M4 完整退出条件通过。本轮等待控制补强通过 **1350 项本机测试**，常驻服务仍使用先前 M5 验收版本；实际范围与限制见 [M4 记录](docs/M4_IMPLEMENTATION.md)。以下命令检出当前整合分支。
 
 ```bash
-git clone --branch codex/delivery-documentation git@github.com:BensonYu/DooNex.git doonex
+git clone --branch codex/m4-bounded-waits git@github.com:BensonYu/DooNex.git doonex
 cd doonex
 python3 -m venv .bootstrap
 .bootstrap/bin/pip install uv==0.13.7
