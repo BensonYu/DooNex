@@ -110,6 +110,24 @@ class SessionRecoveryRequired(RuntimeError):
     """An action without a recorded outcome needs explicit reconciliation."""
 
 
+class ToolOutcomeUnknown(BaseException):
+    """A tool's dispatch commitment or recorded outcome cannot be confirmed.
+
+    The controller raises this when dispatch, execution or durable result
+    recording is uncertain. It bypasses SDK tool-error observations and stops
+    the current response's remaining tools before requiring reconciliation.
+    This is never a safe scheduler checkpoint.
+    """
+
+
+class _ToolCallbackFailure(BaseException):
+    """Carry a controller failure past SDK tool-error observations unchanged."""
+
+    def __init__(self, error):
+        super().__init__("DooNex shell callback failed")
+        self.error = error
+
+
 class SessionContractError(RuntimeError):
     """A model response violated the frozen execution policy."""
 
@@ -1015,25 +1033,32 @@ class _ShellExecutor(ToolExecutor):
         self.callback, self.stop, self.scheduling = callback, stop, scheduling
 
     def __call__(self, action, conversation=None):
-        if self.stop():
-            raise SessionStopped("Execution stopped before a shell action")
-        scheduling = self.scheduling
-        if scheduling is not None and scheduling.shell_with_action is not None:
-            if scheduling.active_action is None:
-                raise SessionRecoveryRequired("SDK shell action identity is missing")
-            try:
-                result = scheduling.shell_with_action(
-                    action.command, dict(scheduling.active_action)
-                )
-            except SchedulerYield:
-                raise _AcceptedSchedulerYield(scheduling) from None
-        else:
-            result = self.callback(action.command)
-        return ShellObservation.from_text(
-            json.dumps(result, ensure_ascii=False),
-            exit_code=result.get("exit_code"),
-            is_error=result.get("exit_code") != 0,
-        )
+        try:
+            if self.stop():
+                raise SessionStopped("Execution stopped before a shell action")
+            scheduling = self.scheduling
+            if scheduling is not None and scheduling.shell_with_action is not None:
+                if scheduling.active_action is None:
+                    raise SessionRecoveryRequired(
+                        "SDK shell action identity is missing"
+                    )
+                try:
+                    result = scheduling.shell_with_action(
+                        action.command, dict(scheduling.active_action)
+                    )
+                except SchedulerYield:
+                    raise _AcceptedSchedulerYield(scheduling) from None
+            else:
+                result = self.callback(action.command)
+            return ShellObservation.from_text(
+                json.dumps(result, ensure_ascii=False),
+                exit_code=result.get("exit_code"),
+                is_error=result.get("exit_code") != 0,
+            )
+        except Exception as error:
+            # SDK 1.60.1 otherwise converts controller/receipt failures into
+            # observations and executes later tools in the same response.
+            raise _ToolCallbackFailure(error) from error
 
 
 class ShellTool(ToolDefinition[ShellAction, ShellObservation]):
@@ -1458,6 +1483,19 @@ def run_session(
                 ):
                     raise
                 scheduling_runtime.pause(conversation)
+            except ToolOutcomeUnknown as signal:
+                raise SessionRecoveryRequired(
+                    "A tool action has no recorded outcome; reconcile it before resuming"
+                ) from signal
+            except _ToolCallbackFailure as signal:
+                error = signal.error
+                if isinstance(error, SessionStopped) and should_stop():
+                    with conversation._state:
+                        conversation._state.execution_status = (
+                            ConversationExecutionStatus.PAUSED
+                        )
+                    return "paused"
+                raise error from error.__cause__
             except Exception as error:
                 # SDK persists the typed error event, then wraps step failures.
                 # Keep this policy failure explicit for the product controller.
