@@ -21,10 +21,19 @@ def run_transport(arm, *, before_request):
         key: arm[key]
         for key in ("v", "transport", "attempt_id", "client_request_id", "nonce")
     }
+    leaked_fds = []
+    for fd in range(8, 128):
+        try:
+            os.fstat(fd)
+        except OSError:
+            continue
+        leaked_fds.append(fd)
     result.update(
         kind="error" if mode == "error" else "result",
         payload={
             "environment": dict(os.environ),
+            "leaked_fds": leaked_fds,
+            "lease_inheritable": os.get_inheritable(5),
             "cwd": os.getcwd(),
             "alarm_default": signal.getsignal(signal.SIGALRM) == signal.SIG_DFL,
             "timer": signal.getitimer(signal.ITIMER_REAL)[0],

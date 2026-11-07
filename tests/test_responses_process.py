@@ -691,3 +691,92 @@ def test_valid_error_with_late_completion_is_rejected(setup):
     )
     assert error.reason == "deadline"
     assert error.evidence["reaped"]
+
+
+def test_bootstrap_closes_ambient_inheritable_descriptors(setup):
+    request, hooks, _ = setup
+    fd = os.open(
+        request.lease.path.parent / "ambient-file", os.O_CREAT | os.O_RDWR, 0o600
+    )
+    inherited = fcntl.fcntl(fd, fcntl.F_DUPFD, 64)
+    os.set_inheritable(inherited, True)
+    try:
+        result = process.run_helper(request, hooks.hooks())
+        assert result.envelope["payload"]["leaked_fds"] == []
+        assert result.envelope["payload"]["lease_inheritable"] is False
+    finally:
+        os.close(inherited)
+        os.close(fd)
+
+
+@pytest.mark.parametrize("source", ["protocol", "transport"])
+def test_exact_source_hash_mismatch_never_dispatches(setup, monkeypatch, source):
+    request, hooks, runtime = setup
+    original = process._hash
+    bad_source = runtime / f"responses_{source}.py"
+    monkeypatch.setattr(
+        process,
+        "_hash",
+        lambda path: "0" * 64 if path == bad_source else original(path),
+    )
+    error = run_failure(request, hooks)
+    assert error.evidence["reaped"]
+    assert not Path(request.call["marker"]).exists()
+    assert any(state == "armed" for state, _ in hooks.calls) == (source == "transport")
+
+
+def test_bootstrap_does_not_execute_site_pth_files(setup):
+    request, hooks, runtime = setup
+    marker = request.lease.path.parent / "pth-executed"
+    (runtime / "unexpected.pth").write_text(
+        f"import pathlib; pathlib.Path({str(marker)!r}).touch()\n"
+    )
+    result = process.run_helper(request, hooks.hooks())
+    assert result.reap["exit_code"] == 0
+    assert not marker.exists()
+
+
+def test_repeated_sigint_waits_for_actual_child_reap_and_receipt(setup):
+    request, _hooks, runtime = setup
+    private = request.lease.path.parent
+    receipt = private / "signal-owner-receipt.json"
+    owner = subprocess.Popen(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            str(_FIXTURES / "orphan_owner.py"),
+            str(Path(process.__file__).parents[1]),
+            str(runtime),
+            str(private),
+            str(receipt),
+            "gil",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        end = time.monotonic() + 3
+        while time.monotonic() < end:
+            if (private / "dispatched").exists():
+                break
+            time.sleep(0.005)
+        else:
+            pytest.fail("signal fixture did not dispatch")
+        saved = json.loads(receipt.read_text())
+        assert saved["state"] == "armed"
+        child = saved["data"]["child"]["pid"]
+        time.sleep(0.02)
+        owner.send_signal(signal.SIGINT)
+        time.sleep(0.02)
+        owner.send_signal(signal.SIGINT)
+        assert owner.wait(timeout=3) != 0
+        final = json.loads(receipt.read_text())
+        assert final["state"] == "reaped"
+        assert final["data"]["reap"]["pid"] == child
+        assert final["data"]["reap"]["exit_code"] == -signal.SIGKILL
+        assert not process.inspect_lease(process.LeaseSpec(request.lease.path)).locked
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+            owner.wait(timeout=1)
