@@ -3,9 +3,11 @@
 import json
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 
 import pytest
+from doonex.budget import Ledger
 from doonex.sdk import GuardedLLM
 from doonex.worker import Worker, run_directory
 from test_scheduling import action_rows, claimed
@@ -34,8 +36,36 @@ def test_foreground_runs_after_only_the_inflight_background_action(
     foreground = []
     active = []
     checkpoint = []
+    timeline = {"running_committed": {}, "model_admitted": {}}
     worker = Worker(settings)
     actual_execute = worker.execute
+    actual_create = store.create_run
+    actual_locked = worker.store.locked
+    actual_reserve = Ledger.reserve
+
+    def create_run(*args, **kwargs):
+        # The commit occurs inside this bracket. Database now() is the
+        # transaction start, and must not stand in for the commit timestamp.
+        before = time.monotonic()
+        value = actual_create(*args, **kwargs)
+        after = time.monotonic()
+        timeline["enqueue_commit_bracket"] = (before, after)
+        return value
+
+    @contextmanager
+    def locked(run_id, *args, **kwargs):
+        with actual_locked(run_id, *args, **kwargs) as (connection, current):
+            prior_state = current["state"]
+            yield connection, current
+        if prior_state == "queued" and current["state"] == "running":
+            timeline["running_committed"].setdefault(run_id, time.monotonic())
+
+    def reserve(ledger, *args, **kwargs):
+        value = actual_reserve(ledger, *args, **kwargs)
+        # Successful reserve returns after its transaction commits. The
+        # foreground workspace and SDK session have been prepared by now.
+        timeline["model_admitted"].setdefault(ledger.run_id, time.monotonic())
+        return value
 
     def execute(run_id):
         execution_order.append(run_id)
@@ -91,6 +121,9 @@ def test_foreground_runs_after_only_the_inflight_background_action(
             finished.set()
 
     monkeypatch.setattr(worker, "execute", execute)
+    monkeypatch.setattr(store, "create_run", create_run)
+    monkeypatch.setattr(worker.store, "locked", locked)
+    monkeypatch.setattr(Ledger, "reserve", reserve)
     monkeypatch.setattr(GuardedLLM, "_transport_call", transport)
     thread = threading.Thread(target=run_worker)
     thread.start()
@@ -169,6 +202,13 @@ def test_foreground_runs_after_only_the_inflight_background_action(
     # separately and is not a hardware-independent latency promise.
     assert 0 <= overhead_seconds < 10
     assert wait_seconds <= current_action_remaining + 10
+    commit_before, commit_after = timeline["enqueue_commit_bracket"]
+    running_committed = timeline["running_committed"][foreground_run["id"]]
+    first_model_admitted = timeline["model_admitted"][foreground_run["id"]]
+    assert commit_before <= commit_after <= running_committed <= first_model_admitted
+    # A guard for this finite synthetic fixture through Worker.run, including
+    # foreground initialization; it is not the M4 release latency bound.
+    assert first_model_admitted - commit_before < 30
     print(
         "scheduling_latency="
         + json.dumps(
@@ -186,6 +226,15 @@ def test_foreground_runs_after_only_the_inflight_background_action(
                 ),
                 "foreground_state": final["state"],
                 "model_transport": "synthetic",
+                "enqueue_commit_bracket_monotonic": [commit_before, commit_after],
+                "running_commit_confirmed_monotonic": running_committed,
+                "first_model_admitted_monotonic": first_model_admitted,
+                "submit_to_first_model_seconds": {
+                    "lower": first_model_admitted - commit_after,
+                    "upper": first_model_admitted - commit_before,
+                },
+                "running_to_first_model_seconds": first_model_admitted
+                - running_committed,
             },
             sort_keys=True,
         )

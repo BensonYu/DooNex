@@ -61,3 +61,11 @@ UTC `2026-11-07T00:32:53Z`，在 M4 两次 Responses 请求超时后又完成一
 上述两个模型只验证了当前网关的 Responses 编程/审查受控样例，不证明速度、价格或复杂度优劣。Mini 的模型列表记录保留，其 Responses 路径不能列为可用。Anthropic 和其他模型仍未真实验证。
 
 私有原始记录保存在本机 DooNex 数据目录的 `verification/model-profiles/`；完整历史 campaign 继续累积，没有清零。真实账户响应、网关地址、API 密钥和样例源代码不进入本仓库。
+
+## 后续 Responses 失败诊断（离线验证，尚未切换常驻服务）
+
+M4 的两次真实超时只保存了外层 `LLMTimeoutError`，无法从历史记录区分连接、读取、写入或连接池等待。新增实现为每个新的 Responses 请求生成独立 `X-Client-Request-Id`；普通失败时保存私有 `model_request_failed` 事件，绑定预算 action、客户端耗时、配置超时、有界异常链、可观测的 HTTPX 阶段及符合限制的服务端请求 ID。诊断不保存原始异常文案、URL、请求正文或任意响应头。关联头只是追踪线索，兼容网关是否保存或支持检索仍未验证。
+
+锁定 SDK 的离线实验表明 LiteLLM 会为超时生成合成 408；实现只把实际 `httpx.HTTPStatusError` 所绑定响应作为 HTTP 状态证据。客户端的 `read` 阶段不代表已定位网关内部或上游故障；没有服务端证据时，失败原因和实际用量仍可未知。头部准备在预算预留前完成；诊断器本身失效时保留固定降级记录和原失败，不重发请求，不释放未知预留。硬中断发生在失败处理之前时，仍可能没有该诊断事件。
+
+独立实现提交 `ed96238`（整合为 `a9e2faf`）的组合检查 **296 passed、3 warnings、82.81 秒、退出 0**，使用一次性 PostgreSQL、真实锁定 SDK 和 MockTransport，没有真实网关调用。包含连接/读/写/池超时、真实与合成 408、504、未知异常、关联 ID、秘密回显拒绝、诊断降级及 worker 持久化。完整整合回归另见 [M4 记录](M4_IMPLEMENTATION.md)。原始记录位于私有 `verification/m4-timeout-investigation-sdk/`；旧失败不补写新字段，也不因新增诊断改写历史分类或账本。
