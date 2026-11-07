@@ -2,6 +2,8 @@
 
 **Do next. 把下一步交给 AI。**
 
+开发已按用户要求暂停。下次继续请先读[开发交接](docs/DEVELOPMENT_HANDOFF.md)，其中记录固定代码、未整合切片、服务状态、验收顺序和合并 `main` 的条件。
+
 DooNex 是面向个人编程工作流的本地 Web 工作台，复用 OpenHands Software Agent SDK 执行任务，由 DooNex 管理项目、预算、恢复状态和交付证据。
 
 > **当前状态：M1–M3 和 M5 本机受控验收通过；M4 完整后台批次及前台等待上界待验收。** 现有多项目执行/只读审查、模型配置与用量、私有 Skill 版本、固定 Arena 批次、候选发现与生成、自托管社区。M3 的真实 45 次尝试中 43 次通过、2 次预算停止，全部记录保留。适用环境、版本与限制见下文及 [M3 实施记录](docs/M3_IMPLEMENTATION.md)，历史见 [M2](docs/M2_IMPLEMENTATION.md) 与 [M1](docs/M1_IMPLEMENTATION.md)。受控样例不形成通用成功率或模型/Skill 优胜声明。
