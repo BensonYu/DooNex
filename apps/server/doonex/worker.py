@@ -138,6 +138,7 @@ class Worker:
             SchedulerYield,
             SessionRecoveryRequired,
             SessionScheduling,
+            ToolOutcomeUnknown,
             parse_review_report,
             run_session,
         )
@@ -342,46 +343,49 @@ class Worker:
                     ledger.settle(reservation, usage)
 
                 def shell(command, action_identity=None):
-                    if generation_service:
-                        raise PermissionViolation("候选生成没有 shell 工具权限")
-                    self.fence()
-                    if role_stop():
-                        raise Halt("运行或角色已停止派发新动作")
-                    # These references have no legitimate model-tool purpose.
-                    # This detects explicit probes; Docker remains the actual
-                    # boundary for indirect/obfuscated commands and scripts.
-                    if any(
-                        target in command
-                        for target in (
-                            "/verifier",
-                            "/var/run/docker.sock",
-                            "/.ssh/",
-                            str(self.settings.home),
-                        )
-                    ):
-                        with self.store.locked(run_id, self.owner) as (c, current):
-                            current["safety_violation"] = True
-                            self.store.event(
-                                run_id,
-                                "permission_denied",
-                                {
-                                    "reason": "模型工具不可访问检查器或宿主秘密",
-                                    **attribution,
-                                },
-                                c,
-                            )
-                        raise PermissionViolation(
-                            "模型请求触及未授权的检查器或宿主秘密路径"
-                        )
-                    action_id = ledger.tool_intent(
-                        command, action_identity=action_identity
-                    )
-                    remaining = max(
-                        0.1,
-                        request["budget"]["max_seconds"]
-                        - elapsed(self.store.get(run_id)),
-                    )
+                    action_id = None
                     try:
+                        if generation_service:
+                            raise PermissionViolation("候选生成没有 shell 工具权限")
+                        self.fence()
+                        if role_stop():
+                            raise Halt("运行或角色已停止派发新动作")
+                        # These references have no legitimate model-tool purpose.
+                        # This detects explicit probes; Docker remains the actual
+                        # boundary for indirect/obfuscated commands and scripts.
+                        if any(
+                            target in command
+                            for target in (
+                                "/verifier",
+                                "/var/run/docker.sock",
+                                "/.ssh/",
+                                str(self.settings.home),
+                            )
+                        ):
+                            with self.store.locked(run_id, self.owner) as (c, current):
+                                current["safety_violation"] = True
+                                self.store.event(
+                                    run_id,
+                                    "permission_denied",
+                                    {
+                                        "reason": "模型工具不可访问检查器或宿主秘密",
+                                        **attribution,
+                                    },
+                                    c,
+                                )
+                            raise PermissionViolation(
+                                "模型请求触及未授权的检查器或宿主秘密路径"
+                            )
+                        # Admission includes the intent commit: an exception may
+                        # leave a durable pending action even before its ID returns.
+                        action_id = ledger.tool_intent(
+                            command, action_identity=action_identity
+                        )
+                        remaining = max(
+                            0.1,
+                            request["budget"]["max_seconds"]
+                            - elapsed(self.store.get(run_id)),
+                        )
                         options = {"read_only": True} if read_only else {}
                         if role == "executor" and skill_context:
                             fresh_skill = library.skill_context(request["skill"])
@@ -410,6 +414,14 @@ class Worker:
                             Workspace.scan(shell_path)
                             if skill_context:
                                 library.skill_context(request["skill"])
+                        checkpoint_digest = (
+                            Workspace.execution_digest(workspace.path)
+                            if arena and not read_only
+                            else None
+                        )
+                        # Snapshot work must finish before recording completion,
+                        # without preventing a concurrent stop request from committing.
+                        self.lease()
                         with self.store.locked(run_id, self.owner) as (c, current):
                             self.store.finish_action(
                                 action_id,
@@ -418,9 +430,9 @@ class Worker:
                                 connection=c,
                                 owner=self.owner,
                             )
-                            if arena and not read_only:
+                            if checkpoint_digest is not None:
                                 current["workspace_checkpoint_digest"] = (
-                                    Workspace.execution_digest(workspace.path)
+                                    checkpoint_digest
                                 )
                             self.store.event(
                                 run_id,
@@ -429,15 +441,42 @@ class Worker:
                                 c,
                             )
                         return result
-                    except BaseException:
-                        self.lease()
-                        self.store.finish_action(
-                            action_id,
-                            "unknown",
-                            {"reason": "工具结果未完整记录"},
-                            owner=self.owner,
-                        )
-                        raise
+                    except BaseException as error:
+                        if action_id is None and isinstance(
+                            error, (Halt, PermissionViolation, OwnershipLost)
+                        ):
+                            raise
+                        try:
+                            if action_id is not None:
+                                self.lease()
+                                with self.store.locked(run_id, self.owner) as (c, _):
+                                    action = c.execute(
+                                        "SELECT status FROM actions WHERE id=%s AND run_id=%s",
+                                        (action_id, run_id),
+                                    ).fetchone()
+                                    # A failed commit acknowledgement may hide a
+                                    # completed result. Never downgrade that receipt.
+                                    if action and action["status"] == "pending":
+                                        self.store.finish_action(
+                                            action_id,
+                                            "unknown",
+                                            {"reason": "工具结果未完整记录"},
+                                            connection=c,
+                                            owner=self.owner,
+                                        )
+                        except BaseException as recording_error:
+                            if not isinstance(error, Exception):
+                                raise error from recording_error
+                            if not isinstance(recording_error, Exception):
+                                raise
+                            raise ToolOutcomeUnknown(
+                                "工具结果及恢复记录未能确认；须人工核对"
+                            ) from recording_error
+                        if not isinstance(error, Exception):
+                            raise
+                        raise ToolOutcomeUnknown(
+                            "工具准入或结果未能确认；须人工核对"
+                        ) from error
 
                 prompt = (
                     None

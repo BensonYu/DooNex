@@ -28,6 +28,7 @@ TERMINAL_RUNS = {
     "budget_exceeded",
 }
 ACTIVE_BATCHES = {"queued", "running", "cancelling"}
+MAX_PLANNED_ATTEMPTS = 400  # 10 tasks, baseline + 3 Skills, 10 repeats.
 
 
 def digest(value):
@@ -405,10 +406,43 @@ class Arena:
         self.sync(identifier)
 
     def sync(self, identifier):
+        identifier = _uuid(identifier)
         value = self.get(identifier)
-        runs = [self.store.get(a["run_id"]) for a in value["attempts"]]
-        states = {r["state"] for r in runs}
-        with self.locked(identifier) as (_, current):
+        attempts = value.get("attempts")
+        if (
+            not isinstance(attempts, list)
+            or not 1 <= len(attempts) <= MAX_PLANNED_ATTEMPTS
+        ):
+            raise ValueError("评测子运行计划数量无效")
+        try:
+            run_ids = [_uuid(attempt["run_id"]) for attempt in attempts]
+        except (KeyError, TypeError, AttributeError, ValueError):
+            raise ValueError("评测子运行计划标识无效") from None
+        if len(set(run_ids)) != len(run_ids):
+            raise ValueError("评测子运行计划包含重复运行")
+        with self.locked(identifier) as (c, current):
+            if current.get("attempts") != attempts or current.get("id") != identifier:
+                raise ValueError("评测子运行计划已变化")
+            # Read only this finite frozen plan in one statement. Do not acquire
+            # child locks while holding the parent lock (reservations use Run -> parent).
+            rows = c.execute(
+                "SELECT id,state,data->>'id' AS run_id,data->>'state' AS run_state,"
+                "data->'request'->'arena'->>'evaluation_id' AS evaluation_id "
+                "FROM runs WHERE id=ANY(%s::uuid[])",
+                (run_ids,),
+            ).fetchall()
+            if {str(row["id"]) for row in rows} != set(run_ids) or len(rows) != len(
+                run_ids
+            ):
+                raise ValueError("评测子运行计划存在缺失运行")
+            if any(
+                row["run_id"] != str(row["id"])
+                or row["run_state"] != row["state"]
+                or row["evaluation_id"] != identifier
+                for row in rows
+            ):
+                raise ValueError("评测子运行归属或状态绑定无效")
+            states = {row["state"] for row in rows}
             if current["state"] == "cancelling":
                 if states <= TERMINAL_RUNS | {"paused", "interrupted"}:
                     current.update(
