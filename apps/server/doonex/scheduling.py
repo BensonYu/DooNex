@@ -52,6 +52,8 @@ class Scheduler:
         self.settings, self.store = settings, store
         self.background = Background(settings, store)
         self.cleanup_blocked = False
+        self._authorization_cursor = None
+        self._maintenance_cursor = None
 
     def preflight(self, connection, run, *, yield_foreground=True):
         """Caller holds dispatch lock, then Run/batch locks, never external I/O."""
@@ -63,7 +65,9 @@ class Scheduler:
             return
         evaluation_id = run["request"]["arena"]["evaluation_id"]
         if execution_fenced(connection):
-            raise BatchHalt("存在未核查的容器或模型传输进程；禁止后台派发", evaluation_id)
+            raise BatchHalt(
+                "存在未核查的容器或模型传输进程；禁止后台派发", evaluation_id
+            )
         try:
             self.background.preflight(
                 connection, binding["authorization_id"], evaluation_id
@@ -210,88 +214,96 @@ class Scheduler:
         with self.store.connect() as c:
             if execution_fenced(c) or queued_work(c):
                 return
-        for authorization in self.background.list():
-            if authorization["state"] != "enabled":
-                continue
-            try:
-                # Full content inspection takes place without the admission lock.
-                prepared = self.background.prepare(authorization["id"])
-                arena = Arena(self.settings, self.store)
-                body = EvaluationInput(
-                    **{
-                        k: authorization["input"][k]
-                        for k in (
-                            "taskset_id",
-                            "skill_version_ids",
-                            "model_profile_id",
-                            "repeats",
-                            "run_budget",
-                            "batch_budget",
-                        )
-                    }
-                )
-                arena_prepared = arena.prepare(body)
-                with self.store.connect() as c:
-                    dispatch_lock(c)
-                    if execution_fenced(c) or queued_work(c):
-                        return
-                    claim = self.background.claim(
-                        c, authorization["id"], prepared=prepared
+        authorization = self.background.next_enabled(self._authorization_cursor)
+        if authorization is None and self._authorization_cursor is not None:
+            self._authorization_cursor = None
+            authorization = self.background.next_enabled()
+        if authorization is None:
+            return None
+        self._authorization_cursor = (authorization["created_at"], authorization["id"])
+        try:
+            # Full content inspection takes place without the admission lock.
+            prepared = self.background.prepare(authorization["id"])
+            arena = Arena(self.settings, self.store)
+            body = EvaluationInput(
+                **{
+                    k: authorization["input"][k]
+                    for k in (
+                        "taskset_id",
+                        "skill_version_ids",
+                        "model_profile_id",
+                        "repeats",
+                        "run_budget",
+                        "batch_budget",
                     )
-                    binding = {
-                        key: claim[key]
-                        for key in ("authorization_id", "date", "reservation_id")
-                    }
-                    result = arena.create(
-                        body, connection=c, background=binding, prepared=arena_prepared
-                    )
-                    self.background.attach(c, claim, result)
-                return result
-            except BackgroundWaiting as error:
-                self.background.dispatch_status(
-                    authorization["id"], "waiting", str(error)
+                }
+            )
+            arena_prepared = arena.prepare(body)
+            with self.store.connect() as c:
+                dispatch_lock(c)
+                if execution_fenced(c) or queued_work(c):
+                    return
+                claim = self.background.claim(c, authorization["id"], prepared=prepared)
+                binding = {
+                    key: claim[key]
+                    for key in ("authorization_id", "date", "reservation_id")
+                }
+                result = arena.create(
+                    body, connection=c, background=binding, prepared=arena_prepared
                 )
-                continue
-            except (BackgroundStopped, ValueError, KeyError, OSError) as error:
-                from doonex.config import redact
+                self.background.attach(c, claim, result)
+            return result
+        except BackgroundWaiting as error:
+            self.background.dispatch_status(authorization["id"], "waiting", str(error))
+            return None
+        except (BackgroundStopped, ValueError, KeyError, OSError) as error:
+            from doonex.config import redact
 
-                reason = (
-                    str(error)
-                    if isinstance(error, BackgroundStopped)
-                    else "后台冻结配置或建批检查失败：" + type(error).__name__
-                )
-                reason = redact(
-                    reason, (self.settings.token, self.settings.database_url)
-                )
-                self.background.dispatch_status(authorization["id"], "blocked", reason)
-                continue
+            reason = (
+                str(error)
+                if isinstance(error, BackgroundStopped)
+                else "后台冻结配置或建批检查失败：" + type(error).__name__
+            )
+            reason = redact(reason, (self.settings.token, self.settings.database_url))
+            self.background.dispatch_status(authorization["id"], "blocked", reason)
+            return None
 
     def maintain(self):
+        """At most one reserved candidate; Worker.run currently calls this twice."""
         from doonex.arena import Arena
-        from doonex.background import BackgroundStopped
+        from doonex.background import TERMINAL_BATCHES, BackgroundStopped
 
+        identifier = self.background.next_reserved(self._maintenance_cursor)
+        if identifier is None and self._maintenance_cursor is not None:
+            self._maintenance_cursor = None
+            identifier = self.background.next_reserved()
+        if identifier is None:
+            return
+        # Advance even when this allocation must retain unknown reservations.
+        self._maintenance_cursor = identifier
+        with self.store.connect() as c:
+            batch = self.background.maintenance_batch(c, identifier)
+        if batch is None:
+            return
         arena = Arena(self.settings, self.store)
-        for batch in arena.list():
-            binding = batch.get("background")
-            if not binding:
-                continue
-            if batch["state"] in {"queued", "running", "interrupted"}:
-                try:
-                    with self.store.connect() as c:
-                        dispatch_lock(c)
-                        self.background.preflight(
-                            c, binding["authorization_id"], batch["id"]
-                        )
-                except BackgroundStopped as error:
-                    arena.stop(batch["id"], "cancelling", str(error))
-            batch = arena.get(batch["id"])
-            if batch["state"] in {"complete", "cancelled", "budget_exceeded"}:
+        if batch["state"] in {"queued", "running", "interrupted"}:
+            try:
                 with self.store.connect() as c:
-                    row = c.execute(
-                        "SELECT data FROM arena_evaluations WHERE id=%s FOR UPDATE",
-                        (batch["id"],),
-                    ).fetchone()
-                    self.background.settle(c, batch["id"], row["data"])
+                    dispatch_lock(c)
+                    current = self.background.maintenance_batch(c, identifier)
+                    if current is None:
+                        return
+                    self.background.preflight(
+                        c, current["background"]["authorization_id"], current["id"]
+                    )
+            except BackgroundStopped as error:
+                arena.stop(batch["id"], "cancelling", str(error))
+        # A stop can have just made this parent terminal. Recheck its binding
+        # under the parent lock before the original day/allocation settlement.
+        with self.store.connect() as c:
+            current = self.background.maintenance_batch(c, identifier, lock=True)
+            if current is not None and current["state"] in TERMINAL_BATCHES:
+                self.background.settle(c, current["id"], current)
 
 
 def install_background_routes(app, settings, store, auth):

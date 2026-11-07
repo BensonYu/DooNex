@@ -185,6 +185,110 @@ class Background:
                 )
             ]
 
+    def next_enabled(self, after=None):
+        """One candidate, including future/blocked grants; callers advance past it."""
+        values = ()
+        cursor = ""
+        if after is not None:
+            stamp, identifier = after
+            _utc(datetime.fromisoformat(stamp))
+            cursor = " AND (COALESCE(data->>'created_at',''),id)>(%s,%s::uuid)"
+            values = (stamp, _identifier(identifier))
+        with self.store.connect() as c:
+            row = c.execute(
+                "SELECT id,state,data FROM background_authorizations "
+                "WHERE state='enabled'"
+                + cursor
+                + " ORDER BY COALESCE(data->>'created_at',''),id LIMIT 1",
+                values,
+            ).fetchone()
+        if not row:
+            return None
+        value = row["data"]
+        try:
+            if value["id"] != str(row["id"]) or value["state"] != row["state"]:
+                raise ValueError
+            _utc(datetime.fromisoformat(value["created_at"]))
+        except (KeyError, TypeError, ValueError):
+            raise BackgroundConflict("后台候选授权的标识、状态或创建时间无效") from None
+        return value
+
+    def next_reserved(self, after=None):
+        """Do not filter missing parent bindings out of this finite work set."""
+        cursor = " AND id>%s::uuid" if after is not None else ""
+        values = (_identifier(after),) if after is not None else ()
+        with self.store.connect() as c:
+            row = c.execute(
+                "SELECT id FROM background_allocations WHERE state='reserved'"
+                + cursor
+                + " ORDER BY id LIMIT 1",
+                values,
+            ).fetchone()
+        return str(row["id"]) if row else None
+
+    def maintenance_batch(self, connection, allocation_id, *, lock=False):
+        """Recheck column/payload ownership without hiding a corrupt candidate.
+
+        Terminal settlement callers lock the parent before day/allocation locks.
+        This read never takes an authorization or child Run write lock.
+        """
+        row = connection.execute(
+            "SELECT id,authorization_id,evaluation_id,day,state,data "
+            "FROM background_allocations WHERE id=%s",
+            (_identifier(allocation_id),),
+        ).fetchone()
+        if row and row["state"] == "settled":
+            return None  # A concurrent explicit settlement already handled it.
+        try:
+            if not row or row["state"] != "reserved" or row["evaluation_id"] is None:
+                raise ValueError
+            allocation = row["data"]
+            evaluation_id = str(row["evaluation_id"])
+            authorization_id = str(row["authorization_id"])
+            day = row["day"].isoformat()
+            if any(
+                allocation[key] != expected
+                for key, expected in (
+                    ("id", str(row["id"])),
+                    ("evaluation_id", evaluation_id),
+                    ("authorization_id", authorization_id),
+                    ("date", day),
+                )
+            ):
+                raise ValueError
+            parent = connection.execute(
+                "SELECT id,state,data FROM arena_evaluations WHERE id=%s"
+                + (" FOR UPDATE" if lock else ""),
+                (evaluation_id,),
+            ).fetchone()
+            grant = connection.execute(
+                "SELECT id,state,data FROM background_authorizations WHERE id=%s",
+                (authorization_id,),
+            ).fetchone()
+            expected = {
+                "authorization_id": authorization_id,
+                "date": day,
+                "reservation_id": str(row["id"]),
+            }
+            if (
+                not parent
+                or not grant
+                or parent["data"]["id"] != evaluation_id
+                or parent["data"]["state"] != parent["state"]
+                or parent["data"].get("background") != expected
+                or grant["data"]["id"] != authorization_id
+                or grant["data"]["state"] != grant["state"]
+                or grant["state"] not in {"consumed", "disabled"}
+                or grant["data"]["evaluation_id"] != evaluation_id
+                or grant["data"]["date"] != day
+            ):
+                raise ValueError
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise BackgroundConflict(
+                "后台维护的分配、批次或授权关联无效；保留预留"
+            ) from None
+        return parent["data"]
+
     def day(self, value, connection=None, *, lock=False):
         if connection is None:
             with self.store.connect() as c:

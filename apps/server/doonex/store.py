@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 
 import psycopg
+from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -79,6 +80,109 @@ RUN_STATES = frozenset(
     }
 )
 
+TERMINATION_UNKNOWN = (
+    "COALESCE(jsonb_array_length(data->'recovery'->'remaining'),0)>0 OR "
+    "COALESCE(jsonb_array_length(data->'recovery'->'errors'),0)>0"
+)
+# Keep SQL predicates literal: generic prepared plans must be able to prove the
+# partial-index predicates, including empty safety queries.
+SCHEDULING_INDEXES = {
+    "runs_queued_order_v1": (
+        "runs",
+        (
+            "((CASE WHEN data->'request' ? 'background' THEN 2 "
+            "WHEN data->'request' ? 'arena' THEN 1 ELSE 0 END),"
+            "(data->>'created_at'),id) WHERE state='queued'"
+        ),
+    ),
+    "arena_active_text_v1": (
+        "arena_evaluations",
+        "((id::text)) WHERE state IN ('queued','running')",
+    ),
+    "runs_termination_unknown_v1": ("runs", f"(id) WHERE {TERMINATION_UNKNOWN}"),
+    "runs_arena_text_v1": (
+        "runs",
+        (
+            "((data->'request'->'arena'->>'evaluation_id'),id) "
+            "WHERE data->'request'->'arena'->>'evaluation_id' IS NOT NULL"
+        ),
+    ),
+    "runs_state_order_v1": ("runs", "(state,(data->>'created_at') DESC,id DESC)"),
+    "arena_state_order_v1": (
+        "arena_evaluations",
+        "(state,(data->>'created_at') DESC,id)",
+    ),
+    "actions_unresolved_run_v1": (
+        "actions",
+        "(run_id) WHERE status IN ('pending','unknown','acknowledged')",
+    ),
+    "allocations_day_v1": ("background_allocations", "(day,id)"),
+    "allocations_reserved_v1": (
+        "background_allocations",
+        "(id) INCLUDE(evaluation_id) WHERE state='reserved'",
+    ),
+    "authorizations_enabled_order_v1": (
+        "background_authorizations",
+        "((COALESCE(data->>'created_at','')),id) WHERE state='enabled'",
+    ),
+}
+
+
+def ensure_scheduling_indexes(connection):
+    """Build missing indexes, but reject drift instead of silently replacing it.
+
+    Ask this PostgreSQL parser to canonicalize the expected definition on empty
+    temporary copies. Comparing the complete USING clause also checks opclasses,
+    collations, ordering, predicates and INCLUDE columns, without relying on
+    pretty-print spelling across PostgreSQL versions or search paths.
+    """
+    prefix = "doonex_index_check_" + uuid.uuid4().hex[:12]
+    tables = {}
+    for number, (name, (table, definition)) in enumerate(SCHEDULING_INDEXES.items()):
+        if table not in tables:
+            tables[table] = f"{prefix}_t{len(tables)}"
+            connection.execute(
+                sql.SQL("CREATE TEMP TABLE {} (LIKE {}) ON COMMIT DROP").format(
+                    sql.Identifier(tables[table]), sql.Identifier(table)
+                )
+            )
+        reference = f"{prefix}_i{number}"
+        connection.execute(
+            sql.SQL("CREATE INDEX {} ON {} " + definition).format(
+                sql.Identifier(reference), sql.Identifier(tables[table])
+            )
+        )
+        expected = connection.execute(
+            "SELECT pg_get_indexdef(%s::regclass) AS definition",
+            ("pg_temp." + reference,),
+        ).fetchone()["definition"]
+        connection.execute(
+            sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} " + definition).format(
+                sql.Identifier(name), sql.Identifier(table)
+            )
+        )
+        actual = connection.execute(
+            "SELECT i.indrelid=%s::regclass AS correct_table,"
+            "i.indisvalid,i.indisready,i.indislive,i.indisunique,i.indisexclusion,"
+            "pg_get_indexdef(i.indexrelid) AS definition "
+            "FROM pg_class c LEFT JOIN pg_index i ON i.indexrelid=c.oid "
+            "WHERE c.relnamespace=(SELECT relnamespace FROM pg_class "
+            "WHERE oid=%s::regclass) AND c.relname=%s",
+            (table, table, name),
+        ).fetchone()
+        if (
+            not actual
+            or not all(
+                actual[key]
+                for key in ("correct_table", "indisvalid", "indisready", "indislive")
+            )
+            or actual["indisunique"]
+            or actual["indisexclusion"]
+            or actual["definition"].split(" USING ", 1)[1]
+            != expected.split(" USING ", 1)[1]
+        ):
+            raise RuntimeError(f"调度索引 {name} 定义或有效性不符；须显式迁移")
+
 
 def dispatch_lock(connection):
     connection.execute("SELECT pg_advisory_xact_lock(%s)", (DISPATCH_LOCK,))
@@ -87,9 +191,7 @@ def dispatch_lock(connection):
 def termination_unknown(connection):
     return bool(
         connection.execute(
-            "SELECT 1 FROM runs WHERE "
-            "COALESCE(jsonb_array_length(data->'recovery'->'remaining'),0)>0 OR "
-            "COALESCE(jsonb_array_length(data->'recovery'->'errors'),0)>0 LIMIT 1"
+            f"SELECT 1 FROM runs WHERE {TERMINATION_UNKNOWN} ORDER BY id LIMIT 1"
         ).fetchone()
     )
 
@@ -146,6 +248,7 @@ class Store:
             from doonex.responses_registry import HELPER_REGISTRY_SCHEMA
 
             connection.execute(HELPER_REGISTRY_SCHEMA)
+            ensure_scheduling_indexes(connection)
             # Keep the M1 source row intact. Repeated startup never overwrites
             # updated M2 metadata, identities, runs or their private artifacts.
             connection.execute(
@@ -305,8 +408,11 @@ class Store:
                 conditions.append("data->'request'->>'project_id'=%s")
                 values.append(project_id)
             if states is not None:
-                conditions.append("state=ANY(%s)")
-                values.append(states)
+                # These are validated RUN_STATES constants. A bound array hides
+                # their selectivity from generic prepared plans and scans history.
+                conditions.append(
+                    "state IN (" + ",".join("'" + state + "'" for state in states) + ")"
+                )
             if conditions:
                 query += " WHERE " + " AND ".join(conditions)
             query += " ORDER BY data->>'created_at' DESC,id DESC"

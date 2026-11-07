@@ -136,12 +136,36 @@ class Arena:
             raise KeyError("找不到评测")
         return row["data"]
 
-    def list(self):
+    def list(self, *, states=None):
+        condition = ""
+        if states is not None:
+            allowed = ACTIVE_BATCHES | {
+                "complete",
+                "cancelled",
+                "failed",
+                "interrupted",
+                "budget_exceeded",
+            }
+            if not isinstance(states, (list, tuple, set, frozenset)) or any(
+                type(state) is not str or state not in allowed for state in states
+            ):
+                raise ValueError("评测状态筛选无效")
+            if not states:
+                return []
+            # Only validated finite enum constants enter this SQL. Keep their
+            # selectivity visible even when PostgreSQL uses a generic plan.
+            condition = (
+                " WHERE state IN ("
+                + ",".join("'" + state + "'" for state in sorted(set(states)))
+                + ")"
+            )
         with self.store.connect() as c:
             return [
                 r["data"]
                 for r in c.execute(
-                    "SELECT data FROM arena_evaluations ORDER BY data->>'created_at' DESC,id"
+                    "SELECT data FROM arena_evaluations"
+                    + condition
+                    + " ORDER BY data->>'created_at' DESC,id"
                 )
             ]
 
