@@ -971,6 +971,14 @@ class Worker:
                 current.update(state=state, reason=reason, recovery=cleanup)
                 if state in {"failed", "cancelled", "budget_exceeded"}:
                     current["ended_at"] = now()
+                provider_error = exception_cause(exc, ModelCallError)
+                if provider_error and provider_error.diagnostics is not None:
+                    self.store.event(
+                        run_id,
+                        "model_request_failed",
+                        redact(provider_error.diagnostics, secrets),
+                        c,
+                    )
                 if arena:
                     current["arena_outcome"] = {
                         "classification": "cancelled"
@@ -980,7 +988,6 @@ class Worker:
                         "safety_violation": bool(current.get("safety_violation")),
                         "recorded_at": now(),
                     }
-                    provider_error = exception_cause(exc, ModelCallError)
                     provider_type = getattr(provider_error, "provider_error_type", None)
                     if state == "failed" and not current.get("safety_violation"):
                         if exception_cause(exc, SandboxError):

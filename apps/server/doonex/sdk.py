@@ -20,11 +20,13 @@ import re
 import stat
 import sys
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib.metadata import version
+from itertools import islice
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -42,6 +44,7 @@ os.environ["LITELLM_MODE"] = "PRODUCTION"  # Prevent implicit .env discovery.
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"  # No remote cost-map download.
 os.environ["OTEL_SDK_DISABLED"] = "true"
 
+import httpx
 import litellm
 from litellm import model_cost
 from openhands.sdk import LLM, Agent
@@ -279,9 +282,135 @@ class _SchedulingRuntime:
 class ModelCallError(RuntimeError):
     """A provider failed; expose only its class, never raw credential-bearing text."""
 
-    def __init__(self, message, provider_error_type=None):
+    def __init__(self, message, provider_error_type=None, diagnostics=None):
         super().__init__(message)
         self.provider_error_type = provider_error_type
+        self.diagnostics = diagnostics
+
+
+_ERROR_TYPES = frozenset(
+    {
+        "APIConnectionError",
+        "APITimeoutError",
+        "AuthenticationError",
+        "BadGatewayError",
+        "BadRequestError",
+        "BaseLLMException",
+        "ConnectError",
+        "ConnectTimeout",
+        "ContextWindowExceededError",
+        "Exception",
+        "HTTPStatusError",
+        "InternalServerError",
+        "LLMAuthenticationError",
+        "LLMBadRequestError",
+        "LLMContentPolicyViolationError",
+        "LLMContextWindowExceedError",
+        "LLMMalformedConversationHistoryError",
+        "LLMNoResponseError",
+        "LLMRateLimitError",
+        "LLMServiceUnavailableError",
+        "LLMTimeoutError",
+        "MaskedHTTPStatusError",
+        "PoolTimeout",
+        "RateLimitError",
+        "ReadTimeout",
+        "RuntimeError",
+        "ServiceUnavailableError",
+        "Timeout",
+        "TimeoutError",
+        "TypeError",
+        "ValueError",
+        "WriteTimeout",
+    }
+)
+
+
+def _model_error_type(error):
+    # Exception classes can be manufactured with prompt/key-bearing names.
+    name = type.__dict__["__name__"].__get__(type(error))
+    return name if len(name) <= 64 and name in _ERROR_TYPES else "Exception"
+
+
+def _diagnostic_request_id(value, secret):
+    if (
+        type(value) is str
+        and len(value) <= 128
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", value)
+        and not (secret and secret.casefold() in value.casefold())
+    ):
+        return value
+    return None
+
+
+def _provider_diagnostics(error, secret):
+    """Read bounded evidence without formatting errors or trusting mapped 408s."""
+    result = {
+        "exception_chain": [],
+        "chain_truncated": False,
+        "transport_phase": "unknown",
+        "http_status": None,
+        "server_request_id": None,
+    }
+    queue, seen, phases = [error], set(), set()
+    while queue and len(seen) < 12:
+        current = queue.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        result["exception_chain"].append(_model_error_type(current))
+        for kind, phase in (
+            (httpx.ConnectTimeout, "connect"),
+            (httpx.ReadTimeout, "read"),
+            (httpx.WriteTimeout, "write"),
+            (httpx.PoolTimeout, "pool"),
+        ):
+            if isinstance(current, kind):
+                phases.add(phase)
+        # Bypass user-defined attribute access/properties on exception classes.
+        fields = BaseException.__dict__["__dict__"].__get__(current)
+        response = fields.get("response")
+        headers = [fields.get("headers")]
+        if type(response) is httpx.Response:
+            headers.append(response.headers)
+            if (
+                isinstance(current, httpx.HTTPStatusError)
+                and type(response.status_code) is int
+                and 100 <= response.status_code <= 599
+            ):
+                result["http_status"] = response.status_code
+        for source in headers:
+            if type(source) is httpx.Headers:
+                if len(source) > 64:
+                    continue
+                try:
+                    value = source.get("x-request-id")
+                except (UnicodeError, ValueError):
+                    continue
+            elif type(source) is dict:
+                value = next(
+                    (
+                        value
+                        for key, value in islice(source.items(), 64)
+                        if type(key) is str
+                        and len(key) <= 64
+                        and key.lower() == "x-request-id"
+                    ),
+                    None,
+                )
+            else:
+                continue
+            request_id = _diagnostic_request_id(value, secret)
+            if request_id and result["server_request_id"] is None:
+                result["server_request_id"] = request_id
+        for name in ("__cause__", "__context__"):
+            linked = BaseException.__dict__[name].__get__(current)
+            if linked is not None and id(linked) not in seen:
+                queue.append(linked)
+    result["chain_truncated"] = any(id(item) not in seen for item in queue)
+    if len(phases) == 1:
+        result["transport_phase"] = phases.pop()
+    return result
 
 
 class ReviewReportError(ValueError):
@@ -749,19 +878,72 @@ class GuardedLLM(LLM):
         estimate = len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) + 1024
         if estimate > self.max_input_tokens:
             raise ValueError("Conversation exceeds the configured input token bound")
+        # Pure local preparation must complete before reserving an action.
+        client_request_id = str(uuid.uuid4()) if mode == "responses" else None
+        if client_request_id is not None:
+            headers = kwargs.get("extra_headers", self.extra_headers)
+            headers = {} if headers is None else headers
+            if type(headers) is not dict or any(
+                type(name) is not str for name in headers
+            ):
+                raise ValueError("Responses headers require a string-keyed dictionary")
+            kwargs = {
+                **kwargs,
+                "extra_headers": {
+                    **{
+                        name: value
+                        for name, value in headers.items()
+                        if name.lower() != "x-client-request-id"
+                    },
+                    "X-Client-Request-Id": client_request_id,
+                },
+            }
         try:
             reservation = self._before(estimate, self.max_output_tokens)
         except SchedulerYield:
             if self._scheduling is None:
                 raise
             raise _AcceptedSchedulerYield(self._scheduling) from None
+        started = time.monotonic()
         try:
             response = call(messages=messages, tools=tools, **kwargs)
         except Exception as error:  # noqa: BLE001 -- providers expose heterogeneous exceptions
+            elapsed_ms = max(0, round((time.monotonic() - started) * 1000))
             self._after(reservation, None)
+            error_type = _model_error_type(error)
+            diagnostics = None
+            if client_request_id is not None:
+                try:
+                    details = _provider_diagnostics(
+                        error, self.api_key.get_secret_value() if self.api_key else ""
+                    )
+                except Exception:  # noqa: BLE001 -- diagnostics cannot replace the failure
+                    details = {
+                        "exception_chain": [error_type],
+                        "chain_truncated": True,
+                        "transport_phase": "unknown",
+                        "http_status": None,
+                        "server_request_id": None,
+                        "diagnostic_unavailable": True,
+                    }
+                diagnostics = {
+                    "version": 1,
+                    "api_mode": "responses",
+                    "client_request_id": client_request_id,
+                    "elapsed_ms": elapsed_ms,
+                    "timeout_seconds": self.timeout,
+                    **details,
+                }
+                if type(reservation) is dict:
+                    action_id = reservation.get("id")
+                    if type(action_id) is str and re.fullmatch(
+                        r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", action_id
+                    ):
+                        diagnostics["action_id"] = action_id
             raise ModelCallError(
-                f"Model request failed ({type(error).__name__})",
-                provider_error_type=type(error).__name__,
+                f"Model request failed ({error_type})",
+                provider_error_type=error_type,
+                diagnostics=diagnostics,
             ) from None
         usage = getattr(response.raw_response, "usage", None)
         names = (
