@@ -86,3 +86,5 @@
 - [许可说明](https://github.com/milind-soni/OpenMausBot/blob/fb31cb7dc56a90a00a6f07001219335a1afdff08/LICENSING.md) 区分普通 Apache-2.0 源码和受其他条款约束的 `enterprise/`。本次未运行上游程序或复制实现，不引入其企业代码，也不替 DooNex 选择自有许可证。
 
 M4 的后台试验、M5 的公共生态按路线图在前置验收后继续设计和推进；当前研究不代表这些功能已完成。
+
+后续于 UTC 2026-11-07 对另一固定上游版本补查了恢复、计时、用量与安全边界，见 [OpenMausBot 参考核对](OPENMAUSBOT_REFERENCE.md)。本节保留 M3 当时的研究基准与阶段记录。

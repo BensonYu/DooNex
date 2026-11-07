@@ -59,6 +59,9 @@ CREATE TABLE IF NOT EXISTS actions (
 
 
 DISPATCH_LOCK = 4142061110
+CONNECT_TIMEOUT_SECONDS = 5
+STATEMENT_TIMEOUT_MS = 15_000
+LOCK_TIMEOUT_MS = 5_000
 
 
 def dispatch_lock(connection):
@@ -80,7 +83,26 @@ class Store:
         self.database_url = database_url
 
     def connect(self):
-        return psycopg.connect(self.database_url, row_factory=dict_row)
+        # Let libpq resolve DSN, environment and service-file options first;
+        # replacing startup options could discard schema or read-only settings.
+        connection = psycopg.connect(
+            self.database_url,
+            row_factory=dict_row,
+            connect_timeout=CONNECT_TIMEOUT_SECONDS,
+        )
+        try:
+            with connection.transaction():
+                connection.execute(
+                    "SELECT set_config('statement_timeout', %s, false), "
+                    "set_config('lock_timeout', %s, false)",
+                    (str(STATEMENT_TIMEOUT_MS), str(LOCK_TIMEOUT_MS)),
+                )
+        except BaseException:
+            connection.close()
+            raise
+        # These are server-side statement/lock limits after setup, not an
+        # end-to-end scheduling or failed-host/network guarantee.
+        return connection
 
     def initialize(self):
         with self.connect() as connection:

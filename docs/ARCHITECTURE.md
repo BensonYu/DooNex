@@ -1,6 +1,6 @@
 # DooNex 首版架构
 
-更新：2026-11-06 · 状态：M1–M3、M4 发现/生成切片和 M5 自托管社区均有受控验收证据；最终整合代码通过 1199 项本机测试。M4 的 SDK 续接缺陷已修复并获真实续接证据，后续真实 60 秒及 180 秒模型请求均超时，整批验收仍未完成，完整未知日预留保留，见 [M4 实施记录](M4_IMPLEMENTATION.md)。社区本机验收及未公开部署边界见 [M5 实施记录](M5_IMPLEMENTATION.md)，私有竞技见 [M3 实施记录](M3_IMPLEMENTATION.md)，多项目与单 Agent 历史分别见 [M2](M2_IMPLEMENTATION.md)、[M1](M1_IMPLEMENTATION.md)。
+更新：2026-11-06 · 状态：M1–M3、M4 发现/生成切片和 M5 自托管社区均有受控验收证据；最终整合代码通过 1199 项本机测试。M4 的 SDK 续接缺陷已修复并获真实续接证据，后续真实 60 秒及 180 秒模型请求均超时，整批和前台等待上界验收仍未完成，完整未知日预留保留，见 [M4 实施记录](M4_IMPLEMENTATION.md)。社区本机验收及未公开部署边界见 [M5 实施记录](M5_IMPLEMENTATION.md)，私有竞技见 [M3 实施记录](M3_IMPLEMENTATION.md)，多项目与单 Agent 历史分别见 [M2](M2_IMPLEMENTATION.md)、[M1](M1_IMPLEMENTATION.md)。
 
 ## 1. 选择与边界
 

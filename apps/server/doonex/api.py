@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import UUID, uuid4
 
+import psycopg
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -119,6 +120,15 @@ def create_app(settings=None):
     @app.exception_handler(KeyError)
     async def missing(request, exc):
         return JSONResponse({"detail": "记录不存在"}, status_code=404)
+
+    @app.exception_handler(psycopg.OperationalError)
+    async def database_unavailable(request, exc):
+        # A lost response can leave a write's outcome unknown. Do not suggest
+        # replaying it, and do not expose DSNs, SQL, or provider exception text.
+        return JSONResponse(
+            {"detail": "数据库暂不可用或等待超时；请先刷新并核对操作结果"},
+            status_code=503,
+        )
 
     def load_run(run_id):
         run_id = identifier(run_id)
