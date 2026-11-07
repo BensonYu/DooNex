@@ -22,6 +22,12 @@ class ModelConfig(StrictModel):
     provider: Literal["openai", "anthropic"]
     model_id: str = Field(min_length=1, max_length=200)
     api_mode: Literal["chat", "responses"] = "chat"
+    responses_transport: Literal["direct", "isolated_direct_v1"] = Field(
+        default="direct",
+        # Legacy profile revisions hash the exact serialized model. Preserve
+        # that payload until a user explicitly selects the isolated transport.
+        exclude_if=lambda value: value == "direct",
+    )
     credential_env: str = Field(
         default="DOONEX_LLM_API_KEY", pattern=r"^[A-Z][A-Z0-9_]{0,100}$"
     )
@@ -39,6 +45,10 @@ class ModelConfig(StrictModel):
     def validate_endpoint(self):
         if self.provider != "openai" and self.api_mode == "responses":
             raise ValueError("Responses 接口仅支持 OpenAI 兼容配置")
+        if self.responses_transport != "direct" and (
+            self.provider != "openai" or self.api_mode != "responses"
+        ):
+            raise ValueError("独立传输进程仅支持 OpenAI 兼容的 Responses 配置")
         if self.base_url:
             url = urlparse(self.base_url)
             if not url.hostname or any(char.isspace() for char in self.base_url):

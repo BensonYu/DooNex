@@ -1286,6 +1286,8 @@ def run_session(
         raise ValueError("M1 supports explicit chat or responses API mode only")
     if api_mode == "responses" and model.get("provider") != "openai":
         raise ValueError("M1 supports Responses only through the openai adapter")
+    if model.get("responses_transport", "direct") != "direct":
+        raise ValueError("Isolated Responses transport requires its controller binding")
     if not api_key:
         raise ValueError("Model API credential is missing")
     generation_user, generation_prompt_sha256 = None, None
