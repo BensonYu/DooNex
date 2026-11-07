@@ -60,6 +60,10 @@ from openhands.sdk.tool.builtins import FinishTool
 from openhands.sdk.tool.schema import Action, Observation
 from pydantic import Field, PrivateAttr, SecretStr
 
+from doonex import responses_adapter
+
+responses_adapter.install()
+
 SDK_VERSION = "1.60.1"
 _SUPPORTED_PROVIDERS = frozenset({"openai", "anthropic"})
 _RUN_LOCK = threading.Lock()
@@ -376,6 +380,20 @@ def _provider_diagnostics(error, secret):
         if id(current) in seen:
             continue
         seen.add(id(current))
+        if type(current) is responses_adapter.HelperReportedError:
+            return dict(current.diagnostics)
+        from doonex.responses_process import HelperProcessError
+
+        if type(current) is HelperProcessError:
+            return {
+                "source": "controller",
+                "controller_reason": current.reason,
+                "exception_chain": ["RuntimeError"],
+                "chain_truncated": False,
+                "transport_phase": "unknown",
+                "http_status": None,
+                "server_request_id": None,
+            }
         result["exception_chain"].append(_model_error_type(current))
         for kind, phase in (
             (httpx.ConnectTimeout, "connect"),
@@ -786,6 +804,7 @@ class GuardedLLM(LLM):
     _scheduling: _SchedulingRuntime | None = PrivateAttr(default=None)
     _execution_policy: str = PrivateAttr(default="workspace")
     _generation_user: dict | None = PrivateAttr(default=None)
+    _responses_transport: Callable | None = PrivateAttr(default=None)
 
     def _model_name_for_capabilities(self) -> str:
         model = super()._model_name_for_capabilities()
@@ -829,11 +848,13 @@ class GuardedLLM(LLM):
         scheduling=None,
         execution_policy="workspace",
         generation_user=None,
+        responses_transport=None,
     ) -> None:
         self._before, self._after, self._stop = before, after, should_stop
         self._scheduling = scheduling
         self._execution_policy = execution_policy
         self._generation_user = generation_user
+        self._responses_transport = responses_transport
 
     def _validate_finish_response(self, message, tools):
         # Validate before Agent's response dispatch: empty/reasoning/content
@@ -924,11 +945,34 @@ class GuardedLLM(LLM):
             raise _AcceptedSchedulerYield(self._scheduling) from None
         started = time.monotonic()
         try:
-            response = call(messages=messages, tools=tools, **kwargs)
+            if mode == "responses":
+                expected_tools = (
+                    [
+                        tool.to_responses_tool(
+                            add_security_risk_prediction=kwargs.get(
+                                "add_security_risk_prediction", False
+                            )
+                        )
+                        for tool in tools
+                    ]
+                    if tools
+                    else None
+                )
+                with responses_adapter.request_context(
+                    self._responses_transport,
+                    reservation,
+                    client_request_id,
+                    expected_tools,
+                ):
+                    response = call(messages=messages, tools=tools, **kwargs)
+            else:
+                response = call(messages=messages, tools=tools, **kwargs)
         except Exception as error:  # noqa: BLE001 -- providers expose heterogeneous exceptions
             elapsed_ms = max(0, round((time.monotonic() - started) * 1000))
             self._after(reservation, None)
             error_type = _model_error_type(error)
+            if type(error) is responses_adapter.HelperReportedError:
+                error_type = error.error_type
             diagnostics = None
             if client_request_id is not None:
                 try:
@@ -1226,6 +1270,7 @@ def run_session(
     shell_with_action: Callable[[str, dict], dict] | None = None,
     execution_policy: str = "workspace",
     frozen_prompt: str | None = None,
+    responses_transport: Callable | None = None,
 ) -> str:
     """Run/resume one SDK conversation; model credentials remain in this process.
 
@@ -1286,8 +1331,21 @@ def run_session(
         raise ValueError("M1 supports explicit chat or responses API mode only")
     if api_mode == "responses" and model.get("provider") != "openai":
         raise ValueError("M1 supports Responses only through the openai adapter")
-    if model.get("responses_transport", "direct") != "direct":
+    isolated = model.get("responses_transport", "direct") == "isolated_direct_v1"
+    if isolated and responses_transport is None:
         raise ValueError("Isolated Responses transport requires its controller binding")
+    if model.get("responses_transport", "direct") not in {
+        "direct",
+        "isolated_direct_v1",
+    }:
+        raise ValueError("Unsupported Responses transport")
+    if responses_transport is not None and (not isolated or api_mode != "responses"):
+        raise ValueError("Responses controller binding requires explicit isolated mode")
+    if isolated:
+        from doonex.responses_protocol import assert_direct_environment
+
+        responses_adapter.assert_installed()
+        assert_direct_environment()
     if not api_key:
         raise ValueError("Model API credential is missing")
     generation_user, generation_prompt_sha256 = None, None
@@ -1338,7 +1396,9 @@ def run_session(
             model=model_id,
             api_mode=api_mode,
             api_key=SecretStr(api_key),
-            base_url=model.get("base_url"),
+            base_url=(model.get("base_url") or "https://api.openai.com/v1")
+            if isolated
+            else model.get("base_url"),
             usage_id="doonex-agent",
             num_retries=0,
             caching_prompt=False,
@@ -1348,6 +1408,11 @@ def run_session(
             timeout=model["timeout_seconds"],
             max_input_tokens=model["max_input_tokens"],
             max_output_tokens=model["max_output_tokens"],
+            **(
+                {"openrouter_site_url": "", "openrouter_app_name": ""}
+                if isolated
+                else {}
+            ),
         )
         llm.bind(
             before_model,
@@ -1356,6 +1421,7 @@ def run_session(
             scheduling_runtime,
             execution_policy=execution_policy,
             generation_user=generation_user,
+            responses_transport=responses_transport,
         )
         agent = _M1Agent(
             llm=llm,

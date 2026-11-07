@@ -9,6 +9,7 @@ export type ModelConfig = {
   provider: string;
   model_id: string;
   api_mode: string;
+  responses_transport?: 'direct' | 'isolated_direct_v1';
   base_url?: string | null;
   max_input_tokens: number;
   max_output_tokens: number;
@@ -364,6 +365,19 @@ export type Recovery = {
   pending_actions: unknown[];
   workspace_ok: boolean;
   notes: string[];
+  transport_blocked?: boolean;
+};
+
+export type TransportInspection = {
+  schema: 1;
+  action_id: string;
+  run_id: string;
+  record_sha256: string | null;
+  record: { state: string; attempt_id: string; nonce: string; [key: string]: unknown } | null;
+  valid: boolean;
+  unresolved: boolean;
+  lease: { device: number; inode: number; locked: boolean } | null;
+  problems: string[];
 };
 
 export type Diff = { diff: string; source?: 'review_handoff' | 'evidence' | 'unavailable'; snapshot_digest?: string; verified?: boolean };

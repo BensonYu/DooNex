@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import textwrap
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,14 @@ def test_stateless_http_input_is_identical_after_scheduler_resume(
 ):
     import httpx
 
+    # These are three independent conversations. Freeze their prompt input so
+    # crossing a wall-clock minute does not change CURRENT_DATETIME between
+    # samples; keep the complete HTTP-body equality assertion below unchanged.
+    monkeypatch.setattr(
+        sdk,
+        "AgentContext",
+        partial(sdk.AgentContext, current_datetime="2026-11-06T22:03"),
+    )
     bodies = {}
     active = None
     responses = responses_answer("doonex_shell", {"command": "create-once"})
@@ -125,10 +134,14 @@ def test_stateless_http_input_is_identical_after_scheduler_resume(
         ]
         assert len(calls) == len(outputs) == 1, (boundary, second["input"])
         assert calls[0]["id"] == first["output"][-1]["id"]
-        assert calls[0]["call_id"] == outputs[0]["call_id"] == (
-            "call_original_link_0123456789"
+        assert (
+            calls[0]["call_id"]
+            == outputs[0]["call_id"]
+            == ("call_original_link_0123456789")
         )
-        prior_reasoning = [item for item in second["input"] if item["type"] == "reasoning"]
+        prior_reasoning = [
+            item for item in second["input"] if item["type"] == "reasoning"
+        ]
         assert prior_reasoning == ([first["output"][0]] if reasoning else [])
 
     assert bodies["uninterrupted"] == bodies["before_tool"] == bodies["after_tool"]

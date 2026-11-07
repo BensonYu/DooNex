@@ -7,7 +7,7 @@ from uuid import UUID
 from psycopg.types.json import Jsonb
 
 from doonex.models import model_for_role
-from doonex.store import now, termination_unknown
+from doonex.store import execution_fenced, now
 
 
 class Halt(RuntimeError):
@@ -195,8 +195,8 @@ class Ledger:
 
     def reserve(self, input_tokens, output_tokens):
         with self.store.locked(self.run_id, self.owner, dispatch=True) as (c, run):
-            if termination_unknown(c):
-                raise Halt("存在终止状态不明的任务容器；禁止派发")
+            if execution_fenced(c):
+                raise Halt("存在未核查的容器或模型传输进程；禁止派发")
             guard(run)
             usages = self.usages(run, dispatch=True)
             batch = _locked_batch(c, run, dispatch=True)
@@ -251,6 +251,11 @@ class Ledger:
                 "model_id": model["model_id"],
                 "provider": model["provider"],
                 "api_mode": model.get("api_mode", "chat"),
+                **(
+                    {"transport_mode": "isolated_direct_v1"}
+                    if model.get("responses_transport") == "isolated_direct_v1"
+                    else {}
+                ),
                 **self.attribution(),
                 **({"evaluation_id": batch[0]} if batch is not None else {}),
             }
@@ -379,8 +384,8 @@ class Ledger:
 
     def tool_intent(self, command, *, action_identity=None):
         with self.store.locked(self.run_id, self.owner, dispatch=True) as (c, run):
-            if termination_unknown(c):
-                raise Halt("存在终止状态不明的任务容器；禁止派发")
+            if execution_fenced(c):
+                raise Halt("存在未核查的容器或模型传输进程；禁止派发")
             guard(run)
             self.usages(run, dispatch=True)
             _locked_batch(c, run, dispatch=True)

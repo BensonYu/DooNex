@@ -176,9 +176,16 @@ class Worker:
                 self.store.event(run_id, kind, redact(payload, secrets), c)
 
         try:
-            with self.store.locked(run_id) as (c, current):
+            with self.store.locked(run_id, dispatch=True) as (c, current):
                 if current["state"] != "queued":
                     return
+                from doonex.store import execution_fenced
+
+                if execution_fenced(c):
+                    raise SessionRecoveryRequired(
+                        "容器或模型传输进程尚未完成核查，禁止领取运行"
+                    )
+                self.fence()
                 current.update(state="running", owner=self.owner, reason="Agent 执行中")
                 if current["first_started_at"] is None:
                     current["first_started_at"] = now()
@@ -304,6 +311,20 @@ class Worker:
                     dispatch_check=self.scheduler.preflight,
                 )
                 attribution = ledger.attribution()
+                responses_transport = None
+                if selected_model.get("responses_transport") == "isolated_direct_v1":
+                    from doonex.responses_binding import ResponsesBinding
+
+                    responses_transport = ResponsesBinding(
+                        self.settings,
+                        self.store,
+                        run_id=run_id,
+                        owner=self.owner,
+                        check_owner=self.lease,
+                        check_dispatch=self.fence,
+                        model=selected_model,
+                        api_key=role_keys[role],
+                    )
 
                 def role_stop():
                     if self.stop_requested(run_id):
@@ -340,6 +361,8 @@ class Worker:
 
                 def after_model(reservation, usage):
                     self.lease()
+                    if usage is None and responses_transport is not None:
+                        responses_transport.abandon_uninvoked(reservation)
                     ledger.settle(reservation, usage)
 
                 def shell(command, action_identity=None):
@@ -541,6 +564,11 @@ class Worker:
                     shell=shell,
                     on_event=lambda payload: role_event("sdk", payload),
                     should_stop=role_stop,
+                    **(
+                        {"responses_transport": responses_transport}
+                        if responses_transport is not None
+                        else {}
+                    ),
                     resume=resume,
                     role=role,
                     on_finish=finishes.append,
@@ -781,10 +809,12 @@ class Worker:
                             if elapsed(current) >= request["budget"]["max_seconds"]:
                                 raise Halt("原运行时长已达上限")
                             from doonex.budget import _locked_batch
-                            from doonex.store import termination_unknown
+                            from doonex.store import execution_fenced
 
-                            if termination_unknown(c):
-                                raise Halt("存在终止状态不明的任务容器；禁止验证派发")
+                            if execution_fenced(c):
+                                raise Halt(
+                                    "容器或模型传输进程终止状态不明；禁止验证派发"
+                                )
                             _locked_batch(c, current, dispatch=True)
                             self.scheduler.preflight(c, current)
                             action = self.store.action(
@@ -1027,7 +1057,16 @@ class Worker:
                     }
                     provider_type = getattr(provider_error, "provider_error_type", None)
                     if state == "failed" and not current.get("safety_violation"):
-                        if exception_cause(exc, SandboxError):
+                        if (
+                            provider_error
+                            and (provider_error.diagnostics or {}).get("source")
+                            == "controller"
+                        ):
+                            current["arena_outcome"].update(
+                                classification="environment_failure",
+                                kind="model_transport_control_failure",
+                            )
+                        elif exception_cause(exc, SandboxError):
                             current["arena_outcome"].update(
                                 classification="environment_failure",
                                 kind="docker_control_failure",
@@ -1092,13 +1131,13 @@ class Worker:
                     arena.sync(batch["id"])
             while not self.stopping:
                 self.fence()
-                from doonex.store import termination_unknown
+                from doonex.store import execution_fenced
 
                 with self.store.connect() as c:
-                    blocked = termination_unknown(c)
+                    blocked = execution_fenced(c)
                 if self.cleanup_blocked or self.scheduler.cleanup_blocked or blocked:
                     raise RuntimeError(
-                        "任务容器终止状态不明；执行服务阻止后续任务，须核查"
+                        "容器或模型传输进程终止状态不明；执行服务阻止后续任务，须核查"
                     )
                 self.scheduler.maintain()
                 from doonex.budget import BatchHalt

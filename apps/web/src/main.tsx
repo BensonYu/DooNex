@@ -463,7 +463,8 @@ function App() {
             {recovery.notes.length > 0 && <ul>{recovery.notes.map((note, index) => <li key={index}>{note}</li>)}</ul>}
             <details><summary>查看容器与动作记录</summary><pre>{json({ containers: recovery.containers, pending_actions: recovery.pending_actions })}</pre></details>
             <label className="checkbox-label"><input type="checkbox" checked={acknowledge} onChange={(event) => setAcknowledge(event.target.checked)} />我已核对工作区、容器和结果未知的外部动作，确认可以继续。</label>
-            <button className="primary" disabled={busy || !acknowledge || !recovery.workspace_ok} onClick={() => control('resume')}>确认核查并恢复</button>
+            {recovery.transport_blocked && <button onClick={() => setView('models')}>打开模型传输恢复核查</button>}
+            <button className="primary" disabled={busy || !acknowledge || !recovery.workspace_ok || recovery.transport_blocked} onClick={() => control('resume')}>确认核查并恢复</button>
           </section>}
           {isGeneration ? <section className="workflow-panel" aria-label="生成流程与共享预算"><h2>生成 → 候选结构检查 → 人工审核</h2><p className="field-help">仅一个执行角色，通过 finish 返回文本。原 Run 的调用、token、未知预留和首次启动时钟持续保留。</p></section> : <WorkflowProgress run={selected} />}
           <section className="usage-panel" aria-label="共享预算与累计用量">

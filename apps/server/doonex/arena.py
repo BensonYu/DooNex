@@ -461,9 +461,13 @@ class Arena:
                     )
 
     def resume(self, identifier, acknowledge_unknown):
+        from doonex.responses_registry import helper_fenced
         from doonex.sandbox import Sandbox
         from doonex.worker import get_workspace, run_directory
 
+        with self.store.connect() as connection:
+            if helper_fenced(connection):
+                raise ValueError("模型传输进程尚未完成独立核查；禁止恢复批次")
         value = self.get(identifier)
         if value["state"] != "interrupted" or not acknowledge_unknown:
             raise ValueError("请核查批次的未决动作并明确确认恢复")
@@ -505,6 +509,8 @@ class Arena:
             with self.store.locked(run["id"], dispatch=True) as (c, current):
                 if current["state"] not in {"paused", "interrupted"}:
                     raise ValueError("子运行状态已变化，请重新核查")
+                if helper_fenced(c):
+                    raise ValueError("模型传输进程尚未完成独立核查；禁止恢复批次")
                 if current["request"].get("background"):
                     from doonex.background import Background
 

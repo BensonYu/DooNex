@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { TransportRecovery } from './transport-recovery';
 import { Api, type AccountUsageResult, type MetadataResult, type ModelConfig, type ModelProfile, type ModelProfiles, type ModelsResult, type Role, type Run } from './api';
 
 export const formatMoney = (value: number | null | undefined) => value == null || !Number.isFinite(value) ? '未知' : `US$${value.toFixed(4)}`;
@@ -15,21 +16,25 @@ export function ModelConfigFields({ value, onChange, disabled = false, prefix = 
   return <fieldset className="model-fields" disabled={disabled}>
     <legend>连接与能力配置</legend>
     <div className="settings-grid">
-      <div><label htmlFor={`${prefix}-provider`}>供应商适配器</label><select id={`${prefix}-provider`} value={value.provider} onChange={(event) => change({ provider: event.target.value, ...(event.target.value === 'anthropic' ? { api_mode: 'chat' } : {}) })}>
+      <div><label htmlFor={`${prefix}-provider`}>供应商适配器</label><select id={`${prefix}-provider`} value={value.provider} onChange={(event) => change({ provider: event.target.value, ...(event.target.value === 'anthropic' ? { api_mode: 'chat', responses_transport: 'direct' as const } : {}) })}>
         <option value="openai">OpenAI 兼容接口</option><option value="anthropic">Anthropic 接口</option>
       </select></div>
-      <div><label htmlFor={`${prefix}-api-mode`}>API 模式</label><select id={`${prefix}-api-mode`} value={value.api_mode} onChange={(event) => change({ api_mode: event.target.value })}>
+      <div><label htmlFor={`${prefix}-api-mode`}>API 模式</label><select id={`${prefix}-api-mode`} value={value.api_mode} onChange={(event) => change({ api_mode: event.target.value, ...(event.target.value === 'chat' ? { responses_transport: 'direct' as const } : {}) })}>
         <option value="chat">Chat</option><option value="responses" disabled={value.provider === 'anthropic'}>Responses</option>
       </select></div>
+      {value.api_mode === 'responses' && <div className="span-all"><label htmlFor={`${prefix}-transport`}>Responses 传输方式</label><select id={`${prefix}-transport`} value={value.responses_transport ?? 'direct'} onChange={(event) => change({ responses_transport: event.target.value as ModelConfig['responses_transport'] })}>
+        <option value="direct">现有 SDK 传输</option><option value="isolated_direct_v1">独立传输进程（直连）</option>
+      </select></div>}
       <div className="span-all"><label htmlFor={`${prefix}-base-url`}>API 地址</label><input id={`${prefix}-base-url`} type="url" maxLength={4096} value={value.base_url ?? ''} onChange={(event) => change({ base_url: event.target.value || null })} placeholder="留空使用供应商默认地址" spellCheck={false} autoComplete="off" /></div>
       <div><label htmlFor={`${prefix}-model-id`}>实际模型 ID</label><input id={`${prefix}-model-id`} list={`${prefix}-candidates`} value={value.model_id} maxLength={200} onChange={(event) => change({ model_id: event.target.value })} required spellCheck={false} autoComplete="off" /><datalist id={`${prefix}-candidates`}>{candidates.map((id) => <option key={id} value={id} />)}</datalist></div>
       <div><label htmlFor={`${prefix}-credential-env`}>服务端凭据引用</label><input id={`${prefix}-credential-env`} value={value.credential_env} pattern="[A-Z][A-Z0-9_]{0,100}" maxLength={101} onChange={(event) => change({ credential_env: event.target.value })} placeholder="例如 MODEL_API_KEY" required spellCheck={false} autoComplete="off" /></div>
     </div>
     <p className="field-help">这里只保存凭据的环境变量名或服务端引用，不输入 API key。模型列表是候选 ID；接口、工具调用和上下文能力仍需分别验证。</p>
+    {value.responses_transport === 'isolated_direct_v1' && <p className="field-help">独立传输仅支持直连 HTTPS 或已授权的私网 HTTP，暂不支持代理及自定义证书。进程超时后保留未知用量；本地终止不代表远端请求或计费已结束。</p>}
     <div className="settings-grid settings-numbers">
       <div><label htmlFor={`${prefix}-max-input`}>输入 token 上限</label><input id={`${prefix}-max-input`} type="number" min={16384} max={200000} step={1} required value={value.max_input_tokens} onChange={(event) => change({ max_input_tokens: Number(event.target.value) })} /></div>
       <div><label htmlFor={`${prefix}-max-output`}>输出 token 上限</label><input id={`${prefix}-max-output`} type="number" min={128} max={16384} step={1} required value={value.max_output_tokens} onChange={(event) => change({ max_output_tokens: Number(event.target.value) })} /></div>
-      <div><label htmlFor={`${prefix}-timeout`}>请求超时（秒）</label><input id={`${prefix}-timeout`} type="number" min={1} max={300} step={1} required value={value.timeout_seconds} onChange={(event) => change({ timeout_seconds: Number(event.target.value) })} /></div>
+      <div><label htmlFor={`${prefix}-timeout`}>{value.responses_transport === 'isolated_direct_v1' ? '传输进程时限（秒）' : '传输阶段超时（秒）'}</label><input id={`${prefix}-timeout`} type="number" min={1} max={300} step={1} required value={value.timeout_seconds} onChange={(event) => change({ timeout_seconds: Number(event.target.value) })} /></div>
     </div>
     <label className="checkbox-label"><input type="checkbox" checked={value.allow_private_http} onChange={(event) => change({ allow_private_http: event.target.checked })} />允许连接已授权的私网 HTTP 地址</label>
     <h3>计费与价格元数据</h3>
@@ -60,6 +65,7 @@ export function FrozenModels({ run }: { run: Run }) {
         <dl className="config-list">
           {profile && <div><dt>配置档</dt><dd>{profile.name} · <code>{profile.id}</code> · 版本 {profile.revision}</dd></div>}
           <div><dt>供应商 / 接口</dt><dd>{model.provider} · {model.api_mode}</dd></div>
+          {model.api_mode === 'responses' && <div><dt>Responses 传输</dt><dd>{model.responses_transport === 'isolated_direct_v1' ? '独立传输进程（直连）' : '现有 SDK 传输'} · {model.timeout_seconds} 秒</dd></div>}
           <div><dt>凭据引用</dt><dd>{model.credential_env}</dd></div>
           {model.base_url && <div><dt>API 地址</dt><dd className="path-text">{model.base_url}</dd></div>}
           <div><dt>输入 / 输出上限</dt><dd>{model.max_input_tokens.toLocaleString()} / {model.max_output_tokens.toLocaleString()} tokens</dd></div>
@@ -179,6 +185,7 @@ export function ModelSettings({ api, registry, onRegistry, onClose }: {
 
   return <div className="model-settings-view">
     <div className="page-heading"><div><h1>模型设置</h1><p className="muted">保存明确的连接与能力配置，在创建任务时按角色选择。</p></div><button onClick={onClose}>返回工作台</button></div>
+    <TransportRecovery api={api} />
     {error && <p className="notice error" role="alert">{error}</p>}{notice && <p className="notice" role="status">{notice}</p>}
     <div className="profiles-layout">
       <nav className="profiles-list" aria-label="模型配置档">

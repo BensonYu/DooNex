@@ -104,6 +104,9 @@ def create_app(settings=None):
                 raise HTTPException(404, "运行不属于所选项目")
 
     auth = [Depends(authenticated)]
+    from doonex.responses_api import install_responses_routes
+
+    install_responses_routes(app, settings, store, auth)
 
     @app.exception_handler(ValueError)
     async def invalid(request, exc):
@@ -515,6 +518,12 @@ def create_app(settings=None):
         if result.returncode:
             raise ValueError("无法核查 Docker 状态，禁止恢复")
         pending = store.pending(run["id"])
+        from doonex.responses_registry import helper_fenced
+
+        with store.connect() as connection:
+            transport_blocked = helper_fenced(connection)
+        if transport_blocked:
+            notes.append("存在未核查的模型传输进程；请先在模型设置中打开模型传输恢复核查。")
         if pending:
             notes.append(
                 "存在未决动作；未知模型用量保留预留额度。请核对现有文件再确认续接。"
@@ -524,6 +533,7 @@ def create_app(settings=None):
             "pending_actions": pending,
             "workspace_ok": workspace_ok,
             "notes": notes,
+            "transport_blocked": transport_blocked,
         }
 
     @app.post("/api/runs/{run_id}/resume", dependencies=auth)
@@ -554,6 +564,10 @@ def create_app(settings=None):
         with store.locked(run["id"], dispatch=True) as (c, current):
             if current["state"] not in {"paused", "interrupted"}:
                 raise ValueError("运行状态已变化")
+            from doonex.responses_registry import helper_fenced
+
+            if helper_fenced(c):
+                raise ValueError("模型传输进程尚未完成独立核查；普通续接不能解除阻止")
             if reset_session:
                 current["session_generation"] = current.get("session_generation", 0) + 1
                 current["resume_session"] = False

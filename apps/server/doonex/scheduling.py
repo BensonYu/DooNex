@@ -3,7 +3,7 @@
 from copy import deepcopy
 
 from doonex.budget import BatchHalt, elapsed
-from doonex.store import dispatch_lock, now, termination_unknown
+from doonex.store import dispatch_lock, execution_fenced, now
 
 
 class Yielded(BaseException):
@@ -62,8 +62,8 @@ class Scheduler:
         if not binding:
             return
         evaluation_id = run["request"]["arena"]["evaluation_id"]
-        if termination_unknown(connection):
-            raise BatchHalt("存在终止状态不明的容器；禁止后台派发", evaluation_id)
+        if execution_fenced(connection):
+            raise BatchHalt("存在未核查的容器或模型传输进程；禁止后台派发", evaluation_id)
         try:
             self.background.preflight(
                 connection, binding["authorization_id"], evaluation_id
@@ -208,7 +208,7 @@ class Scheduler:
         from doonex.background import BackgroundStopped, BackgroundWaiting
 
         with self.store.connect() as c:
-            if termination_unknown(c) or queued_work(c):
+            if execution_fenced(c) or queued_work(c):
                 return
         for authorization in self.background.list():
             if authorization["state"] != "enabled":
@@ -233,7 +233,7 @@ class Scheduler:
                 arena_prepared = arena.prepare(body)
                 with self.store.connect() as c:
                     dispatch_lock(c)
-                    if termination_unknown(c) or queued_work(c):
+                    if execution_fenced(c) or queued_work(c):
                         return
                     claim = self.background.claim(
                         c, authorization["id"], prepared=prepared

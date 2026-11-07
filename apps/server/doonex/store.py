@@ -94,6 +94,13 @@ def termination_unknown(connection):
     )
 
 
+def execution_fenced(connection):
+    """Unresolved process records survive Run state and action acknowledgement."""
+    from doonex.responses_registry import helper_fenced
+
+    return termination_unknown(connection) or helper_fenced(connection)
+
+
 class Store:
     def __init__(self, database_url):
         self.database_url = database_url
@@ -136,6 +143,9 @@ class Store:
             from doonex.community_evidence import COMMUNITY_EVIDENCE_SCHEMA
 
             connection.execute(COMMUNITY_EVIDENCE_SCHEMA)
+            from doonex.responses_registry import HELPER_REGISTRY_SCHEMA
+
+            connection.execute(HELPER_REGISTRY_SCHEMA)
             # Keep the M1 source row intact. Repeated startup never overwrites
             # updated M2 metadata, identities, runs or their private artifacts.
             connection.execute(
