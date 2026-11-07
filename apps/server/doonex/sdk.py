@@ -938,7 +938,14 @@ class GuardedLLM(LLM):
                 },
             }
         try:
-            reservation = self._before(estimate, self.max_output_tokens)
+            if self._responses_transport is not None:
+                reservation = self._before(
+                    estimate,
+                    self.max_output_tokens,
+                    responses_request_id=client_request_id,
+                )
+            else:
+                reservation = self._before(estimate, self.max_output_tokens)
         except SchedulerYield:
             if self._scheduling is None:
                 raise
@@ -1272,7 +1279,10 @@ def run_session(
     frozen_prompt: str | None = None,
     responses_transport: Callable | None = None,
 ) -> str:
-    """Run/resume one SDK conversation; model credentials remain in this process.
+    """Run/resume one SDK conversation with server-owned model credentials.
+
+    Isolated Responses passes only the current request key through an anonymous
+    pipe to its fixed helper, after the durable armed acknowledgment.
 
     The caller owns container isolation, action timeouts, persistent budget
     reservations, process ownership and crash reconciliation. A recorded action

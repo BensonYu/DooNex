@@ -6,6 +6,7 @@ import pytest
 from doonex.api import create_app
 from doonex.arena import Arena
 from doonex.budget import Halt, Ledger
+from doonex.responses_process import LeaseIdentity
 from doonex.responses_registry import helper_fenced
 from doonex.scheduling import Scheduler
 from doonex.worker import Worker
@@ -18,16 +19,12 @@ pytestmark = pytest.mark.postgres
 
 
 def unresolved_with_real_lease(factory, settings):
-    item = factory()
     lease = settings.home / "responses-helper" / "lifetime.lease"
     lease.parent.mkdir(parents=True, mode=0o700)
     fd = os.open(lease, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
     observed = os.fstat(fd)
     os.close(fd)
-    item["registration"]["lease"] = {
-        "device": observed.st_dev,
-        "inode": observed.st_ino,
-    }
+    item = factory(lease=LeaseIdentity(observed.st_dev, observed.st_ino))
     item["registry"].register(item["registration"])
     return item
 
@@ -35,11 +32,13 @@ def unresolved_with_real_lease(factory, settings):
 @pytest.mark.parametrize(
     "action_status", ["pending", "unknown", "acknowledged", "completed"]
 )
+@pytest.mark.parametrize("stage", ["reserved", "prepared"])
 def test_helper_fence_survives_action_and_run_state_changes(
-    factory, store, settings, request_data, action_status
+    factory, store, settings, request_data, action_status, stage
 ):
     item = factory()
-    item["registry"].register(item["registration"])
+    if stage == "prepared":
+        item["registry"].register(item["registration"])
     with store.connect() as connection:
         connection.execute(
             "UPDATE actions SET status=%s WHERE id=%s",

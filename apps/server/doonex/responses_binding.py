@@ -1,12 +1,20 @@
 """Worker-owned connection between a reserved model action and one helper."""
 
+import os
 import secrets
 import time
-from uuid import uuid4
+from datetime import UTC, datetime
+from uuid import UUID, uuid4
 
 from doonex.budget import elapsed
 from doonex.responses_adapter import HelperReportedError
-from doonex.responses_process import HelperHooks, HelperRequest, run_helper
+from doonex.responses_process import (
+    HelperAttempt,
+    HelperHooks,
+    HelperRequest,
+    LeaseSpec,
+    run_helper,
+)
 from doonex.responses_protocol import assert_direct_environment, validate_call
 from doonex.responses_registry import ResponsesRegistry, lease_spec
 from doonex.responses_transport import rebuild_response
@@ -34,6 +42,37 @@ class ResponsesBinding:
         self.model, self.api_key = dict(model), api_key
         self._entered: set[str] = set()
 
+    def prepare_intent(self, client_request_id):
+        """Probe the actual permanent inode before Ledger takes dispatch locks."""
+        if (
+            type(client_request_id) is not str
+            or str(UUID(client_request_id)) != client_request_id
+        ):
+            raise ValueError("Responses requires its SDK client request identity")
+        self.check_dispatch()
+        assert_direct_environment()
+        lease = lease_spec(self.settings, self.store, check_owner=self.check_owner)
+        self.check_dispatch()
+        run = self.store.get(self.run_id)
+        remaining = min(
+            self.model["timeout_seconds"],
+            run["request"]["budget"]["max_seconds"] - elapsed(run),
+        )
+        if remaining <= 0:
+            raise ValueError("Responses request has no remaining time")
+        observed = time.monotonic_ns()
+        return HelperAttempt(
+            str(uuid4()),
+            client_request_id,
+            secrets.token_hex(32),
+            os.getpid(),
+            observed,
+            _PARENT_BOOT_ID,
+            datetime.now(UTC).isoformat(),
+            lease.expected_identity,
+            observed + int(remaining * 1_000_000_000),
+        )
+
     def _registry(self, reservation):
         return ResponsesRegistry(
             self.settings,
@@ -47,14 +86,13 @@ class ResponsesBinding:
     def _not_spawned(self, reservation, client_request_id):
         # Only the original live parent uses this path, before entering
         # run_helper. A restarted worker cannot infer this from an empty lock.
+        attempt = HelperAttempt.from_record(reservation["transport_helper"])
+        if client_request_id != attempt.client_request_id:
+            raise ValueError("Responses client request identity changed")
         return self._registry(reservation).block(
             {
-                "schema": 1,
-                "transport": "isolated_direct_v1",
-                "attempt_id": str(uuid4()),
-                "client_request_id": client_request_id,
-                "nonce": secrets.token_hex(32),
-                "previous_record_sha256": None,
+                **attempt.base(),
+                "previous_record_sha256": attempt.record_sha256,
                 "spawn_attempted": False,
                 "child_pid": None,
                 "reaped": False,
@@ -66,7 +104,9 @@ class ResponsesBinding:
     def abandon_uninvoked(self, reservation):
         """SDK preparation failed before this binding was ever called."""
         if reservation["id"] not in self._entered:
-            self._not_spawned(reservation, str(uuid4()))
+            self._not_spawned(
+                reservation, reservation["transport_helper"]["client_request_id"]
+            )
             self._entered.add(reservation["id"])
 
     def __call__(self, reservation, sdk_call, client_request_id):
@@ -76,6 +116,14 @@ class ResponsesBinding:
         self._entered.add(action_id)
         invoked = False
         try:
+            attempt = HelperAttempt.from_record(reservation["transport_helper"])
+            if (
+                client_request_id != attempt.client_request_id
+                or reservation["transport_helper"]["run_id"] != self.run_id
+                or reservation["transport_helper"]["action_id"] != action_id
+                or reservation["transport_helper"]["owner"] != self.owner
+            ):
+                raise ValueError("Responses reservation identity changed")
             self.check_dispatch()
             assert_direct_environment()
             call = dict(sdk_call)
@@ -106,12 +154,14 @@ class ResponsesBinding:
             )
             if remaining <= 0:
                 raise ValueError("Responses request has no remaining time")
-            deadline = time.monotonic_ns() + int(remaining * 1_000_000_000)
-            lease = lease_spec(
-                self.settings,
-                self.store,
-                check_owner=self.check_owner,
-                exclude_action_id=action_id,
+            deadline = min(
+                attempt.deadline_monotonic_ns,
+                time.monotonic_ns() + int(remaining * 1_000_000_000),
+            )
+            lease = LeaseSpec(
+                self.settings.home / "responses-helper" / "lifetime.lease",
+                attempt.lease_identity,
+                False,
             )
             registry = self._registry(reservation)
             request = HelperRequest(
@@ -119,8 +169,7 @@ class ResponsesBinding:
                 api_key=self.api_key,
                 deadline_monotonic_ns=deadline,
                 lease=lease,
-                parent_boot_id=_PARENT_BOOT_ID,
-                client_request_id=client_request_id,
+                attempt=attempt,
             )
 
             def register(payload):

@@ -11,7 +11,7 @@ from uuid import uuid4
 
 import pytest
 from doonex.budget import Ledger
-from doonex.responses_process import LeaseIdentity, LeaseInspection
+from doonex.responses_process import HelperAttempt, LeaseIdentity, LeaseInspection
 from doonex.responses_registry import (
     HELPER_FENCE_PREDICATE,
     HELPER_REGISTRY_SCHEMA,
@@ -25,6 +25,7 @@ from doonex.responses_registry import (
     inspect_helper,
     lease_spec,
     list_unresolved,
+    reserved_record,
     resolve_helper,
 )
 from doonex.store import OwnershipLost
@@ -39,15 +40,33 @@ def registry_schema(store):
 
 @pytest.fixture
 def factory(settings, store, request_data):
-    def create(*, marker=True):
-        run = store.create_run(request_data)
+    def create(*, marker=True, initial=True, lease=None):
+        data = copy.deepcopy(request_data)
+        if marker and initial:
+            data["model"].update(api_mode="responses", responses_transport=MODE)
+        run = store.create_run(data)
         owner = str(uuid4())
         with store.locked(run["id"]) as (_, current):
             current.update(state="running", owner=owner)
         ledger = Ledger(store, run["id"], owner)
-        reservation = ledger.reserve(100, 50)
+        observed = time.monotonic_ns()
+        intent = HelperAttempt(
+            str(uuid4()),
+            str(uuid4()),
+            uuid4().hex + uuid4().hex,
+            os.getpid(),
+            observed,
+            "offline-contract-fixture",
+            datetime.now(UTC).isoformat(),
+            lease or LeaseIdentity(1, 2),
+            observed + 60_000_000_000,
+        )
+        reservation = ledger.reserve(
+            100, 50, **({"helper_intent": intent} if marker and initial else {})
+        )
         action_id = reservation["id"]
-        if marker:
+        if marker and not initial:
+            # Deliberate historical missing-record fixture, not a new writer.
             with store.connect() as connection:
                 connection.execute(
                     "UPDATE actions SET data=data || %s WHERE id=%s",
@@ -61,23 +80,18 @@ def factory(settings, store, request_data):
             action_id=action_id,
             check_owner=lambda: None,
         )
-        base = {
-            "schema": 1,
-            "transport": MODE,
-            "attempt_id": str(uuid4()),
-            "client_request_id": str(uuid4()),
-            "nonce": uuid4().hex + uuid4().hex,
-        }
+        base = intent.base()
+        current = reservation.get("transport_helper")
+        reserved = ResponsesRegistry._ack(current) if current else None
         registration = {
             **base,
-            "parent": {
-                "pid": os.getpid(),
-                "observed_monotonic_ns": time.monotonic_ns(),
-                "boot_id": "offline-contract-fixture",
-            },
-            "deadline_monotonic_ns": time.monotonic_ns() + 60_000_000_000,
-            "observed_at_utc": datetime.now(UTC).isoformat(),
-            "lease": {"device": 1, "inode": 2},
+            "previous_record_sha256": current["record_sha256"] if current else "0" * 64,
+            "parent": intent.parent(),
+            "deadline_monotonic_ns": current["deadline_monotonic_ns"]
+            if current
+            else intent.deadline_monotonic_ns,
+            "observed_at_utc": intent.observed_at_utc,
+            "lease": intent.lease_identity.data(),
         }
         return {
             "registry": registry,
@@ -88,6 +102,8 @@ def factory(settings, store, request_data):
             "registration": registration,
             "ledger": ledger,
             "reservation": reservation,
+            "intent": intent,
+            "reserved": reserved,
         }
 
     return create
@@ -150,9 +166,9 @@ def completion(item, acknowledgment, reap):
 def blocked(item, acknowledgment=None, *, spawned=True, reaped=False):
     return {
         **item["base"],
-        "previous_record_sha256": acknowledgment["record_sha256"]
-        if acknowledgment
-        else None,
+        "previous_record_sha256": (acknowledgment or item.get("reserved") or {}).get(
+            "record_sha256"
+        ),
         "spawn_attempted": spawned,
         "child_pid": 123 if spawned else None,
         "reaped": reaped,
@@ -233,7 +249,78 @@ def test_prepared_receipt_lost_can_record_known_not_spawned(
     payload = blocked(item, spawned=False)
     done = item["registry"].block(payload)
     assert done["state"] == "not_spawned" and not fenced(store)
-    assert item["registry"].block(payload) == done
+    # After cleanup, that initial hash is two transitions old. It must not
+    # become a general ancestor-CAS exception for a terminal record.
+    with pytest.raises(RegistryError, match="cas"):
+        item["registry"].block(payload)
+    assert (
+        item["registry"].block(
+            {**payload, "previous_record_sha256": done["record_sha256"]}
+        )
+        == done
+    )
+
+
+def test_register_only_shrinks_deadline_and_keeps_final_deadline_immutable(
+    factory, store
+):
+    item = factory()
+    initial = record(store, item)
+    with pytest.raises(RegistryError, match="cas"):
+        item["registry"].register(
+            {
+                **item["registration"],
+                "deadline_monotonic_ns": initial["deadline_monotonic_ns"] + 1,
+            }
+        )
+    registration = {
+        **item["registration"],
+        "deadline_monotonic_ns": initial["deadline_monotonic_ns"] - 1_000_000_000,
+    }
+    prepared = item["registry"].register(registration)
+    current = record(store, item)
+    assert current["deadline_monotonic_ns"] == registration["deadline_monotonic_ns"]
+    assert current["transition_from_sha256"] == initial["record_sha256"]
+    assert item["registry"].register(registration) == prepared
+    with pytest.raises(RegistryError, match="cas"):
+        item["registry"].register(item["registration"])
+    reap = actual_reap()
+    payload = {
+        **item["base"],
+        "previous_record_sha256": prepared["record_sha256"],
+        "child": {"pid": reap["pid"], "pgid": reap["pid"]},
+        "lease": registration["lease"],
+        "deadline_monotonic_ns": initial["deadline_monotonic_ns"],
+    }
+    with pytest.raises(RegistryError, match="arm_binding"):
+        item["registry"].arm(payload)
+    item["registry"].arm(
+        {**payload, "deadline_monotonic_ns": registration["deadline_monotonic_ns"]}
+    )
+    assert (
+        record(store, item)["deadline_monotonic_ns"]
+        == registration["deadline_monotonic_ns"]
+    )
+
+
+def test_reserved_cannot_claim_spawn_or_reap_and_old_ancestor_cannot_skip_arm(
+    factory, store
+):
+    item = factory()
+    initial = copy.deepcopy(record(store, item))
+    reap = actual_reap()
+    with pytest.raises(RegistryError, match="cas"):
+        arm(item, item["reserved"], reap)
+    with pytest.raises(RegistryError, match="cas"):
+        item["registry"].complete(completion(item, item["reserved"], reap))
+    with pytest.raises(RegistryError, match="not_spawned_binding"):
+        item["registry"].block(blocked(item))
+    assert record(store, item) == initial
+    prepared = item["registry"].register(item["registration"])
+    arm(item, prepared, reap)
+    with pytest.raises(RegistryError, match="cas"):
+        item["registry"].block(blocked(item, item["reserved"], spawned=False))
+    assert record(store, item)["state"] == "armed" and fenced(store)
 
 
 def test_arm_commit_unknown_cannot_use_old_hash_to_claim_reap(
@@ -267,12 +354,40 @@ def test_complete_commit_unknown_is_idempotent_and_never_downgraded(
     assert item["registry"].block(blocked(item, armed, reaped=True)) == done
 
 
+def legacy_no_spawn(store, item):
+    """Retain an explicit old valid row; no production API backfills it."""
+    with store.connect() as connection:
+        value = reserved_record(
+            connection,
+            run_id=item["run_id"],
+            action_id=item["action_id"],
+            owner=item["owner"],
+            attempt=item["intent"],
+        )
+        failure = {
+            key: blocked(item, spawned=False)[key]
+            for key in ("reason", "spawn_attempted", "child_pid", "reaped", "errors")
+        }
+        value.update(
+            state="not_spawned",
+            registered=False,
+            parent=None,
+            lease=None,
+            deadline_monotonic_ns=None,
+            failure=failure,
+        )
+        value["record_sha256"] = _digest(connection, value)
+        connection.execute(
+            "UPDATE actions SET data=jsonb_set(data,'{transport_helper}',%s) WHERE id=%s",
+            (Jsonb(value), item["action_id"]),
+        )
+    return value
+
+
 def test_unregistered_known_not_spawned_has_no_fabricated_identity(factory, store):
-    item = factory()
-    payload = blocked(item, spawned=False)
-    done = item["registry"].block(payload)
-    current = record(store, item)
-    assert done["state"] == "not_spawned" and not fenced(store)
+    item = factory(initial=False)
+    current = legacy_no_spawn(store, item)
+    assert not fenced(store)
     assert not current["registered"]
     assert (
         current["lease"]
@@ -280,18 +395,19 @@ def test_unregistered_known_not_spawned_has_no_fabricated_identity(factory, stor
         is current["deadline_monotonic_ns"]
         is None
     )
-    assert item["registry"].block(payload) == done
+    assert (
+        item["registry"].block(blocked(item, spawned=False))["state"] == "not_spawned"
+    )
     with store.connect() as connection:
         assert historical_lease_identity(connection) is None
 
 
 def test_safe_no_spawn_history_does_not_prevent_first_lease(factory, store, settings):
-    item = factory()
-    item["registry"].block(blocked(item, spawned=False))
-    spec = lease_spec(
-        settings, store, check_owner=lambda: None, lease_inspector=free_lease
-    )
-    assert spec.expected_identity is None and spec.allow_create
+    item = factory(initial=False)
+    legacy_no_spawn(store, item)
+    spec = lease_spec(settings, store, check_owner=lambda: None)
+    assert spec.expected_identity.inode == spec.path.stat().st_ino
+    assert not spec.allow_create
 
 
 @pytest.mark.parametrize(
@@ -304,7 +420,7 @@ def test_safe_no_spawn_history_does_not_prevent_first_lease(factory, store, sett
     ],
 )
 def test_missing_record_never_implies_not_spawned(factory, store, change):
-    item = factory()
+    item = factory(initial=False)
     with pytest.raises(RegistryError):
         item["registry"].block({**blocked(item, spawned=False), **change})
     assert record(store, item) is None and fenced(store)
@@ -312,7 +428,7 @@ def test_missing_record_never_implies_not_spawned(factory, store, change):
 
 def test_unmarked_action_cannot_become_unregistered_receipt(factory, store):
     item = factory(marker=False)
-    with pytest.raises(RegistryError, match="not_spawned_binding"):
+    with pytest.raises(RegistryError, match="record_missing"):
         item["registry"].block(blocked(item, spawned=False))
 
 
@@ -499,47 +615,75 @@ def test_operator_rejects_active_worker_and_stale_hash(factory, store, settings)
 
 
 def test_history_lease_binding_and_first_install_adoption(factory, store, settings):
-    item = factory()
-    path = settings.home / "responses-helper" / "lifetime.lease"
-    missing = lease_spec(
-        settings,
-        store,
-        check_owner=lambda: None,
-        exclude_action_id=item["action_id"],
-        lease_inspector=free_lease,
-    )
-    assert missing.allow_create and missing.expected_identity is None
-    path.touch(mode=0o600)
-    adopted = lease_spec(
-        settings,
-        store,
-        check_owner=lambda: None,
-        exclude_action_id=item["action_id"],
-        lease_inspector=free_lease,
-    )
-    assert not adopted.allow_create and adopted.expected_identity == LeaseIdentity(1, 2)
+    first = lease_spec(settings, store, check_owner=lambda: None)
+    assert first.expected_identity.inode == first.path.stat().st_ino
+    assert not first.allow_create
+    adopted = lease_spec(settings, store, check_owner=lambda: None)
+    assert adopted == first
+    item = factory(lease=first.expected_identity)
     prepared = item["registry"].register(item["registration"])
-    reap = actual_reap()
-    item["registry"].complete(completion(item, prepared, reap))
-    expected = lease_spec(
-        settings, store, check_owner=lambda: None, lease_inspector=free_lease
-    )
-    assert (
-        expected.expected_identity == LeaseIdentity(1, 2) and not expected.allow_create
-    )
+    item["registry"].complete(completion(item, prepared, actual_reap()))
+    expected = lease_spec(settings, store, check_owner=lambda: None)
+    assert expected == first
 
     def wrong(spec):
-        return LeaseInspection(LeaseIdentity(1, 3), False)
+        return LeaseInspection(
+            LeaseIdentity(
+                first.expected_identity.device, first.expected_identity.inode + 1
+            ),
+            False,
+        )
 
     with pytest.raises(RegistryError, match="lease_changed"):
         lease_spec(settings, store, check_owner=lambda: None, lease_inspector=wrong)
 
 
-def test_matching_partial_index_avoids_terminal_history_scan(factory, store):
+def test_v2_index_install_preserves_old_definition_and_resolves_reserved(
+    factory, store, settings
+):
+    old_predicate = HELPER_FENCE_PREDICATE.replace(
+        "IN ('reserved','prepared','armed','blocked')",
+        "IN ('prepared','armed','blocked')",
+    )
+    assert old_predicate != HELPER_FENCE_PREDICATE
+    with store.connect() as connection:
+        connection.execute("DROP INDEX actions_helper_fenced_v2")
+        connection.execute(
+            f"CREATE INDEX actions_helper_fenced ON actions(id) WHERE {old_predicate}"
+        )
+        old_definition = connection.execute(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname=current_schema() AND indexname='actions_helper_fenced'"
+        ).fetchone()["indexdef"]
+        connection.execute(HELPER_REGISTRY_SCHEMA)
+        definitions = {
+            row["indexname"]: row["indexdef"]
+            for row in connection.execute(
+                "SELECT indexname,indexdef FROM pg_indexes WHERE schemaname=current_schema() AND indexname IN ('actions_helper_fenced','actions_helper_fenced_v2')"
+            ).fetchall()
+        }
+    assert definitions["actions_helper_fenced"] == old_definition
+    assert "'reserved'" in definitions["actions_helper_fenced_v2"]
+    item = factory()
+    initial = record(store, item)
+    assert initial["state"] == "reserved" and fenced(store)
+    result = resolve(settings, store, item, initial)
+    assert result["record"]["resolution"]["original_state"] == "reserved"
+    assert not fenced(store)
+    next_item = factory()
+    assert record(store, next_item)["state"] == "reserved"
+    assert next_item["base"]["attempt_id"] != item["base"]["attempt_id"]
+    assert fenced(store)
+
+
+def test_matching_partial_index_avoids_terminal_history_scan(factory, store, settings):
     item = factory()
     prepared = item["registry"].register(item["registration"])
     item["registry"].complete(completion(item, prepared, actual_reap()))
     current = record(store, item)
+    resolved_item = factory()
+    resolved = resolve(settings, store, resolved_item, record(store, resolved_item))[
+        "record"
+    ]
     count = int(os.environ.get("DOONEX_REGISTRY_SCALE", "10000"))
     with store.connect() as connection:
         for start in range(1, count + 1, 10000):
@@ -547,12 +691,19 @@ def test_matching_partial_index_avoids_terminal_history_scan(factory, store):
                 """WITH ids AS (
             SELECT md5('registry-scale-' || n::text)::uuid AS id FROM generate_series(%s::integer,%s::integer) n
         ), records AS (
-            SELECT id,%s::jsonb || jsonb_build_object('action_id',id::text) AS record FROM ids
+            SELECT id,(CASE WHEN substr(id::text,1,1)<'8' THEN %s::jsonb ELSE %s::jsonb END) || jsonb_build_object('action_id',id::text,'run_id',%s::text) AS record FROM ids
         ) INSERT INTO actions(id,run_id,kind,status,data)
         SELECT id,%s,'model','completed',jsonb_build_object('transport_mode','isolated_direct_v1','transport_helper',
           record || jsonb_build_object('record_sha256',encode(sha256(jsonb_send(record-'record_sha256')),'hex')))
         FROM records""",
-                (start, min(start + 9999, count), Jsonb(current), item["run_id"]),
+                (
+                    start,
+                    min(start + 9999, count),
+                    Jsonb(current),
+                    Jsonb(resolved),
+                    item["run_id"],
+                    item["run_id"],
+                ),
             )
         connection.execute("ANALYZE actions")
         plan = connection.execute(
@@ -567,7 +718,9 @@ def test_matching_partial_index_avoids_terminal_history_scan(factory, store):
 
         walk(plan["Plan"])
         print(json.dumps({"terminal_history_rows": count + 1, "fence_plan": plan}))
-        assert any(node.get("Index Name") == "actions_helper_fenced" for node in nodes)
+        assert any(
+            node.get("Index Name") == "actions_helper_fenced_v2" for node in nodes
+        )
         assert not any(node["Node Type"] == "Seq Scan" for node in nodes)
         assert not helper_fenced(connection)
 
@@ -597,7 +750,6 @@ def test_duplicate_transition_still_requires_original_cas_hash(factory, store):
 def test_real_fd_resolution_keeps_inherited_lock_and_unknown_budget(
     factory, store, settings
 ):
-    item = factory()
     path = settings.home / "responses-helper" / "lifetime.lease"
     path.parent.mkdir(mode=0o700, parents=True)
     descriptor = os.open(
@@ -605,7 +757,7 @@ def test_real_fd_resolution_keeps_inherited_lock_and_unknown_budget(
     )
     try:
         info = os.fstat(descriptor)
-        item["registration"]["lease"] = {"device": info.st_dev, "inode": info.st_ino}
+        item = factory(lease=LeaseIdentity(info.st_dev, info.st_ino))
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         item["registry"].register(item["registration"])
         item["ledger"].settle(item["reservation"], None)
@@ -631,12 +783,11 @@ def test_real_fd_resolution_keeps_inherited_lock_and_unknown_budget(
 def test_real_missing_or_replaced_lease_is_never_recreated(
     factory, store, settings, mode
 ):
-    item = factory()
     path = settings.home / "responses-helper" / "lifetime.lease"
     path.parent.mkdir(mode=0o700, parents=True)
     path.touch(mode=0o600)
     info = path.stat()
-    item["registration"]["lease"] = {"device": info.st_dev, "inode": info.st_ino}
+    item = factory(lease=LeaseIdentity(info.st_dev, info.st_ino))
     item["registry"].register(item["registration"])
     current = record(store, item)
     path.unlink()

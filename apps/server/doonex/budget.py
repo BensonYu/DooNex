@@ -1,6 +1,8 @@
 """Pre-dispatch reservations persist across retries, crashes and resumes."""
 
 import math
+import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -193,7 +195,7 @@ class Ledger:
             raise Halt("角色分配已改变，旧回调不得继续派发或结算")
         return [run["usage"], assignment["usage"]]
 
-    def reserve(self, input_tokens, output_tokens):
+    def reserve(self, input_tokens, output_tokens, *, helper_intent=None):
         with self.store.locked(self.run_id, self.owner, dispatch=True) as (c, run):
             if execution_fenced(c):
                 raise Halt("存在未核查的容器或模型传输进程；禁止派发")
@@ -207,6 +209,26 @@ class Ledger:
                 run["request"]["budget"],
                 run["usage"],
             )
+            isolated = model.get("responses_transport") == "isolated_direct_v1"
+            if isolated:
+                from doonex.responses_process import HelperAttempt
+
+                if type(helper_intent) is not HelperAttempt:
+                    raise ValueError("Isolated reservation requires its helper intent")
+                if type(helper_intent.deadline_monotonic_ns) is not int:
+                    raise ValueError("Isolated helper deadline must be an integer")
+                ceiling = time.monotonic_ns() + int(
+                    min(model["timeout_seconds"], limits["max_seconds"] - elapsed(run))
+                    * 1_000_000_000
+                )
+                helper_intent = replace(
+                    helper_intent,
+                    deadline_monotonic_ns=min(
+                        helper_intent.deadline_monotonic_ns, ceiling
+                    ),
+                )
+            elif helper_intent is not None:
+                raise ValueError("Direct reservation cannot bind a helper intent")
             if (
                 input_tokens < 0
                 or output_tokens < 1
@@ -260,6 +282,23 @@ class Ledger:
                 **({"evaluation_id": batch[0]} if batch is not None else {}),
             }
             action_id = self.store.action(self.run_id, "model", reservation, c)
+            if isolated:
+                from doonex.responses_registry import reserved_record
+
+                reservation["transport_helper"] = reserved_record(
+                    c,
+                    run_id=self.run_id,
+                    action_id=action_id,
+                    owner=self.owner,
+                    attempt=helper_intent,
+                )
+                c.execute(
+                    "UPDATE actions SET data=data || %s WHERE id=%s",
+                    (
+                        Jsonb({"transport_helper": reservation["transport_helper"]}),
+                        action_id,
+                    ),
+                )
             for item in usages:
                 item["calls"] += 1
                 item["reserved_tokens"] += tokens

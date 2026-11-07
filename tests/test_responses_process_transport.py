@@ -11,6 +11,7 @@ import os
 import signal
 import threading
 import time
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from uuid import uuid4
@@ -251,7 +252,12 @@ class _ChainedHooks:
         self.request = request
         self.state = state
         self.observer = observer
-        self.previous = None
+        self.previous = {
+            "attempt_id": request.attempt.attempt_id,
+            "nonce": request.attempt.nonce,
+            "state": "reserved",
+            "record_sha256": request.attempt.record_sha256,
+        }
         self.child_pid = None
 
     def invoke(self, target):
@@ -264,7 +270,7 @@ class _ChainedHooks:
                 assert data["nonce"] == self.previous["nonce"]
                 assert data["previous_record_sha256"] == self.previous["record_sha256"]
             if target == "prepared":
-                assert self.previous is None and not self.state.requests
+                assert self.previous["state"] == "reserved" and not self.state.requests
                 assert data["parent"]["pid"] == os.getpid()
                 assert data["parent"]["boot_id"] == self.request.parent_boot_id
                 assert (
@@ -387,13 +393,28 @@ def prepared(tmp_path, monkeypatch, loopback_server):
             "include": ["reasoning.encrypted_content"],
             "reasoning": {"effort": "high"},
         }
+        deadline = time.monotonic_ns() + int(seconds * 1e9)
+        lease = process.prepare_lease(
+            process.LeaseSpec(private / "lease", allow_create=True)
+        )
+        attempt = process.HelperAttempt(
+            str(uuid4()),
+            client_request_id,
+            uuid4().hex + uuid4().hex,
+            os.getpid(),
+            time.monotonic_ns(),
+            "offline-process-transport-test-boot",
+            datetime.now(UTC).isoformat(),
+            lease.expected_identity,
+            deadline,
+            "0" * 64,
+        )
         request = process.HelperRequest(
             call,
             _SYNTHETIC_KEY,
-            time.monotonic_ns() + int(seconds * 1e9),
-            process.LeaseSpec(private / "lease", allow_create=True),
-            "offline-process-transport-test-boot",
-            client_request_id,
+            deadline,
+            lease,
+            attempt,
         )
         observer = _ObservedLifecycle(monkeypatch)
         hooks = _ChainedHooks(request, state, observer)

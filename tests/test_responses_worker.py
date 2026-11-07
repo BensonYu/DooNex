@@ -160,8 +160,8 @@ def test_sdk_preparation_failure_records_original_parent_not_spawned(
     (row,) = actions(store, run["id"])
     helper = row["data"]["transport_helper"]
     assert helper["state"] == "not_spawned"
-    assert helper["registered"] is False
-    assert helper["lease"] is None
+    assert helper["registered"] is True
+    assert helper["lease"]["inode"] > 0
     with store.connect() as connection:
         assert not helper_fenced(connection)
     with TestClient(create_app(settings)) as client:

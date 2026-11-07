@@ -353,11 +353,24 @@ class Worker:
                         },
                     )
 
-                def before_model(input_tokens, output_tokens):
+                def before_model(
+                    input_tokens, output_tokens, *, responses_request_id=None
+                ):
                     self.fence()
                     if role_stop():
                         raise Halt("运行或角色已停止派发新动作")
-                    return ledger.reserve(input_tokens, output_tokens)
+                    intent = None
+                    if responses_transport is not None:
+                        intent = responses_transport.prepare_intent(
+                            responses_request_id
+                        )
+                    elif responses_request_id is not None:
+                        raise ValueError(
+                            "Direct model cannot reserve a helper identity"
+                        )
+                    return ledger.reserve(
+                        input_tokens, output_tokens, helper_intent=intent
+                    )
 
                 def after_model(reservation, usage):
                     self.lease()

@@ -19,15 +19,17 @@ from psycopg.types.json import Jsonb
 from .responses_process import (
     CLEANUP_ERROR_CODES,
     FAILURE_REASONS,
+    HelperAttempt,
     LeaseIdentity,
     LeaseSpec,
     inspect_lease,
+    prepare_lease,
 )
 from .store import OwnershipLost, dispatch_lock
 
 MODE = "isolated_direct_v1"
 TERMINAL_STATES = frozenset({"reaped", "not_spawned", "operator_resolved"})
-STATES = TERMINAL_STATES | {"prepared", "armed", "blocked"}
+STATES = TERMINAL_STATES | {"reserved", "prepared", "armed", "blocked"}
 HASH_ALGORITHM = "postgresql18-jsonb-send-v1-sha256"
 WORKER_LOCK = 4142061106
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
@@ -182,7 +184,7 @@ _RESOLUTION = _object(
     f"{_R}->'resolution'",
     _RESOLUTION_FIELDS,
     f"{_hash_sql(f"{_R}->'resolution'->'previous_record_sha256'")} AND "
-    f"{_R}->'resolution'->>'original_state' IN ('prepared','armed','blocked') AND "
+    f"{_R}->'resolution'->>'original_state' IN ('reserved','prepared','armed','blocked') AND "
     f"{_text(f"{_R}->'resolution'->'observed_at_utc'", maximum=40)} AND "
     f"{_text(f"{_R}->'resolution'->'reason'", maximum=512)}",
 )
@@ -240,7 +242,7 @@ _CANDIDATE = f"(data ? 'transport_helper' OR data->>'transport_mode'='{MODE}')"
 _FENCED = f"({_CANDIDATE}) AND NOT ({_VALID_TERMINAL})"
 HELPER_FENCE_PREDICATE = _FENCED
 HELPER_REGISTRY_SCHEMA = f"""
-CREATE INDEX IF NOT EXISTS actions_helper_fenced ON actions(id) WHERE {_FENCED};
+CREATE INDEX IF NOT EXISTS actions_helper_fenced_v2 ON actions(id) WHERE {_FENCED};
 CREATE INDEX IF NOT EXISTS actions_helper_history ON actions(id)
  WHERE data ? 'transport_helper' AND data->'transport_helper'->'registered'='true'::jsonb;
 """
@@ -456,12 +458,12 @@ def _record(connection, value, *, run_id=None, action_id=None):
         item = value["resolution"]
         _exact(item, _RESOLUTION_FIELDS)
         _hash(item["previous_record_sha256"])
-        if item["original_state"] not in {"prepared", "armed", "blocked"}:
+        if item["original_state"] not in {"reserved", "prepared", "armed", "blocked"}:
             raise RegistryError("resolution")
         _timestamp(item["observed_at_utc"])
         _string(item["reason"], 512)
     state = value["state"]
-    if state == "prepared" and (
+    if state in {"reserved", "prepared"} and (
         value["spawn_attempted"]
         or any(
             value[key] is not None
@@ -505,6 +507,52 @@ def _record(connection, value, *, run_id=None, action_id=None):
     return value
 
 
+def reserved_record(connection, *, run_id, action_id, owner, attempt):
+    """Build only; Ledger writes this for its new action in the same transaction.
+
+    No filesystem access, locks, connections, or old-action repair happen here.
+    """
+    if type(attempt) is not HelperAttempt or attempt.record_sha256 is not None:
+        raise RegistryError("reservation_intent")
+    _base(attempt.base())
+    _parent(attempt.parent())
+    _timestamp(attempt.observed_at_utc)
+    _lease(attempt.lease_identity.data())
+    _int(attempt.deadline_monotonic_ns, 1)
+    if attempt.parent_pid != os.getpid():
+        raise RegistryError("parent_identity")
+    if (
+        not attempt.parent_observed_monotonic_ns
+        <= time.monotonic_ns()
+        < attempt.deadline_monotonic_ns
+    ):
+        raise RegistryError("parent_identity")
+    expected = historical_lease_identity(connection)
+    if expected is not None and expected != attempt.lease_identity:
+        raise RegistryError("lease_changed")
+    record = {
+        **attempt.base(),
+        "run_id": run_id,
+        "action_id": action_id,
+        "owner": owner,
+        "registered": True,
+        "transition_from_sha256": None,
+        "state": "reserved",
+        "parent": attempt.parent(),
+        "lease": attempt.lease_identity.data(),
+        "deadline_monotonic_ns": attempt.deadline_monotonic_ns,
+        "observed_at_utc": attempt.observed_at_utc,
+        "spawn_attempted": False,
+        "child": None,
+        "reap": None,
+        "terminal_summary": None,
+        "failure": None,
+        "resolution": None,
+    }
+    record["record_sha256"] = _digest(connection, record)
+    return _record(connection, record, run_id=run_id, action_id=action_id)
+
+
 def historical_lease_identity(connection):
     """The first immutable helper identity binds every subsequent attempt."""
     row = connection.execute(
@@ -527,30 +575,30 @@ def _lease_path(settings):
 def lease_spec(
     settings, store, *, check_owner, lease_inspector=None, exclude_action_id=None
 ):
-    """Select a permanent inode only while a trusted worker owns dispatch."""
+    """Observe a real permanent inode outside every dispatch transaction.
+
+    The Worker session owns execution. Ledger rechecks the authoritative fence
+    and historical identity in its later short dispatch transaction.
+    """
     inspector = lease_inspector or inspect_lease
     check_owner()
     with store.connect() as connection:
-        dispatch_lock(connection)
         check_owner()
         if _fenced(connection, exclude_action_id):
             raise RegistryError("fenced")
         expected = historical_lease_identity(connection)
-        path = _lease_path(settings)
-        if expected is not None:
-            observed = inspector(LeaseSpec(path, expected, False))
-            if observed.identity != expected or observed.locked:
-                raise RegistryError(
-                    "lease_locked" if observed.locked else "lease_changed"
-                )
-            return LeaseSpec(path, expected, False)
+    path = _lease_path(settings)
+    if expected is None:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if path.exists() or path.is_symlink():
-            observed = inspector(LeaseSpec(path, None, False))
-            if observed.locked:
-                raise RegistryError("lease_locked")
-            return LeaseSpec(path, observed.identity, False)
-        return LeaseSpec(path, None, True)
+        if not path.exists() and not path.is_symlink():
+            prepared = prepare_lease(LeaseSpec(path, None, True))
+            check_owner()
+            return prepared
+    observed = inspector(LeaseSpec(path, expected, False))
+    if (expected is not None and observed.identity != expected) or observed.locked:
+        raise RegistryError("lease_locked" if observed.locked else "lease_changed")
+    check_owner()
+    return LeaseSpec(path, observed.identity, False)
 
 
 class ResponsesRegistry:
@@ -637,11 +685,18 @@ class ResponsesRegistry:
         _exact(
             payload,
             _BASE_FIELDS
-            | {"parent", "deadline_monotonic_ns", "observed_at_utc", "lease"},
+            | {
+                "previous_record_sha256",
+                "parent",
+                "deadline_monotonic_ns",
+                "observed_at_utc",
+                "lease",
+            },
         )
         _base(payload)
+        _hash(payload["previous_record_sha256"])
         _parent(payload["parent"])
-        identity = _lease(payload["lease"])
+        _lease(payload["lease"])
         _int(payload["deadline_monotonic_ns"], 1)
         _timestamp(payload["observed_at_utc"])
         if (
@@ -660,34 +715,38 @@ class ResponsesRegistry:
                 raise RegistryError("action_state")
             if action["data"].get("transport_mode") != MODE:
                 raise RegistryError("transport_mode")
-            if "transport_helper" in action["data"]:
-                current = self._bound_record(connection, action, payload)
-                if current["state"] == "prepared" and all(
-                    current[name] == value for name, value in payload.items()
-                ):
-                    return self._ack(current)
-                raise RegistryError("already_registered")
+            # Missing historical records are never backfilled by this hook.
+            record = self._bound_record(connection, action, payload)
+            unchanged = all(
+                record[name] == payload[name]
+                for name in ("parent", "lease", "observed_at_utc")
+            )
+            if (
+                record["state"] == "prepared"
+                and record["transition_from_sha256"]
+                == payload["previous_record_sha256"]
+                and unchanged
+                and record["deadline_monotonic_ns"] == payload["deadline_monotonic_ns"]
+            ):
+                return self._ack(record)
+            if (
+                record["state"] != "reserved"
+                or record["record_sha256"] != payload["previous_record_sha256"]
+                or not unchanged
+                or payload["deadline_monotonic_ns"] > record["deadline_monotonic_ns"]
+            ):
+                raise RegistryError("cas")
             if _fenced(connection, self.action_id):
                 raise RegistryError("fenced")
-            expected = historical_lease_identity(connection)
-            if expected is not None and identity != expected:
-                raise RegistryError("lease_changed")
-            record = {
-                **payload,
-                "run_id": self.run_id,
-                "action_id": self.action_id,
-                "owner": self.owner,
-                "registered": True,
-                "transition_from_sha256": None,
-                "state": "prepared",
-                "spawn_attempted": False,
-                "child": None,
-                "reap": None,
-                "terminal_summary": None,
-                "failure": None,
-                "resolution": None,
-            }
-            acknowledgment = self._save(connection, record)
+            acknowledgment = self._save(
+                connection,
+                {
+                    **record,
+                    "state": "prepared",
+                    "deadline_monotonic_ns": payload["deadline_monotonic_ns"],
+                    "transition_from_sha256": record["record_sha256"],
+                },
+            )
         return acknowledgment
 
     def arm(self, payload):
@@ -803,65 +862,47 @@ class ResponsesRegistry:
         with self.store.connect() as connection:
             action = self._locked(connection)
             if "transport_helper" not in action["data"]:
-                if (
-                    action["data"].get("transport_mode") != MODE
-                    or payload["previous_record_sha256"] is not None
-                    or payload["spawn_attempted"]
-                    or payload["child_pid"] is not None
-                    or payload["reaped"]
-                ):
-                    raise RegistryError("not_spawned_binding")
-                record = {
-                    **{name: payload[name] for name in _BASE_FIELDS},
-                    "run_id": self.run_id,
-                    "action_id": self.action_id,
-                    "owner": self.owner,
-                    "registered": False,
-                    "transition_from_sha256": None,
-                    "state": "not_spawned",
-                    "parent": None,
-                    "lease": None,
-                    "deadline_monotonic_ns": None,
-                    "observed_at_utc": datetime.now(UTC).isoformat(),
-                    "spawn_attempted": False,
-                    "child": None,
-                    "reap": None,
-                    "terminal_summary": None,
-                    "failure": failure,
-                    "resolution": None,
-                }
-            else:
-                record = self._bound_record(connection, action, payload)
-                if record["state"] in TERMINAL_STATES:
-                    if payload["previous_record_sha256"] not in {
-                        record["record_sha256"],
-                        record["transition_from_sha256"],
-                    }:
-                        raise RegistryError("cas")
-                    return self._ack(record)
-                if record["record_sha256"] != payload[
-                    "previous_record_sha256"
-                ] and not (
-                    payload["previous_record_sha256"] is None
-                    and record["state"] == "prepared"
-                    and not payload["spawn_attempted"]
-                ):
+                raise RegistryError("record_missing")
+            record = self._bound_record(connection, action, payload)
+            if record["state"] in TERMINAL_STATES:
+                if payload["previous_record_sha256"] not in {
+                    record["record_sha256"],
+                    record["transition_from_sha256"],
+                }:
                     raise RegistryError("cas")
-                not_spawned = (
-                    record["state"] == "prepared"
-                    and not record["spawn_attempted"]
-                    and not payload["spawn_attempted"]
-                    and payload["child_pid"] is None
-                    and not payload["reaped"]
-                )
-                record = {
-                    **record,
-                    "state": "not_spawned" if not_spawned else "blocked",
-                    "spawn_attempted": record["spawn_attempted"]
-                    or payload["spawn_attempted"],
-                    "failure": failure,
-                    "transition_from_sha256": payload["previous_record_sha256"],
-                }
+                return self._ack(record)
+            no_spawn = (
+                not payload["spawn_attempted"]
+                and payload["child_pid"] is None
+                and not payload["reaped"]
+            )
+            lost_register_ack = (
+                record["state"] == "prepared"
+                and no_spawn
+                and payload["previous_record_sha256"] is not None
+                and record["transition_from_sha256"]
+                == payload["previous_record_sha256"]
+            )
+            if (
+                record["record_sha256"] != payload["previous_record_sha256"]
+                and not lost_register_ack
+            ):
+                raise RegistryError("cas")
+            not_spawned = (
+                record["state"] in {"reserved", "prepared"}
+                and not record["spawn_attempted"]
+                and no_spawn
+            )
+            if record["state"] == "reserved" and not not_spawned:
+                raise RegistryError("not_spawned_binding")
+            record = {
+                **record,
+                "state": "not_spawned" if not_spawned else "blocked",
+                "spawn_attempted": record["spawn_attempted"]
+                or payload["spawn_attempted"],
+                "failure": failure,
+                "transition_from_sha256": record["record_sha256"],
+            }
             acknowledgment = self._save(connection, record)
         return acknowledgment
 

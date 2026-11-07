@@ -23,10 +23,9 @@ import time
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID
 
 _MODE = "isolated_direct_v1"
 _CLEANUP_SECONDS = 1.0
@@ -115,13 +114,69 @@ class LeaseInspection:
 
 
 @dataclass(frozen=True)
+class HelperAttempt:
+    """A pre-reservation observation; only a committed record supplies its hash."""
+
+    attempt_id: str
+    client_request_id: str
+    nonce: str
+    parent_pid: int
+    parent_observed_monotonic_ns: int
+    parent_boot_id: str
+    observed_at_utc: str
+    lease_identity: LeaseIdentity
+    deadline_monotonic_ns: int
+    record_sha256: str | None = None
+
+    def base(self):
+        return {
+            "schema": 1,
+            "transport": _MODE,
+            "attempt_id": self.attempt_id,
+            "client_request_id": self.client_request_id,
+            "nonce": self.nonce,
+        }
+
+    def parent(self):
+        return {
+            "pid": self.parent_pid,
+            "observed_monotonic_ns": self.parent_observed_monotonic_ns,
+            "boot_id": self.parent_boot_id,
+        }
+
+    @classmethod
+    def from_record(cls, record):
+        if record["state"] != "reserved" or record["registered"] is not True:
+            raise HelperProcessError("parent_identity")
+        return cls(
+            record["attempt_id"],
+            record["client_request_id"],
+            record["nonce"],
+            record["parent"]["pid"],
+            record["parent"]["observed_monotonic_ns"],
+            record["parent"]["boot_id"],
+            record["observed_at_utc"],
+            LeaseIdentity(**record["lease"]),
+            record["deadline_monotonic_ns"],
+            record["record_sha256"],
+        )
+
+
+@dataclass(frozen=True)
 class HelperRequest:
     call: dict = field(repr=False)
     api_key: str = field(repr=False)
     deadline_monotonic_ns: int
     lease: LeaseSpec
-    parent_boot_id: str
-    client_request_id: str | None = None
+    attempt: HelperAttempt
+
+    @property
+    def client_request_id(self):
+        return self.attempt.client_request_id
+
+    @property
+    def parent_boot_id(self):
+        return self.attempt.parent_boot_id
 
 
 @dataclass(frozen=True)
@@ -247,6 +302,25 @@ def inspect_lease(spec: LeaseSpec) -> LeaseInspection:
         return LeaseInspection(identity, False)
     finally:
         resources.close_all()
+        if resources.errors:
+            raise HelperProcessError("lease_inspection_cleanup") from None
+
+
+def prepare_lease(spec: LeaseSpec) -> LeaseSpec:
+    """Create/probe the permanent inode before any dispatch transaction."""
+    resources = _Resources()
+    try:
+        fd, directory_fd, identity = _open_lease(spec, resources)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise HelperProcessError("lease_locked") from None
+        _check_path(fd, directory_fd, Path(spec.path).name)
+        return LeaseSpec(spec.path, identity, False)
+    finally:
+        resources.close_all()
+        if resources.control is not None:
+            raise resources.control
         if resources.errors:
             raise HelperProcessError("lease_inspection_cleanup") from None
 
@@ -550,13 +624,8 @@ def run_helper(request: HelperRequest, hooks: HelperHooks) -> HelperTerminal:
     exception/ambiguous commit cannot authorize spawn/ARM/result acceptance.
     """
     resources = _Resources()  # Outer ledger exists before every FD allocation.
-    base = {
-        "schema": 1,
-        "transport": _MODE,
-        "attempt_id": str(uuid4()),
-        "client_request_id": request.client_request_id or str(uuid4()),
-        "nonce": os.urandom(32).hex(),
-    }
+    attempt = request.attempt
+    base = attempt.base()
     identity = {key: base[key] for key in ("attempt_id", "client_request_id", "nonce")}
     previous: dict | None = None
     terminal: dict | None = None
@@ -565,12 +634,36 @@ def run_helper(request: HelperRequest, hooks: HelperHooks) -> HelperTerminal:
     result: HelperTerminal | None = None
     stage = "preflight"
     try:
-        _deadline(request.deadline_monotonic_ns)
         if (
-            type(request.parent_boot_id) is not str
-            or not 1 <= len(request.parent_boot_id) <= 128
+            type(attempt.parent_boot_id) is not str
+            or not 1 <= len(attempt.parent_boot_id) <= 128
+            or attempt.parent_pid != os.getpid()
+            or type(attempt.parent_observed_monotonic_ns) is not int
+            or not 0 < attempt.parent_observed_monotonic_ns <= time.monotonic_ns()
+            or type(attempt.deadline_monotonic_ns) is not int
+            or request.deadline_monotonic_ns > attempt.deadline_monotonic_ns
+            or request.lease.allow_create
+            or request.lease.expected_identity != attempt.lease_identity
+            or any(
+                type(value) is not str or str(UUID(value)) != value
+                for value in (attempt.attempt_id, attempt.client_request_id)
+            )
+            or type(attempt.nonce) is not str
+            or not _HASH.fullmatch(attempt.nonce)
         ):
             raise HelperProcessError("parent_identity")
+        previous = _ack(
+            {
+                "schema": 1,
+                "attempt_id": attempt.attempt_id,
+                "nonce": attempt.nonce,
+                "state": "reserved",
+                "record_sha256": attempt.record_sha256,
+            },
+            base,
+            {"reserved"},
+        )
+        _deadline(request.deadline_monotonic_ns)
         protocol = _protocol()
         arm = {
             "v": 1,
@@ -595,13 +688,10 @@ def run_helper(request: HelperRequest, hooks: HelperHooks) -> HelperTerminal:
             hooks.register(
                 {
                     **base,
-                    "parent": {
-                        "pid": os.getpid(),
-                        "observed_monotonic_ns": time.monotonic_ns(),
-                        "boot_id": request.parent_boot_id,
-                    },
+                    "previous_record_sha256": previous["record_sha256"],
+                    "parent": attempt.parent(),
                     "deadline_monotonic_ns": request.deadline_monotonic_ns,
-                    "observed_at_utc": datetime.now(UTC).isoformat(),
+                    "observed_at_utc": attempt.observed_at_utc,
                     "lease": lease_identity.data(),
                 }
             ),

@@ -1,9 +1,12 @@
 """Finite test-only owner killed by the original pytest parent."""
 
 import json
+import os
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 sys.path.insert(0, sys.argv[1])
 from doonex import responses_process as process
@@ -47,13 +50,29 @@ def hook(state):
     return callback
 
 
+deadline = time.monotonic_ns() + 2_000_000_000
+lease = process.prepare_lease(
+    process.LeaseSpec(private / "lease", allow_create=not (private / "lease").exists())
+)
+attempt = process.HelperAttempt(
+    str(uuid4()),
+    str(uuid4()),
+    uuid4().hex + uuid4().hex,
+    os.getpid(),
+    time.monotonic_ns(),
+    "offline-test-boot",
+    datetime.now(UTC).isoformat(),
+    lease.expected_identity,
+    deadline,
+    "0" * 64,
+)
 process.run_helper(
     process.HelperRequest(
         call={"mode": str(mode), "marker": str(private / "dispatched")},
         api_key="offline-synthetic-key",
-        deadline_monotonic_ns=time.monotonic_ns() + 2_000_000_000,
-        lease=process.LeaseSpec(private / "lease", allow_create=True),
-        parent_boot_id="offline-test-boot",
+        deadline_monotonic_ns=deadline,
+        lease=lease,
+        attempt=attempt,
     ),
     process.HelperHooks(
         hook("prepared"), hook("armed"), hook("reaped"), hook("blocked")

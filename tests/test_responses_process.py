@@ -12,7 +12,9 @@ import subprocess
 import sys
 import time
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from doonex import responses_process as process
@@ -102,12 +104,28 @@ def setup(tmp_path, monkeypatch):
             runtime,
         ),
     )
+    deadline = time.monotonic_ns() + 3_000_000_000
+    lease = process.prepare_lease(
+        process.LeaseSpec(private / "lease", allow_create=True)
+    )
+    attempt = process.HelperAttempt(
+        str(uuid4()),
+        str(uuid4()),
+        uuid4().hex + uuid4().hex,
+        os.getpid(),
+        time.monotonic_ns(),
+        "offline-test-boot",
+        datetime.now(UTC).isoformat(),
+        lease.expected_identity,
+        deadline,
+        "0" * 64,
+    )
     request = process.HelperRequest(
         call={"mode": "result", "marker": str(private / "dispatch")},
         api_key="offline-synthetic-key",
-        deadline_monotonic_ns=time.monotonic_ns() + 3_000_000_000,
-        lease=process.LeaseSpec(private / "lease", allow_create=True),
-        parent_boot_id="offline-test-boot",
+        deadline_monotonic_ns=deadline,
+        lease=lease,
+        attempt=attempt,
     )
     return request, Hooks(), runtime
 
@@ -306,9 +324,10 @@ def test_block_failure_preserves_prepared_record(setup):
 def test_inspection_refuses_missing_symlink_mode_and_changed_identity(setup):
     request, hooks, _ = setup
     path = request.lease.path
+    missing = path.with_name("missing-lease")
     with pytest.raises(FileNotFoundError):
-        process.inspect_lease(request.lease)
-    assert not path.exists()
+        process.inspect_lease(process.LeaseSpec(missing))
+    assert not missing.exists()
     process.run_helper(request, hooks.hooks())
     original = process.inspect_lease(process.LeaseSpec(path)).identity
     os.chmod(path, 0o644)
@@ -333,7 +352,10 @@ def test_inherited_lease_lock_is_not_explicitly_unlocked(setup):
     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     try:
         assert process.inspect_lease(process.LeaseSpec(request.lease.path)).locked
-        request = replace(request, lease=process.LeaseSpec(request.lease.path))
+        request = replace(
+            request,
+            lease=process.LeaseSpec(request.lease.path, request.attempt.lease_identity),
+        )
         error = run_failure(request, Hooks())
         assert error.reason == "lease_locked"
     finally:
@@ -477,6 +499,17 @@ def test_lease_setup_failures_never_spawn(setup, monkeypatch, operation):
         raise OSError(errno.EIO, "synthetic")
 
     monkeypatch.setattr(fcntl if operation == "flock" else os, operation, fail)
+    if operation == "fsync":
+        before = fd_set()
+        with pytest.raises(OSError):
+            process.prepare_lease(
+                process.LeaseSpec(
+                    request.lease.path.with_name("new-lease"), allow_create=True
+                )
+            )
+        assert fd_set() == before
+        assert not hooks.calls
+        return
     error = run_failure(request, hooks)
     assert not error.evidence["spawn_attempted"]
     assert not Path(request.call["marker"]).exists()

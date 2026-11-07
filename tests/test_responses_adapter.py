@@ -90,14 +90,15 @@ def test_real_sdk_with_isolated_binding_reserves_once_and_never_direct(
 
     monkeypatch.setattr(responses_adapter, "_ORIGINAL", forbidden)
 
-    def before(*args):
-        reservation = {"id": str(len(reservations))}
+    def before(*args, responses_request_id=None):
+        reservation = {"id": str(len(reservations)), "request_id": responses_request_id}
         reservations.append(reservation)
         return reservation
 
     def binding(reservation, kwargs, request_id):
         calls.append(kwargs)
         assert reservation is reservations[-1]
+        assert request_id == reservation["request_id"]
         assert kwargs["extra_headers"]["X-Client-Request-Id"] == request_id
         assert "HTTP-Referer" not in kwargs["extra_headers"]
         assert "X-Title" not in kwargs["extra_headers"]

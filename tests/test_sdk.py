@@ -184,7 +184,7 @@ def answer(tool, arguments, *, sequence=1, usage=True):
 def harness(tmp_path, **overrides):
     reservations, settlements, commands, events = [], [], [], []
 
-    def reserve(input_tokens, output_tokens):
+    def reserve(input_tokens, output_tokens, *, responses_request_id=None):
         item = (input_tokens, output_tokens)
         reservations.append(item)
         return item
