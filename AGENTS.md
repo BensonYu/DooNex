@@ -7,7 +7,7 @@
 1. 阅读 [README](README.md)、[PRD](docs/PRD.md) 和当前阶段的 [路线图](docs/ROADMAP.md)。涉及运行机制或评测时，再读对应规范。
 2. 检查 Git 状态、已有文件和最近提交，保留用户及其他 Agent 的未提交改动。
 3. 明确本次范围、受影响的调用方与验收方法。先完成一个可验收的纵向流程，再扩展功能。
-4. 区分已实现事实、设计基线和后续设想。M1–M3 已完成受控验收；用户已授权继续推进，当前 [M4](docs/M4_IMPLEMENTATION.md) 的发现与有界生成已分别完成受控验收，完整后台批次仍待新 UTC 日验收；[M5 自托管社区](docs/M5_IMPLEMENTATION.md) 的本机受控验收已通过。不能宣称整个 M4–M5 已完成。M3 证据与限制见 [实施记录](docs/M3_IMPLEMENTATION.md)，未完成能力不得写成已交付。M2 证据和限制见 [M2 实施记录](docs/M2_IMPLEMENTATION.md)，历史 M1 证据见 [M1 实施记录](docs/M1_IMPLEMENTATION.md)，不能把受控样例泛化为任意项目或模型兼容。
+4. 区分已实现事实、设计基线和后续设想。M1–M3 已完成受控验收；用户已授权继续推进，当前 [M4](docs/M4_IMPLEMENTATION.md) 的发现与有界生成已分别完成受控验收，UTC 2026-11-07 的两轮完整后台批次均超时，未知预留保留，完整批次仍待新 UTC 日验收；[M5 自托管社区](docs/M5_IMPLEMENTATION.md) 的本机受控验收已通过。不能宣称整个 M4–M5 已完成。M3 证据与限制见 [实施记录](docs/M3_IMPLEMENTATION.md)，未完成能力不得写成已交付。M2 证据和限制见 [M2 实施记录](docs/M2_IMPLEMENTATION.md)，历史 M1 证据见 [M1 实施记录](docs/M1_IMPLEMENTATION.md)，不能把受控样例泛化为任意项目或模型兼容。
 
 ## 产品约束
 

@@ -6,7 +6,7 @@ DooNex 是面向个人编程工作流的本地 Web 工作台，复用 OpenHands 
 
 > **当前状态：M1–M3 和 M5 本机受控验收通过；M4 剩完整后台批次待验收。** 现有多项目执行/只读审查、模型配置与用量、私有 Skill 版本、固定 Arena 批次、候选发现与生成、自托管社区。M3 的真实 45 次尝试中 43 次通过、2 次预算停止，全部记录保留。适用环境、版本与限制见下文及 [M3 实施记录](docs/M3_IMPLEMENTATION.md)，历史见 [M2](docs/M2_IMPLEMENTATION.md) 与 [M1](docs/M1_IMPLEMENTATION.md)。受控样例不形成通用成功率或模型/Skill 优胜声明。
 
-M4 的固定 GitHub 候选发现与有界追加生成已完成受控验收；生成实际使用 1 次调用、2352 token，产物经预览、导入和独立审核入口核对，未进行质量提升试验。有限后台的原 SDK 会话续接、调用上限与在途撤销已有实际证据；完整批次仍待新的 UTC 日预算验收，旧失败与未知预留保留。各切片结果与限制见 [后台记录](docs/M4_IMPLEMENTATION.md)、[发现记录](docs/M4_DISCOVERY_PLAN.md) 和 [生成记录](docs/M4_GENERATION_PLAN.md)。
+M4 的固定 GitHub 候选发现与有界追加生成已完成受控验收；生成实际使用 1 次调用、2352 token，产物经预览、导入和独立审核入口核对，未进行质量提升试验。有限后台的原 SDK 会话续接、调用上限与在途撤销已有实际证据；UTC 2026-11-07 的两次完整批次在 60 秒及 180 秒配置下均发生模型超时，原失败与完整未知预留保留；当日仅剩 10 次后台调用余量，完整批次继续待验收。各切片结果与限制见 [后台记录](docs/M4_IMPLEMENTATION.md)、[发现记录](docs/M4_DISCOVERY_PLAN.md) 和 [生成记录](docs/M4_GENERATION_PLAN.md)。
 
 M5 自托管社区已完成本机受控验收，最终代码通过 **1199 项本机测试**、静态检查与前端构建；真实投稿、审核、分发、下架、权限拒绝和独立数据审计通过。没有公开上线、收费或作者收益。详见 [M5 记录](docs/M5_IMPLEMENTATION.md)。
 
@@ -40,8 +40,10 @@ M5 面向自托管单站点，范围与实际检查见 [M5 记录](docs/M5_IMPLE
 
 首个验证环境为 Apple Silicon Mac mini、macOS、Docker 与 Python 3.12。系统 Python 3.9 不用于应用运行；`uv` 根据项目约束创建 Python 3.12 环境。还需可用的 Git、Node.js 和 `pnpm`，前端包管理器锁定为 `pnpm@11.1.1`。这些命令供本机开发使用，不代表已验证其他硬件或公网部署。
 
+当前整合成果位于 `codex/delivery-documentation` 分支，`main` 暂保留 M3，等待 M4 完整退出条件通过。以下命令检出当前整合分支。
+
 ```bash
-git clone git@github.com:BensonYu/DooNex.git doonex
+git clone --branch codex/delivery-documentation git@github.com:BensonYu/DooNex.git doonex
 cd doonex
 python3 -m venv .bootstrap
 .bootstrap/bin/pip install uv==0.13.7
