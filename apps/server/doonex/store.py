@@ -62,6 +62,22 @@ DISPATCH_LOCK = 4142061110
 CONNECT_TIMEOUT_SECONDS = 5
 STATEMENT_TIMEOUT_MS = 15_000
 LOCK_TIMEOUT_MS = 5_000
+RUN_STATES = frozenset(
+    {
+        "queued",
+        "running",
+        "verifying",
+        "pausing",
+        "paused",
+        "interrupted",
+        "yielded",
+        "completed_verified",
+        "completed_unverified",
+        "failed",
+        "cancelled",
+        "budget_exceeded",
+    }
+)
 
 
 def dispatch_lock(connection):
@@ -239,14 +255,51 @@ class Store:
             raise KeyError("找不到运行")
         return row["data"]
 
-    def list_runs(self, limit=100, project_id=None):
+    def next_queued_run(self):
+        """Read one candidate; owner checks and dispatch admission still apply."""
+        with self.connect() as c:
+            row = c.execute(
+                """SELECT r.data FROM runs r
+                WHERE r.state='queued'
+                AND (NOT (r.data->'request' ? 'arena') OR EXISTS (
+                    SELECT 1 FROM arena_evaluations a
+                    WHERE a.id::text=r.data->'request'->'arena'->>'evaluation_id'
+                    AND a.state IN ('queued','running')
+                ))
+                ORDER BY
+                    CASE
+                        WHEN r.data->'request' ? 'background' THEN 2
+                        WHEN r.data->'request' ? 'arena' THEN 1
+                        ELSE 0
+                    END,
+                    r.data->>'created_at', r.id
+                LIMIT 1"""
+            ).fetchone()
+        return row["data"] if row else None
+
+    def list_runs(self, limit=100, project_id=None, *, states=None):
+        if limit is not None and (type(limit) is not int or limit < 0):
+            raise ValueError("运行数量上限必须为非负整数或 None")
+        if states is not None:
+            if not isinstance(states, (list, tuple, set, frozenset)) or any(
+                type(state) is not str or state not in RUN_STATES for state in states
+            ):
+                raise ValueError("运行状态筛选无效")
+            states = sorted(set(states))
+            if not states:
+                return []
         with self.connect() as c:
             query = "SELECT data FROM runs"
-            values = []
+            conditions, values = [], []
             if project_id is not None:
-                query += " WHERE data->'request'->>'project_id'=%s"
+                conditions.append("data->'request'->>'project_id'=%s")
                 values.append(project_id)
-            query += " ORDER BY data->>'created_at' DESC"
+            if states is not None:
+                conditions.append("state=ANY(%s)")
+                values.append(states)
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+            query += " ORDER BY data->>'created_at' DESC,id DESC"
             if limit is not None:
                 query += " LIMIT %s"
                 values.append(limit)
