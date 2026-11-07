@@ -105,9 +105,7 @@ class Worker:
         from doonex.sandbox import Sandbox
 
         sandbox = Sandbox()
-        for run in self.store.list_runs(limit=None):
-            if run["state"] not in ACTIVE | {"interrupted"}:
-                continue
+        for run in self.store.list_runs(limit=None, states=ACTIVE | {"interrupted"}):
             with self.store.locked(run["id"]) as (c, current):
                 self.lease()
                 result = stop_containers(sandbox, run["id"])
@@ -1066,9 +1064,7 @@ class Worker:
                 self.scheduler.maintain()
                 from doonex.budget import BatchHalt
 
-                for run in self.store.list_runs(limit=None):
-                    if run["state"] != "yielded":
-                        continue
+                for run in self.store.list_runs(limit=None, states={"yielded"}):
                     try:
                         self.scheduler.resume_yielded(
                             run,
@@ -1086,26 +1082,9 @@ class Worker:
                             "后台检查点存在残留或未知容器；须核查后恢复服务"
                         )
                 self.scheduler.claim_next()
-                queued = [
-                    r
-                    for r in reversed(self.store.list_runs(limit=None))
-                    if r["state"] == "queued"
-                ]
-                queued = [
-                    r
-                    for r in queued
-                    if not r["request"].get("arena")
-                    or arena.get(r["request"]["arena"]["evaluation_id"])["state"]
-                    in {"queued", "running"}
-                ]
-                queued.sort(
-                    key=lambda r: (
-                        bool(r["request"].get("background")),
-                        bool(r["request"].get("arena")),
-                    )
-                )
+                queued = self.store.next_queued_run()
                 if queued:
-                    self.execute(queued[0]["id"])
+                    self.execute(queued["id"])
                 self.scheduler.maintain()
                 if once:
                     break
