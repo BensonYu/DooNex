@@ -27,6 +27,7 @@ from doonex import sdk
 from doonex import workspace as workspace_module
 from doonex.budget import Ledger
 from doonex.session_store import LIMITS, MIB, SessionFileStore, canonical_sha256
+from doonex.store import Store
 from doonex.worker import Worker, run_directory
 from openhands.sdk.conversation.event_store import EventLog
 from openhands.sdk.conversation.persistence_const import EVENT_NAME_RE
@@ -388,6 +389,97 @@ def _foreground_body(request_data, tmp_path, name):
     return body
 
 
+def _cold_startup_timeline(settings, store, paused, root, body, monkeypatch):
+    """Include construction/initialize/reconcile/census after enqueue commits."""
+    observations, admission = [], []
+    original_initialize = Store.initialize
+    original_reconcile = Worker.reconcile
+    original_census = Store.scheduling_runs
+    original_reserve = Ledger.reserve
+
+    def observe(kind, **details):
+        observations.append({"kind": kind, "monotonic": time.monotonic(), **details})
+
+    def initialize(current, *args, **kwargs):
+        observe("startup_store_initialize_enter")
+        value = original_initialize(current, *args, **kwargs)
+        observe("startup_store_initialize_returned")
+        return value
+
+    def reconcile(current, *args, **kwargs):
+        observe("startup_reconcile_enter")
+        value = original_reconcile(current, *args, **kwargs)
+        observe("startup_reconcile_returned")
+        return value
+
+    def census(current, *args, **kwargs):
+        value = original_census(current, *args, **kwargs)
+        observe(
+            "startup_census_returned",
+            states=sorted(kwargs["states"]),
+            run_ids=[item["id"] for item in value],
+        )
+        return value
+
+    def reserve(ledger, *args, **kwargs):
+        assert ledger.run_id == foreground["id"]
+        value = original_reserve(ledger, *args, **kwargs)
+        admission.append(time.monotonic())
+        observe("startup_foreground_model_admission_commit_confirmed")
+        return value
+
+    def transport(llm, *args, **kwargs):
+        assert Path(llm._session_store.root) != root
+        return response("finish", {"message": "Synthetic startup foreground"}, 61)
+
+    with monkeypatch.context() as startup:
+        startup.setattr(Store, "initialize", initialize)
+        startup.setattr(Worker, "reconcile", reconcile)
+        startup.setattr(Store, "scheduling_runs", census)
+        startup.setattr(Ledger, "reserve", reserve)
+        startup.setattr(sdk.GuardedLLM, "_transport_call", transport)
+        before = time.monotonic()
+        foreground = store.create_run(body)
+        after = time.monotonic()
+        observe("startup_foreground_enqueue_commit_confirmed")
+        Worker(settings).run(once=True)
+    assert len(admission) == 1
+    assert store.get(foreground["id"])["state"] == "completed_verified"
+    current = store.get(paused["id"])
+    assert current["state"] == "yielded"
+    assert current["usage"] == paused["usage"]
+    assert current["scheduling"] == paused["scheduling"]
+    assert current["first_started_at"] == paused["first_started_at"]
+    moments = {item["kind"]: item["monotonic"] for item in observations}
+    assert (
+        before
+        <= after
+        <= moments["startup_store_initialize_enter"]
+        <= moments["startup_store_initialize_returned"]
+        <= moments["startup_reconcile_enter"]
+        <= moments["startup_reconcile_returned"]
+        <= admission[0]
+    )
+    yielded = [
+        item
+        for item in observations
+        if item["kind"] == "startup_census_returned" and item["states"] == ["yielded"]
+    ]
+    assert yielded and paused["id"] in yielded[0]["run_ids"]
+    assert after <= yielded[0]["monotonic"] <= admission[0]
+    return {
+        "foreground_id": foreground["id"],
+        "enqueue_commit_bracket_monotonic": [before, after],
+        "first_model_admission_commit_confirmed_monotonic": admission[0],
+        "submit_to_first_admission_seconds": {
+            "lower": admission[0] - after,
+            "upper": admission[0] - before,
+        },
+        "observations": observations,
+        "sdk_restore_deferred_by_actual_foreground_priority": True,
+    }
+
+
 def _cold_foreground_timeline(settings, store, paused, root, body, monkeypatch):
     """Queue during actual cold restoration, then run the real dispatcher."""
     entered, release, finished = (threading.Event() for _ in range(3))
@@ -590,6 +682,18 @@ def test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore(
     monkeypatch.setattr(sdk, "run_session", session)
     monkeypatch.setattr(sdk.GuardedLLM, "_transport_call", forbidden)
     with _watchdog():
+        cold_startup = _cold_startup_timeline(
+            wide[0],
+            store,
+            paused,
+            root,
+            _foreground_body(request_data, tmp_path, "startup-foreground"),
+            monkeypatch,
+        )
+    assert not reads, "Foreground priority should defer background SDK restoration"
+    assert _files(root) == original_files
+    assert _accounting(store, evaluation_id) == parent_before
+    with _watchdog():
         cold_wait = _cold_foreground_timeline(
             wide[0],
             store,
@@ -608,11 +712,17 @@ def test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore(
     assert final["usage"] == paused["usage"]
     assert _accounting(store, evaluation_id) == parent_before
     assert sessions == [
+        (cold_startup["foreground_id"], False),
         (paused["id"], True),
         (cold_wait["foreground_id"], False),
         (paused["id"], True),
     ]
-    assert closes == [paused["id"], cold_wait["foreground_id"], paused["id"]]
+    assert closes == [
+        cold_startup["foreground_id"],
+        paused["id"],
+        cold_wait["foreground_id"],
+        paused["id"],
+    ]
     assert receipts == [paused["scheduling"]["receipt"]] * 3
     assert set(original_files.items()).issubset(set(reads))
     final_files = _files(root)
@@ -639,6 +749,7 @@ def test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore(
                 "cold_all_original_files_read_and_hashed": True,
                 "cold_original_event_count": len(original_events),
                 "cold_final_directory_entries": final_entries,
+                "cold_startup_foreground_wait": cold_startup,
                 "cold_foreground_wait": cold_wait,
                 "original_usage_and_parent_ledgers_preserved": True,
                 "additional_model_calls": 0,
