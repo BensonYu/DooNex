@@ -33,15 +33,19 @@ def _evidence() -> dict:
     return {
         "container_name": None,
         "container_absence_confirmed": None,
+        "container_snapshot_absence_confirmed": None,
         "processes": [],
         "errors": [],
         "local_process_unknown": False,
+        "daemon_request_unknown": False,
     }
 
 
 def _unknown(evidence: dict) -> bool:
-    return evidence["local_process_unknown"] or (
-        evidence["container_absence_confirmed"] is False
+    return (
+        evidence["local_process_unknown"]
+        or evidence.get("daemon_request_unknown", False)
+        or (evidence["container_absence_confirmed"] is False)
     )
 
 
@@ -388,6 +392,7 @@ class Sandbox:
         except SandboxError as error:
             errors.append(str(error)[:1000])
         supervisor.evidence["container_absence_confirmed"] = remaining == []
+        supervisor.evidence["container_snapshot_absence_confirmed"] = remaining == []
         errors.extend(supervisor.evidence["errors"])
         return {
             "remaining": remaining,
@@ -453,6 +458,7 @@ class Sandbox:
         }
         name = "doonex-" + uuid.uuid4().hex
         attempted_create = False
+        acknowledged_create = False
         pending = None
         try:
             if should_stop():
@@ -567,6 +573,7 @@ class Sandbox:
                             raise SandboxError(
                                 "Docker create returned a malformed container identifier"
                             )
+                        acknowledged_create = True
                         result["container_id"] = identifier
                         attached = supervisor.process(
                             [self.docker, "start", "-a", identifier],
@@ -611,6 +618,17 @@ class Sandbox:
             if not result["cancelled"] and time.monotonic() >= deadline:
                 result["timed_out"] = True
             if attempted_create:
+                if not acknowledged_create and any(
+                    item["operation"] == "create"
+                    for item in supervisor.evidence["processes"]
+                ):
+                    # Killing/reaping the client does not cancel a daemon's
+                    # in-flight create. A current empty ps is only a snapshot;
+                    # the named container may materialize after that query.
+                    supervisor.evidence["daemon_request_unknown"] = True
+                    supervisor.evidence["errors"].append(
+                        "Create daemon request completion unconfirmed"
+                    )
                 cleanup_deadline = supervisor.cleanup.start()
                 try:
                     # The chosen name is known even if create's ACK was lost.
@@ -626,7 +644,13 @@ class Sandbox:
                     supervisor.evidence["errors"].append(str(error)[:1000])
                 try:
                     remaining = self._containers(run_id, cleanup_deadline, supervisor)
-                    supervisor.evidence["container_absence_confirmed"] = not remaining
+                    supervisor.evidence[
+                        "container_snapshot_absence_confirmed"
+                    ] = not remaining
+                    supervisor.evidence["container_absence_confirmed"] = (
+                        not remaining
+                        and not supervisor.evidence["daemon_request_unknown"]
+                    )
                     if remaining:
                         supervisor.evidence["errors"].append(
                             "Container absence unconfirmed"

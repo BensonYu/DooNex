@@ -32,7 +32,20 @@ with (root / 'operations.jsonl').open('a') as output:
     output.write(json.dumps({'operation': operation, 'at': time.monotonic(), 'arguments': sys.argv[2:]}) + '\n')
 state = root / 'container'
 if operation == 'create':
-    state.write_text(sys.argv[sys.argv.index('--name') + 1])
+    name = sys.argv[sys.argv.index('--name') + 1]
+    if settings.get('late_create_delay'):
+        pid = os.fork()
+        if pid == 0:
+            os.setsid()
+            (root / 'daemon.pid').write_text(str(os.getpid()))
+            os.close(0)
+            os.close(1)
+            os.close(2)
+            time.sleep(settings['late_create_delay'])
+            state.write_text(name)
+            os._exit(0)
+    else:
+        state.write_text(name)
     time.sleep(settings.get('create_delay', 0))
     sys.stdout.write(settings.get('create_output', 'a' * 64 + '\n'))
 elif operation == 'start':
@@ -82,12 +95,13 @@ def fake_docker(tmp_path, monkeypatch):
         return Sandbox(docker=str(executable))
 
     yield control, configure
-    child = control / "child.pid"
-    if child.exists():
-        try:
-            os.kill(int(child.read_text()), signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+    for name in ["child.pid", "daemon.pid"]:
+        child = control / name
+        if child.exists():
+            try:
+                os.kill(int(child.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def operations(control):
@@ -113,12 +127,12 @@ def assert_reaped_and_eof(evidence):
 
 def test_common_deadline_covers_create_and_attach(fake_docker, tmp_path):
     control, configure = fake_docker
-    sandbox = configure(create_delay=0.15, start_delay=0.25)
+    sandbox = configure(create_delay=0.2, start_delay=0.8)
     entered = time.monotonic()
-    result = sandbox.run(tmp_path, "true", 0.40, "common_deadline")
+    result = sandbox.run(tmp_path, "true", 0.70, "common_deadline")
     elapsed = time.monotonic() - entered
     assert result["timed_out"]
-    assert elapsed < 0.40 + 0.35 + 0.3
+    assert elapsed < 0.70 + 0.35 + 0.3
     assert not result["cleanup_unknown"], result
     assert not (control / "container").exists()
     assert "inspect" not in [item["operation"] for item in operations(control)]
@@ -128,11 +142,12 @@ def test_common_deadline_covers_create_and_attach(fake_docker, tmp_path):
 def test_caller_deadline_does_not_refresh_at_sandbox_entry(fake_docker, tmp_path):
     control, configure = fake_docker
     sandbox = configure(create_delay=30)
-    deadline = time.monotonic() + 0.4
+    deadline = time.monotonic() + 0.55
     time.sleep(0.12)
     result = sandbox.run(tmp_path, "true", 3, "caller_deadline", deadline=deadline)
     assert result["timed_out"]
-    assert not result["cleanup_unknown"], result
+    assert result["cleanup_unknown"], result
+    assert result["cleanup_evidence"]["daemon_request_unknown"]
     assert time.monotonic() < deadline + 0.35 + 0.3
     assert not (control / "container").exists()
 
@@ -158,7 +173,7 @@ def test_create_ack_loss_is_cleaned_by_preselected_name(fake_docker, tmp_path):
     sandbox = configure(create_delay=30)
     result = sandbox.run(tmp_path, "true", 0.35, "lost_create_ack")
     assert result["timed_out"] and result["container_id"] is None
-    assert not result["cleanup_unknown"], result
+    assert result["cleanup_unknown"], result
     calls = operations(control)
     created = next(item for item in calls if item["operation"] == "create")
     removed = next(item for item in calls if item["operation"] == "rm")
@@ -167,8 +182,33 @@ def test_create_ack_loss_is_cleaned_by_preselected_name(fake_docker, tmp_path):
     listed = next(item for item in calls if item["operation"] == "ps")
     assert "label=doonex.run_id=lost_create_ack" in listed["arguments"]
     assert not any(argument.startswith("name=") for argument in listed["arguments"])
-    assert result["cleanup_evidence"]["container_absence_confirmed"] is True
+    assert result["cleanup_evidence"]["container_snapshot_absence_confirmed"] is True
+    assert result["cleanup_evidence"]["container_absence_confirmed"] is False
+    assert result["cleanup_evidence"]["daemon_request_unknown"]
     assert_reaped_and_eof(result["cleanup_evidence"])
+
+
+def test_late_daemon_create_cannot_be_cleared_by_current_empty_ps(
+    fake_docker, tmp_path
+):
+    control, configure = fake_docker
+    sandbox = configure(create_delay=30, late_create_delay=0.7)
+    result = sandbox.run(tmp_path, "true", 0.35, "late_daemon_create")
+    evidence = result["cleanup_evidence"]
+    assert result["timed_out"] and result["cleanup_unknown"]
+    assert evidence["daemon_request_unknown"]
+    assert evidence["container_snapshot_absence_confirmed"] is True
+    assert evidence["container_absence_confirmed"] is False
+    assert not evidence["local_process_unknown"]
+    assert_reaped_and_eof(evidence)
+    wait_until = time.monotonic() + 1.5
+    while not (control / "container").exists() and time.monotonic() < wait_until:
+        time.sleep(0.02)
+    assert (control / "container").exists(), (
+        "Synthetic daemon did not finish the late create"
+    )
+    assert sandbox.stop_run("late_daemon_create")["remaining"] == []
+    assert result["cleanup_unknown"] and evidence["daemon_request_unknown"]
 
 
 @pytest.mark.parametrize("output", ["short\n", IDENTIFIER + "\n\n", "a" * 100_000])
@@ -178,8 +218,10 @@ def test_invalid_or_excess_create_ack_never_bypasses_cleanup(
     control, configure = fake_docker
     with pytest.raises(SandboxError) as raised:
         configure(create_output=output).run(tmp_path, "true", 3, "invalid_ack")
-    assert not raised.value.cleanup_unknown
-    assert raised.value.cleanup_evidence["container_absence_confirmed"] is True
+    assert raised.value.cleanup_unknown
+    assert raised.value.cleanup_evidence["daemon_request_unknown"]
+    assert raised.value.cleanup_evidence["container_absence_confirmed"] is False
+    assert raised.value.cleanup_evidence["container_snapshot_absence_confirmed"] is True
     assert not (control / "container").exists()
     assert "start" not in [item["operation"] for item in operations(control)]
 
@@ -344,7 +386,8 @@ def test_cancel_during_create_preserves_cleanup_proof(fake_docker, tmp_path):
         tmp_path, "true", 3, "create_cancel", lambda: time.monotonic() >= stop_at
     )
     assert result["cancelled"] and not result["timed_out"]
-    assert not result["cleanup_unknown"]
+    assert result["cleanup_unknown"]
+    assert result["cleanup_evidence"]["daemon_request_unknown"]
     assert_reaped_and_eof(result["cleanup_evidence"])
 
 
