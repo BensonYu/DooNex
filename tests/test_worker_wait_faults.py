@@ -558,8 +558,13 @@ def test_worker_held_sdk_lock_expires_before_model_reservation(wait_fault):
         release()
     assert not watchdog_fired, "SDK-lock rescue fired; this is a failed fault sample"
     current = _assert_preserved(context, calls=0)
-    assert current["state"] in {"failed", "budget_exceeded"}, current["reason"]
-    assert "deadline" in current["reason"].lower()
+    assert current["state"] == "budget_exceeded", current["reason"]
+    assert current["reason"] == "运行的共同执行期限已到，停止新增工作"
+    released = [
+        item for item in context.events if item["kind"] == "actual_sdk_lock_released"
+    ]
+    assert len(released) == 1 and released[0]["monotonic"] >= context.deadline
+    assert released[0]["watchdog_rescue"] is False
     assert context.calls == [context.foreground["id"]]
     assert not action_rows(context.store, context.background_id)
     _assert_foreground_finished(context)
