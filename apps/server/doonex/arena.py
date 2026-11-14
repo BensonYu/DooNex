@@ -556,7 +556,9 @@ class Arena:
 
         with self.store.connect() as connection:
             if execution_fenced(connection):
-                raise ValueError("模型传输进程尚未完成独立核查；禁止恢复批次")
+                raise ValueError(
+                    "控制进程、Docker 请求或模型传输进程尚未完成独立核查；禁止恢复批次"
+                )
         value = self.get(identifier)
         if value["state"] != "interrupted" or not acknowledge_unknown:
             raise ValueError("请核查批次的未决动作并明确确认恢复")
@@ -612,7 +614,9 @@ class Arena:
                 if cleanup_intent_unresolved(current):
                     raise ValueError("子运行清理意图尚未核实；禁止恢复批次")
                 if execution_fenced(c):
-                    raise ValueError("模型传输进程尚未完成独立核查；禁止恢复批次")
+                    raise ValueError(
+                        "控制进程、Docker 请求或模型传输进程尚未完成独立核查；禁止恢复批次"
+                    )
                 if controller_cleanup_unknown(current.get("recovery")):
                     raise ValueError(
                         "控制进程或 Docker 请求尚未完成独立核查；禁止恢复批次"

@@ -6,11 +6,14 @@ import tarfile
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
+import controller_test_support
 from doonex.api import create_app
 from doonex.discovery import Discovery
 from fastapi.testclient import TestClient
 from psycopg.types.json import Jsonb
 from test_discovery import PublicGit
+
+controller_registry = controller_test_support.controller_registry
 
 
 def test_community_migration_preserves_existing_private_records(store, request_data):

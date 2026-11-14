@@ -534,7 +534,10 @@ class Worker:
                     self.owner,
                     dispatch_check=lambda c, current: (
                         check_deadline(execution_deadline),
-                        self.scheduler.preflight(c, current),
+                        self.scheduler.preflight(
+                            c, current, deadline=execution_deadline
+                        ),
+                        check_deadline(execution_deadline),
                     ),
                 )
                 attribution = ledger.attribution()
@@ -1096,7 +1099,10 @@ class Worker:
                                     "容器或模型传输进程终止状态不明；禁止验证派发"
                                 )
                             _locked_batch(c, current, dispatch=True)
-                            self.scheduler.preflight(c, current)
+                            self.scheduler.preflight(
+                                c, current, deadline=execution_deadline
+                            )
+                            check_deadline(execution_deadline)
                             action = self.store.action(
                                 run_id,
                                 "verification",

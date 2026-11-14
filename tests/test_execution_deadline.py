@@ -3,6 +3,8 @@
 import threading
 import time
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
+from types import SimpleNamespace
 
 import pytest
 from doonex import sdk
@@ -250,6 +252,94 @@ def test_worker_commits_first_clock_before_expiring_content_initialization(
     assert final["usage"]["calls"] == final["usage"]["reserved_tokens"] == 0
     assert not store.pending(run["id"])
     assert not (settings.home / "runs" / run["id"]).exists()
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("stage", ["model", "shell", "verification"])
+def test_worker_rechecks_shared_deadline_after_preflight_before_action_commit(
+    settings, store, request_data, tmp_path, monkeypatch, stage
+):
+    from doonex import deadline as deadline_module
+
+    run, _, _ = prepare_run(
+        store,
+        settings,
+        request_data,
+        tmp_path,
+        checks=["true"] if stage == "verification" else [],
+    )
+    calls = scripted_model(monkeypatch, ["true"] if stage == "shell" else [])
+    original = Scheduler.preflight
+    original_execute = Worker.execute
+    observed = []
+    expired = False
+    execution_active = False
+
+    def execute(worker, run_id):
+        nonlocal execution_active
+        execution_active = True
+        try:
+            return original_execute(worker, run_id)
+        finally:
+            execution_active = False
+
+    def preflight(scheduler, connection, current, *, deadline, **kwargs):
+        nonlocal expired
+        assert deadline > time.monotonic()
+        result = original(scheduler, connection, current, deadline=deadline, **kwargs)
+        observed.append((deadline, current["first_started_at"]))
+        if (
+            stage == "model"
+            or stage == "shell"
+            and len(observed) == 2
+            or stage == "verification"
+            and current["state"] == "verifying"
+        ):
+            # Only the cooperative check clock advances. Actual subprocess,
+            # database and SDK timing keep their real host monotonic clock.
+            expired = True
+        return result
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("An expired preflight must not start a tool or verifier")
+
+    monkeypatch.setattr(Scheduler, "preflight", preflight)
+    monkeypatch.setattr(Worker, "execute", execute)
+    monkeypatch.setattr(
+        deadline_module,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: (
+                time.monotonic() + (10000 if expired and execution_active else 0)
+            )
+        ),
+    )
+    monkeypatch.setattr(Sandbox, "run", forbidden)
+    monkeypatch.setattr(
+        Sandbox,
+        "stop_run",
+        lambda *_a, **_k: {"remaining": [], "errors": [], "stopped": []},
+    )
+    Worker(settings).run(once=True)
+    final = store.get(run["id"])
+    expected_calls = 0 if stage == "model" else 1
+    assert expired and len(observed) == (1 if stage == "model" else 2)
+    assert all(later[0] <= earlier[0] for earlier, later in pairwise(observed))
+    assert final["state"] == "budget_exceeded", final["reason"]
+    assert final["first_started_at"] == observed[0][1]
+    assert final["request"]["budget"] == run["request"]["budget"]
+    assert final["usage"]["calls"] == len(calls) == expected_calls
+    assert final["usage"]["tokens"] == expected_calls * 120
+    assert final["usage"]["unknown_calls"] == final["usage"]["reserved_tokens"] == 0
+    assert not store.pending(run["id"])
+    with store.connect() as connection:
+        actions = connection.execute(
+            "SELECT kind,status FROM actions WHERE run_id=%s", (run["id"],)
+        ).fetchall()
+    assert [(a["kind"], a["status"]) for a in actions] == [
+        ("model", "completed")
+    ] * expected_calls
+    assert not sdk._CALLBACKS and not sdk._SCHEDULING and not sdk._SESSION_STORES
 
 
 @pytest.mark.postgres

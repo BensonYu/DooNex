@@ -41,12 +41,23 @@ def merge_cleanup(result: dict, *, previous=None, error=None) -> dict:
     No ordinary container cleanup clears this latch.
     """
     result = deepcopy(result)
-    if "cleanup_evidence" in result:
+    # An aggregate's latest unknown receipt is historical evidence, not proof
+    # that this caller attempted cleanup. Keep merging idempotent: the receipt
+    # inventory identifies our aggregate output even when it has no attempt.
+    if "cleanup_evidence" in result and "controller_process_evidence" not in result:
         result.setdefault(
             "cleanup_attempt_evidence", deepcopy(result["cleanup_evidence"])
         )
+    if "cleanup_attempt_evidence" in (previous or {}):
+        result.setdefault(
+            "cleanup_attempt_evidence",
+            deepcopy(previous["cleanup_attempt_evidence"]),
+        )
     receipts = []
-    overflow = bool((previous or {}).get("controller_process_evidence_overflow"))
+    overflow = bool(
+        (previous or {}).get("controller_process_evidence_overflow")
+        or result.get("controller_process_evidence_overflow")
+    )
 
     def keep(receipt):
         nonlocal overflow
@@ -81,6 +92,8 @@ def merge_cleanup(result: dict, *, previous=None, error=None) -> dict:
             keep(receipt)
         keep((previous or {}).get("cleanup_evidence") or {})
     if controller_cleanup_unknown(result):
+        for receipt in result.get("controller_process_evidence", []):
+            keep(receipt)
         keep(result.get("cleanup_evidence") or {})
     seen = set()
     while error is not None and id(error) not in seen:

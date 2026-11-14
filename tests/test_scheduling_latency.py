@@ -6,6 +6,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 
+import controller_test_support
 import pytest
 from doonex.budget import Ledger
 from doonex.sdk import GuardedLLM
@@ -15,6 +16,7 @@ from test_scheduling import taskset_source as taskset_fixture
 from test_scheduling import tuning as tuning_fixture
 from test_worker import prepare_run, response
 
+controller_registry = controller_test_support.controller_registry
 taskset_source = taskset_fixture
 tuning = tuning_fixture
 pytestmark = [pytest.mark.postgres, pytest.mark.docker]

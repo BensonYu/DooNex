@@ -634,7 +634,8 @@ def create_app(settings=None):
 
     @app.post("/api/runs/{run_id}/resume", dependencies=auth)
     def resume(run_id: str, body: ResumeInput):
-        run = load_run(run_id)
+        # Read control state before load_run's optional Review/Git inspection.
+        run = store.get(identifier(run_id))
         if run["request"].get("arena"):
             raise ValueError(
                 "请在 Arena 中核查并恢复整个批次；单独恢复不能绕过批次预算"
@@ -643,6 +644,21 @@ def create_app(settings=None):
             raise ValueError("仅暂停或中断的运行可以续接")
         if cleanup_intent_unresolved(run):
             raise ValueError("原清理意图尚未核实；不能续接或重放")
+        from doonex.cleanup import controller_cleanup_unknown
+
+        # Recovery inspection can launch a Docker probe. An already observed
+        # controller fence must reject ordinary resume before that new work.
+        if controller_cleanup_unknown(run.get("recovery")):
+            raise ValueError(
+                "控制进程或 Docker 请求尚未完成独立核查；普通续接不能解除阻止"
+            )
+        from doonex.store import execution_fenced
+
+        with store.connect() as connection:
+            if execution_fenced(connection):
+                raise ValueError(
+                    "控制进程、Docker 请求或模型传输进程尚未完成独立核查；普通续接不能解除阻止"
+                )
         report = recovery(run_id)
         if report["controller_cleanup_blocked"]:
             raise ValueError(
@@ -668,11 +684,10 @@ def create_app(settings=None):
                 raise ValueError("运行状态已变化")
             if cleanup_intent_unresolved(current):
                 raise ValueError("原清理意图尚未核实；不能续接或重放")
-            from doonex.store import execution_fenced
-
             if execution_fenced(c):
-                raise ValueError("模型传输进程尚未完成独立核查；普通续接不能解除阻止")
-            from doonex.cleanup import controller_cleanup_unknown
+                raise ValueError(
+                    "控制进程、Docker 请求或模型传输进程尚未完成独立核查；普通续接不能解除阻止"
+                )
 
             if controller_cleanup_unknown(current.get("recovery")):
                 raise ValueError(

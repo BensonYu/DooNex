@@ -190,3 +190,27 @@ PYTHONPATH=apps/server:tests .venv/bin/python scripts/test_local.py \
 这些证据仍有边界：API 过期 copy_context 的 late Git 在测试线程执行，Worker closed context 直接检查，没有完整 late OS thread 矩阵；ACK 测试为真实提交后人工抛错，不是真实网络 ACK 丢失；leaf SIGKILL 不等于完整 Worker.run crash 矩阵。**未通过新整合完整回归，也未证明完整前台等待上界。**
 
 旧入口首轮 `controller-existing-integration-01` 在 `6b4a404` 实际为 **76 passed / 9 failed / 15 setup errors / 2 warnings / 85.98 秒 / exit 1**，外层 89.699 秒，输入前后不变；日志 SHA256 `2048ceeae52804ebddb8a65a25708f4ec6e3efd5b5499e872c5883f3943b29b5`。15 个 setup 在共享 Arena fixture 导入 taskset 时缺 registry，其余 Worker/cleanup 行为正在逐项核对，不先认定全部为测试问题。测试进程结束且一次性 PG 已清理，原失败保留。下一步迁移真实调用上下文、处理回归并完成新整合全量，再继续调度 preflight 共同期限、有限 yielded、批次/窗口 monotonic 映射及实际 Worker.run 矩阵；不重放已通过的真实后台批次，不推进 main 或升级服务。
+
+### 旧调用方迁移与清理证据修复
+
+后续独立切片已纳入：Evidence/Review 三文件迁移 `ee03d8b`（原 `4a09a2a`，58 项真实 PG/Docker 检查通过）、M3 隔离 `1dcfe9e`（原 `604f023`，28 项通过）和 Arena fixture `ea3b443`（原 `28dd900`，17 项通过）。它们使用真实 Store/registry/Run/project/nullable owner/action；共享 prepare 改为显式 contextmanager，fixture 生命周期内 yield，Worker 自有 actor 结束后恢复外层，退出后关闭。不增加 autouse、fake registry 或生产旁路。隔离片首轮 19 passed / 9 failed 保留：旧测试一概禁止 Docker，连 mount 拒绝后的精确清理 ps 也阻断；现只允许当前 Run 完整参数的真实 ps，容器创建仍禁止，原隔离、只读、篡改与 10 秒断言保留。
+
+任务集导入测试迁移已纳入 `b794e70`（原 `bc4b430`），Tasksets/Skills 组件实际 **129 passed / 89.67 秒 / exit 0**，10 份输入与原提交逐项一致；共享 taskset_source/registry fixture 不变，Skills 无需修改。原 37 个断言及顺序保留，新增实际 actor、Run/project/nullable owner 绑定检查。组件通过不代替父整合回归，首次 collection 失败仍保留。
+
+独立审查确认旧入口失败包含真实产品缺陷：merge_cleanup 二次合并时丢失历史 cleanup_attempt_evidence，并可能把 aggregate 的历史 unknown 回执冒充本次清理；result 已有的回执库存/overflow 也可能被缩减。当前修复区分 raw attempt 与 aggregate、保留双方有限库存/overflow，无新尝试时保留上一份实际 attempt，新 raw attempt 则更新该字段。已有 global fence 时继续零普通 stop/probe；execution_fenced 和 remaining unknown 是保守状态变化，原全字典 equality 改为精确未知标记/回执/overflow/attempt、零调用及原 usage/首次时钟断言。新定点检查覆盖 process/daemon/record-only 二次合并、多个回执及 overflow、新回执覆盖与 deepcopy；provider 测试仅将原 body 放入 prepare scope，20 个原断言 AST 相同。
+
+`controller-cleanup-provenance-offline-02` 实际 **15 passed / 14 deselected / 1 warning / 2.36 秒 / exit 0**，显式排除 PostgreSQL，不是整合通过。随后 `controller-recovery-integration-01` 联合六个 controller 模块、旧 API/Worker/cleanup、期限及 provider 分类，实际 **284 passed / 4 failed / 2 warnings / 256.23 秒 / exit 1**，外层 259.699 秒、159 个输入前后不变；日志 SHA256 `78d04ecec1660c87ceb62f856483e02061b4b4a8dd67667fd25eed592ea9515b`。一次性 PG 与测试进程已清理，失败记录保留。
+
+四项失败另揭示恢复路径问题：普通 API resume 在检查已有控制阻止前调用 recovery，尝试新的 Docker probe；测试的禁止探测哨兵由 AnyIO 包装成退出时 CancelledError，该根因来自源码与调用链核对，未单独证明 lifespan 缺陷。Arena 已通过扩大后的全局 fence 拒绝，却仍固定提示模型传输，导致两项控制进程断言失败。当前候选将 resume 的原始状态读取、本地及全局阻止检查提前至 Review/Git 和容器核查之前，保留最终锁内复检；全局消息改为控制进程、Docker 请求或模型传输的准确通称。新增其他 Run 阻止下 Review/probe 零尝试、两 Run 完全不变检查，原禁止探测及未知预留断言保留。最终联合复验尚待。没有调用真实模型、改生产账本或启用常驻服务。
+
+### 调度预检共同期限与最终准入
+
+后台/调度测试迁移 `f1cdeb5`（原 `f575780`）的独立组件为 **66 passed / 2 warnings / 225.81 秒 / exit 0**，44 个输入与原提交逐项一致；依赖共享 fixture 的五个测试模块在父候选中显式导出同一真实 registry，原断言保留。之后预检期限片 `514774a`（原 `8a8a456`）已整合：Scheduler.preflight → Background.preflight → metadata `_unchanged` 传同一可选 absolute deadline，在锁、文件读取、allocation/day 核查及最后返回后检查。maintain 每次最多一个候选、一次取调用方期限与 30 秒准备窗口的最小值，Arena 初始化使用该值；结算返回后在原事务内超期则回滚，不释放预留。19 项真实 PostgreSQL 组件通过（65.09 秒 / exit 0），45 个输入与原提交绑定。
+
+父候选将这个 deadline 传给 Worker 的 Ledger model/tool 准入及 GuardedVerifier，并在 preflight 返回后再次检查，再写新 action。新增三个真实 Worker.run/PG/SDK 合成传输检查分别覆盖 model、shell 和 verification 返回后到期，核对实际 action、原已结算用量、未知预留、首次时钟与 SDK 关闭。首轮 `controller-preflight-integration-01` 实际 **1 failed / 13 passed / 2 warnings / 6.64 秒 / exit 1**（外层 10.129 秒），日志 SHA256 `20d52982176ced5d65603955ac93e0a1086289eed3cfc01cbdccecc4f06ce008`：新测试的模拟时钟持续影响 execute 结束后的 maintain。仅将模拟 clock 限于真实 Worker.execute 作用域，保留触发和账本断言，没有修改产品来通过；失败收据保留。
+
+`controller-preflight-integration-02` 已结束：**396 passed / 1 failed / 2 warnings / 599.04 秒 / exit 1**（外层 602.687 秒），159 个非 Markdown 输入前后相同，日志 SHA256 `7ab52924e15059203f0d0f367583ff586563330e9a193d97057d92c3428d6c16`。三个新 Worker 准入到期检查及恢复/证据修复已在本轮实际执行；整轮在 `-x` 首次失败处停止，后续用例未运行，不能记为联合通过。pytest 和一次性 PG 已退出并确认清理。
+
+失败用例人工写入没有原 controller operation 身份的历史 `recovery.remaining/errors`，再要求普通 Arena resume 根据空容器列表清除阻止。此行为违反既有历史未知合同，不能通过产品旁路恢复。现保留真实 Worker 中断、原未知调用/预留、日账和首次时钟，改验收为两种确认值均在新探测之前拒绝；完整 Run、批次、日账、动作、controller 行与事件不变，不确认或返还未知用量。该迁移后的行为复验仍待；Ruff 已通过，不能用静态检查冒充行为通过。
+
+上述检查是健康本地操作之间的协作期限；Arena.stop/settle 内部仍有只在前后检查的区间，数据库 commit、阻塞系统调用不能由局部检查中断。有限 yielded 集合、跨 execute/角色/批次的进程内 monotonic 不续期映射和完整 Worker.run 等待矩阵仍待，不能称完整维护或前台等待已通过。

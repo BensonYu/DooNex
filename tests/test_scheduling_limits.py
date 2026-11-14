@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
+import controller_test_support
 import pytest
 from doonex.arena import Arena
 from doonex.background import Background, BackgroundStopped
@@ -25,6 +26,7 @@ from test_scheduling import tuning as tuning_fixture
 from test_worker import response
 
 tuning = tuning_fixture
+controller_registry = controller_test_support.controller_registry
 taskset_source = source_fixture
 pytestmark = pytest.mark.postgres
 
@@ -358,7 +360,7 @@ def test_atomic_model_admission_stops_with_original_daily_allocation(
 
 
 @pytest.mark.docker
-def test_confirmed_recovery_clears_obsolete_container_block_without_resetting_unknown_usage(
+def test_legacy_container_unknown_blocks_resume_without_resetting_unknown_usage(
     tuning, store, monkeypatch
 ):
     settings, background, grant, batch = claimed(tuning, store)
@@ -383,16 +385,43 @@ def test_confirmed_recovery_clears_obsolete_container_block_without_resetting_un
         store.event(run_id, "termination_unknown", current["recovery"], c)
     with store.connect() as c:
         assert termination_unknown(c)
-    monkeypatch.setattr("doonex.sandbox.Sandbox.containers", lambda *_: [])
-    Arena(settings, store).resume(batch["id"], True)
+    preserved = store.get(run_id)
+    arena = Arena(settings, store)
+    preserved_batch = arena.get(batch["id"])
+    preserved_day = background.day(grant["date"])
+
+    def records():
+        with store.connect() as c:
+            return {
+                table: c.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
+                for table in ("actions", "controller_operations", "events")
+            }
+
+    preserved_records = records()
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("A legacy unknown without an original operation cannot probe")
+
+    monkeypatch.setattr("doonex.sandbox.Sandbox.containers", forbidden)
+    # No original operation identifies this historical uncertainty. Neither a
+    # confirmation nor a hypothetical empty ps authorizes clearing the fence.
+    for acknowledged in (False, True):
+        with pytest.raises(ValueError, match="控制进程、Docker 请求或模型传输进程"):
+            arena.resume(batch["id"], acknowledged)
+        assert store.get(run_id) == preserved
+        assert arena.get(batch["id"]) == preserved_batch
+        assert background.day(grant["date"]) == preserved_day
+        assert records() == preserved_records
     after = store.get(run_id)
-    assert after["state"] == "queued"
+    assert after["state"] == "interrupted"
     assert after["usage"] == before["usage"]
     assert after["first_started_at"] == before["first_started_at"]
-    assert after["recovery"]["remaining"] == after["recovery"]["errors"] == []
-    assert after["recovery"]["confirmed_at"]
+    assert after["recovery"] == preserved["recovery"]
+    assert after["recovery"]["remaining"] == ["previously-unconfirmed-container"]
+    assert after["recovery"]["errors"] == ["old cleanup could not confirm termination"]
+    assert "confirmed_at" not in after["recovery"]
     with store.connect() as c:
-        assert not termination_unknown(c)
+        assert termination_unknown(c)
         assert (
             c.execute(
                 "SELECT count(*) AS n FROM events WHERE run_id=%s AND kind='termination_unknown'",
@@ -402,7 +431,7 @@ def test_confirmed_recovery_clears_obsolete_container_block_without_resetting_un
         )
         assert (
             c.execute(
-                "SELECT count(*) AS n FROM actions WHERE run_id=%s AND kind='model' AND status='acknowledged'",
+                "SELECT count(*) AS n FROM actions WHERE run_id=%s AND kind='model' AND status='unknown'",
                 (run_id,),
             ).fetchone()["n"]
             == 1

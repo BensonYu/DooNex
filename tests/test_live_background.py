@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
+import controller_test_support
 import pytest
 from doonex import controller_operations as co
 from doonex.background import Background as RealBackground
@@ -22,6 +23,7 @@ from test_worker import prepare_run, response
 
 from scripts import live_background
 
+controller_registry = controller_test_support.controller_registry
 taskset_source = full_taskset_fixture
 tuning = tuning_fixture
 

@@ -3,6 +3,7 @@
 import time
 from copy import deepcopy
 
+import controller_test_support
 import pytest
 from doonex import arena
 from doonex.arena import Arena, EvaluationInput
@@ -12,6 +13,7 @@ from test_background import background as background_fixture
 from test_tasksets import taskset_source as source_fixture
 
 background = background_fixture
+controller_registry = controller_test_support.controller_registry
 taskset_source = source_fixture
 pytestmark = pytest.mark.postgres
 

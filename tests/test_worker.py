@@ -5,15 +5,19 @@ import threading
 import time
 from pathlib import Path
 
+import controller_test_support
 import pytest
 from doonex.api import create_app
 from doonex.budget import Ledger
+from doonex.cleanup import operation_context, sandbox_context
 from doonex.sdk import GuardedLLM
 from doonex.store import now
 from doonex.worker import WORKER_LOCK, Worker, run_directory
 from fastapi.testclient import TestClient
 from litellm import ModelResponse
 from test_api import repository
+
+controller_registry = controller_test_support.controller_registry
 
 
 def response(tool, arguments, sequence):
@@ -260,7 +264,7 @@ def test_pause_during_verification_restarts_checks_without_model_replay(
 
 @pytest.mark.docker
 def test_interrupted_cancel_reconciles_live_container(
-    settings, store, request_data, tmp_path
+    settings, store, request_data, tmp_path, controller_registry
 ):
     import subprocess
 
@@ -270,7 +274,7 @@ def test_interrupted_cancel_reconciles_live_container(
     with store.locked(run["id"]) as (_, current):
         current.update(state="interrupted", first_started_at=now())
     sandbox = Sandbox()
-    subprocess.run(
+    created = subprocess.run(
         [
             "docker",
             "run",
@@ -287,15 +291,25 @@ def test_interrupted_cancel_reconciles_live_container(
         check=True,
         capture_output=True,
     )
+    container_id = created.stdout.decode().strip()
+    assert len(container_id) == 64 and all(
+        c in "0123456789abcdef" for c in container_id
+    )
     try:
-        assert sandbox.containers(run["id"])
+        assert sandbox.containers(run["id"], **sandbox_context(store.get(run["id"])))
         with TestClient(create_app(settings)) as client:
             client.headers["Authorization"] = "Bearer " + settings.token
             result = client.post(f"/api/runs/{run['id']}/cancel").json()
         assert result["state"] == "cancelled"
-        assert not sandbox.containers(run["id"])
+        assert not sandbox.containers(
+            run["id"], **sandbox_context(store.get(run["id"]))
+        )
     finally:
-        sandbox.stop_run(run["id"])
+        # This fixture created this exact external container itself. Reclaim it
+        # even if a failed product path has correctly latched its global fence.
+        subprocess.run(
+            ["docker", "rm", "-f", container_id], check=False, capture_output=True
+        )
 
 
 @pytest.mark.docker
@@ -663,7 +677,7 @@ def test_verification_resume_after_review_does_not_reopen_either_role(
 
 @pytest.mark.docker
 def test_legacy_run_without_assignments_remains_executable(
-    settings, store, request_data, tmp_path, monkeypatch
+    settings, store, request_data, tmp_path, monkeypatch, controller_registry
 ):
     from doonex.workspace import Workspace
 
@@ -674,6 +688,7 @@ def test_legacy_run_without_assignments_remains_executable(
         Path(run["request"]["repo_path"]),
         run["request"]["base_commit"],
         directory / "workspace",
+        operation_context=operation_context(run),
     )
     with store.locked(run["id"]) as (_, current):
         current.pop("assignments")
