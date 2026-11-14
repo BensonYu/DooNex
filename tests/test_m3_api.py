@@ -10,9 +10,11 @@ import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import controller_test_support
 import pytest
 from doonex.api import create_app
 from doonex.arena import Arena
+from doonex.cleanup import operation_context, sandbox_context
 from doonex.library import Library
 from doonex.model_registry import ModelRegistry
 from doonex.sandbox import Sandbox
@@ -20,6 +22,8 @@ from doonex.store import now
 from doonex.worker import run_directory
 from doonex.workspace import Workspace
 from fastapi.testclient import TestClient
+
+controller_registry = controller_test_support.controller_registry
 
 
 @pytest.fixture
@@ -437,7 +441,7 @@ def test_running_batch_cancel_waits_for_inflight_child_and_retains_records(
 
 
 def test_interrupted_batch_resume_requires_acknowledgement_and_keeps_clocks(
-    m3_client, settings, store, m3_library, m3_sources, monkeypatch
+    m3_client, settings, store, m3_library, m3_sources, monkeypatch, controller_registry
 ):
     value = create_evaluation(m3_client, m3_library)
     arena = Arena(settings, store)
@@ -446,11 +450,19 @@ def test_interrupted_batch_resume_requires_acknowledgement_and_keeps_clocks(
     directory = run_directory(settings, first["run_id"])
     directory.mkdir(parents=True)
     workspace = Workspace.create(
-        m3_sources["repository"], m3_sources["commit"], directory / "workspace", baseline_path=directory / "baseline"
+        m3_sources["repository"],
+        m3_sources["commit"],
+        directory / "workspace",
+        baseline_path=directory / "baseline",
+        operation_context=operation_context(store.get(first["run_id"])),
     )
     started = (datetime.now(UTC) - timedelta(seconds=5)).isoformat()
     with store.locked(first["run_id"]) as (_, run):
-        run.update(state="paused", baseline_digest=workspace.baseline_digest, first_started_at=started)
+        run.update(
+            state="paused",
+            baseline_digest=workspace.baseline_digest,
+            first_started_at=started,
+        )
         run["usage"].update(calls=1, reserved_tokens=200, unknown_calls=1)
         run["assignments"]["executor"]["state"] = "paused"
     arena.sync(value["id"])
@@ -458,15 +470,44 @@ def test_interrupted_batch_resume_requires_acknowledgement_and_keeps_clocks(
     assert original["state"] == "interrupted"
     endpoint = f"/api/arena/evaluations/{value['id']}/resume"
     assert m3_client.post(endpoint, json={}).status_code == 400
-    assert m3_client.post(endpoint, json={"acknowledge_unknown": "yes"}).status_code == 400
+    assert (
+        m3_client.post(endpoint, json={"acknowledge_unknown": "yes"}).status_code == 400
+    )
     child_resume = m3_client.post(
-        f"/api/runs/{first['run_id']}/resume?project_id={first['project_id']}", json={"acknowledge_unknown": True}
+        f"/api/runs/{first['run_id']}/resume?project_id={first['project_id']}",
+        json={"acknowledge_unknown": True},
     )
     assert child_resume.status_code == 400 and "Arena" in child_resume.json()["detail"]
-    monkeypatch.setattr(Sandbox, "containers", lambda *_: ["synthetic still-active container"])
-    assert m3_client.post(endpoint, json={"acknowledge_unknown": True}).status_code == 400
+
+    def containers(
+        self, run_id, *, deadline=None, project_id, parent_action_id, expected_run_owner
+    ):
+        assert run_id == first["run_id"]
+        assert {
+            "project_id": project_id,
+            "parent_action_id": parent_action_id,
+            "expected_run_owner": expected_run_owner,
+        } == sandbox_context(store.get(run_id))
+        return ["synthetic still-active container"]
+
+    monkeypatch.setattr(Sandbox, "containers", containers)
+    assert (
+        m3_client.post(endpoint, json={"acknowledge_unknown": True}).status_code == 400
+    )
     assert store.get(first["run_id"])["state"] == "paused"
-    monkeypatch.setattr(Sandbox, "containers", lambda *_: [])
+
+    def no_containers(
+        self, run_id, *, deadline=None, project_id, parent_action_id, expected_run_owner
+    ):
+        assert run_id == first["run_id"]
+        assert {
+            "project_id": project_id,
+            "parent_action_id": parent_action_id,
+            "expected_run_owner": expected_run_owner,
+        } == sandbox_context(store.get(run_id))
+        return []
+
+    monkeypatch.setattr(Sandbox, "containers", no_containers)
     response = m3_client.post(endpoint, json={"acknowledge_unknown": True})
     assert response.status_code == 200, response.text
     assert response.json()["state"] == "running"
