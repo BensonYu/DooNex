@@ -21,7 +21,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .workspace import FileContent, WorkspaceError, _allowed_path, manifest, read_files
+from .deadline import ExecutionDeadlineExceeded, check_deadline
+from .workspace import (
+    FileContent,
+    WorkspaceError,
+    WorkspaceProcessUnknown,
+    _allowed_path,
+    manifest,
+    read_files,
+)
 
 MAX_SKILL_ENTRIES = 200
 MAX_SKILL_FILE_BYTES = 2 * 1024 * 1024
@@ -54,14 +62,23 @@ class SkillError(ValueError):
     """A Skill cannot safely be imported or no longer matches its version."""
 
 
-def _json(value: object) -> bytes:
-    return json.dumps(
-        value, sort_keys=True, ensure_ascii=True, separators=(",", ":")
-    ).encode()
+def _json(value: object, *, deadline: float | None = None) -> bytes:
+    chunks = []
+    encoder = json.JSONEncoder(sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    for chunk in encoder.iterencode(value):
+        check_deadline(deadline)
+        chunks.append(chunk.encode())
+    check_deadline(deadline)
+    return b"".join(chunks)
 
 
-def _sha(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
+def _sha(value: bytes, *, deadline: float | None = None) -> str:
+    result = hashlib.sha256()
+    for index in range(0, len(value), 64 * 1024):
+        check_deadline(deadline)
+        result.update(value[index : index + 64 * 1024])
+    check_deadline(deadline)
+    return result.hexdigest()
 
 
 def _path(value: Path) -> Path:
@@ -72,8 +89,10 @@ def _path(value: Path) -> Path:
     return path.absolute()
 
 
-def _no_links(path: Path) -> None:
+def _no_links(path: Path, *, deadline: float | None = None) -> None:
+    check_deadline(deadline)
     for ancestor in reversed((path, *path.parents)):
+        check_deadline(deadline)
         try:
             information = ancestor.lstat()
         except FileNotFoundError:
@@ -199,14 +218,29 @@ def _check_name(name: str) -> None:
         raise SkillError("Unsupported Skill path characters")
 
 
-def _directories(path: Path) -> tuple[str, ...]:
+def _names(path, maximum, *, deadline: float | None = None) -> list[str]:
+    names = []
+    check_deadline(deadline)
+    with os.scandir(path) as entries:
+        for entry in entries:
+            check_deadline(deadline)
+            if len(names) >= maximum:
+                raise SkillError("Skill directory entry limit exceeded")
+            names.append(entry.name)
+    check_deadline(deadline)
+    return sorted(names)
+
+
+def _directories(path: Path, *, deadline: float | None = None) -> tuple[str, ...]:
     """Retain empty directories, reject links, and keep every directory private."""
     directories: list[str] = []
     count = 0
 
     def walk(descriptor: int, prefix: str = "") -> None:
         nonlocal count
-        for name in sorted(os.listdir(descriptor)):
+        check_deadline(deadline)
+        for name in _names(descriptor, MAX_SKILL_ENTRIES - count, deadline=deadline):
+            check_deadline(deadline)
             count += 1
             if count > MAX_SKILL_ENTRIES:
                 raise SkillError("Skill entry limit exceeded")
@@ -240,10 +274,12 @@ def _directories(path: Path) -> tuple[str, ...]:
         walk(descriptor)
     finally:
         os.close(descriptor)
+    check_deadline(deadline)
     return tuple(sorted(directories))
 
 
-def _files(path: Path) -> dict[str, FileContent]:
+def _files(path: Path, *, deadline: float | None = None) -> dict[str, FileContent]:
+    check_deadline(deadline)
     files = read_files(
         path,
         exclude_generated=False,
@@ -251,13 +287,18 @@ def _files(path: Path) -> dict[str, FileContent]:
         max_file_bytes=MAX_SKILL_FILE_BYTES,
         max_total_bytes=MAX_SKILL_TOTAL_BYTES,
         max_depth=MAX_SKILL_DEPTH,
+        deadline=deadline,
     )
     for name in files:
+        check_deadline(deadline)
         _check_name(name)
     return files
 
 
-def _instructions(files: dict[str, FileContent]) -> str:
+def _instructions(
+    files: dict[str, FileContent], *, deadline: float | None = None
+) -> str:
+    check_deadline(deadline)
     if "SKILL.md" not in files:
         raise SkillError("Skill requires a root SKILL.md")
     try:
@@ -266,12 +307,17 @@ def _instructions(files: dict[str, FileContent]) -> str:
         raise SkillError("SKILL.md must be UTF-8 text") from error
     if not text.strip() or "\x00" in text:
         raise SkillError("SKILL.md must contain nonempty plain text")
+    check_deadline(deadline)
     return text
 
 
 def _validate_content(
-    files: dict[str, FileContent], directories: tuple[str, ...]
+    files: dict[str, FileContent],
+    directories: tuple[str, ...],
+    *,
+    deadline: float | None = None,
 ) -> None:
+    check_deadline(deadline)
     if not isinstance(files, dict) or not isinstance(directories, tuple):
         raise SkillError("Invalid prepared Skill content")
     if tuple(sorted(set(directories))) != directories:
@@ -281,6 +327,7 @@ def _validate_content(
     total = 0
     names = set()
     for name in (*directories, *files):
+        check_deadline(deadline)
         if not isinstance(name, str):
             raise SkillError("Invalid Skill path")
         _check_name(name)
@@ -296,6 +343,7 @@ def _validate_content(
         ):
             raise SkillError("Skill file parents do not match its directories")
     for content in files.values():
+        check_deadline(deadline)
         if not isinstance(content, FileContent) or not isinstance(content.data, bytes):
             raise SkillError("Invalid prepared Skill file")
         if type(content.mode) is not int or content.mode < 0 or content.mode & ~0o777:
@@ -303,16 +351,25 @@ def _validate_content(
         total += len(content.data)
         if len(content.data) > MAX_SKILL_FILE_BYTES or total > MAX_SKILL_TOTAL_BYTES:
             raise SkillError("Skill file or total size limit exceeded")
-    _instructions(files)
+    _instructions(files, deadline=deadline)
 
 
-def _identity(metadata: dict, files: dict[str, FileContent], directories) -> dict:
-    entries = manifest(files)
+def _identity(
+    metadata: dict,
+    files: dict[str, FileContent],
+    directories,
+    *,
+    deadline: float | None = None,
+) -> dict:
+    entries = manifest(files, deadline=deadline)
     return {
         "schema_version": _SCHEMA_VERSION,
         "metadata": metadata,
         "content_digest": _sha(
-            _json({"files": entries, "directories": list(directories)})
+            _json(
+                {"files": entries, "directories": list(directories)}, deadline=deadline
+            ),
+            deadline=deadline,
         ),
         "files": entries,
         "directories": list(directories),
@@ -380,6 +437,8 @@ def prepare_import(path: Path, metadata: dict, *, protected_roots=()) -> Prepare
             files,
             directories,
         )
+    except (ExecutionDeadlineExceeded, WorkspaceProcessUnknown):
+        raise
     except (OSError, WorkspaceError) as error:
         raise SkillError("Cannot safely import Skill: " + str(error)) from error
 
@@ -387,29 +446,33 @@ def prepare_import(path: Path, metadata: dict, *, protected_roots=()) -> Prepare
 class SkillRegistry:
     """Publish once under a private home; callers persist returned report bindings."""
 
-    def __init__(self, home: Path):
+    def __init__(self, home: Path, *, deadline: float | None = None):
+        check_deadline(deadline)
         self.home = _path(home)
-        _no_links(self.home)
+        _no_links(self.home, deadline=deadline)
         self.home.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.home.chmod(0o700)
         self.root = self.home / "skills"
         self.versions = self.root / "versions"
         for path in (self.root, self.versions):
-            _no_links(path)
+            check_deadline(deadline)
+            _no_links(path, deadline=deadline)
             path.mkdir(mode=0o700, exist_ok=True)
             if stat.S_IMODE(path.stat().st_mode) != 0o700:
                 raise SkillError("Skill registry directories must have mode 0700")
+        check_deadline(deadline)
 
     def import_local(self, path: Path, metadata: dict) -> dict:
         return self.persist(
             prepare_import(path, metadata, protected_roots=(self.home,))
         )
 
-    def _version_path(self, version_id: str) -> Path:
+    def _version_path(self, version_id: str, *, deadline: float | None = None) -> Path:
+        check_deadline(deadline)
         if not isinstance(version_id, str) or _DIGEST.fullmatch(version_id) is None:
             raise SkillError("Invalid Skill version ID")
         path = self.versions / version_id
-        _no_links(path)
+        _no_links(path, deadline=deadline)
         return path
 
     def persist(self, prepared: PreparedSkill) -> dict:
@@ -474,20 +537,28 @@ class SkillRegistry:
                     os.fsync(output.fileno())
                 staging.rename(destination)
             return self._load(prepared.version_id, _sha(report_bytes))[0]
+        except (ExecutionDeadlineExceeded, WorkspaceProcessUnknown):
+            raise
         except (OSError, WorkspaceError) as error:
             raise SkillError("Cannot persist Skill snapshot: " + str(error)) from error
         finally:
             os.close(descriptor)
 
     def _load(
-        self, version_id: str, expected_report_sha256: str | None
+        self,
+        version_id: str,
+        expected_report_sha256: str | None,
+        *,
+        deadline: float | None = None,
     ) -> tuple[dict, dict[str, FileContent]]:
-        root = self._version_path(version_id)
+        check_deadline(deadline)
+        root = self._version_path(version_id, deadline=deadline)
         for path in (self.home, self.root, self.versions, root, root / "context"):
-            _no_links(path)
+            check_deadline(deadline)
+            _no_links(path, deadline=deadline)
             if stat.S_IMODE(path.stat().st_mode) != 0o700:
                 raise SkillError("Skill storage directories are no longer private")
-        if sorted(path.name for path in root.iterdir()) != ["context", "report.json"]:
+        if _names(root, 2, deadline=deadline) != ["context", "report.json"]:
             raise SkillError("Skill version contains unexpected entries")
         report_path = root / "report.json"
         descriptor = os.open(report_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -499,15 +570,25 @@ class SkillRegistry:
             ):
                 raise SkillError("Skill report must be a private regular file")
             with os.fdopen(descriptor, "rb", closefd=False) as source:
-                report_bytes = source.read(MAX_REPORT_BYTES + 1)
+                chunks, size = [], 0
+                while size <= MAX_REPORT_BYTES:
+                    check_deadline(deadline)
+                    chunk = source.read(min(64 * 1024, MAX_REPORT_BYTES + 1 - size))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    size += len(chunk)
+                report_bytes = b"".join(chunks)
             if len(report_bytes) > MAX_REPORT_BYTES:
                 raise SkillError("Skill report size limit exceeded")
         finally:
             os.close(descriptor)
-        report_hash = _sha(report_bytes)
+        report_hash = _sha(report_bytes, deadline=deadline)
         if expected_report_sha256 is not None and report_hash != expected_report_sha256:
             raise SkillError("Skill report no longer matches its saved hash")
+        check_deadline(deadline)
         report = json.loads(report_bytes)
+        check_deadline(deadline)
         expected_fields = {
             "schema_version",
             "metadata",
@@ -520,13 +601,16 @@ class SkillRegistry:
         }
         if not isinstance(report, dict) or set(report) != expected_fields:
             raise SkillError("Invalid Skill report fields")
-        files = _files(root / "context")
-        directories = _directories(root / "context")
+        files = _files(root / "context", deadline=deadline)
+        directories = _directories(root / "context", deadline=deadline)
         for name in directories:
+            check_deadline(deadline)
             if stat.S_IMODE((root / "context" / name).stat().st_mode) != 0o700:
                 raise SkillError("Skill context directories are no longer private")
-        _validate_content(files, directories)
-        identity = _identity(_metadata(report["metadata"]), files, directories)
+        _validate_content(files, directories, deadline=deadline)
+        identity = _identity(
+            _metadata(report["metadata"]), files, directories, deadline=deadline
+        )
         if (
             report
             != {
@@ -534,41 +618,61 @@ class SkillRegistry:
                 "version_id": version_id,
                 "created_at": report["created_at"],
             }
-            or _sha(_json(identity)) != version_id
+            or _sha(_json(identity, deadline=deadline), deadline=deadline) != version_id
         ):
             raise SkillError(
                 "Skill files, modes or metadata no longer match its version"
             )
         if not isinstance(report["created_at"], str):
             raise SkillError("Invalid Skill import timestamp")
-        _instructions(files)
+        _instructions(files, deadline=deadline)
         return {
             **report,
             "report_sha256": report_hash,
             "context_path": str(root / "context"),
         }, files
 
-    def inspect(self, version_id: str, expected_report_sha256: str) -> dict:
+    def inspect(
+        self,
+        version_id: str,
+        expected_report_sha256: str,
+        *,
+        deadline: float | None = None,
+    ) -> dict:
         try:
+            check_deadline(deadline)
             if (
                 not isinstance(expected_report_sha256, str)
                 or _DIGEST.fullmatch(expected_report_sha256) is None
             ):
                 raise SkillError("Skill requires its saved report hash")
-            record, _ = self._load(version_id, expected_report_sha256)
+            record, _ = self._load(
+                version_id, expected_report_sha256, deadline=deadline
+            )
             return {"valid": True, "errors": [], **record}
+        except (ExecutionDeadlineExceeded, WorkspaceProcessUnknown):
+            raise
         except (OSError, ValueError, KeyError, TypeError, WorkspaceError) as error:
             return {"valid": False, "errors": [str(error)]}
 
-    def context(self, version_id: str, expected_report_sha256: str) -> SkillContext:
+    def context(
+        self,
+        version_id: str,
+        expected_report_sha256: str,
+        *,
+        deadline: float | None = None,
+    ) -> SkillContext:
         """Return text and an asset root, never parse or execute Skill frontmatter."""
-        status = self.inspect(version_id, expected_report_sha256)
+        check_deadline(deadline)
+        status = self.inspect(version_id, expected_report_sha256, deadline=deadline)
         if not status["valid"]:
             raise SkillError("Skill context is invalid: " + "; ".join(status["errors"]))
-        record, files = self._load(version_id, expected_report_sha256)
+        record, files = self._load(
+            version_id, expected_report_sha256, deadline=deadline
+        )
         return SkillContext(
             version_id,
-            _instructions(files),
+            _instructions(files, deadline=deadline),
             Path(record["context_path"]),
             tuple(name for name in sorted(files) if name != "SKILL.md"),
             record["metadata"],

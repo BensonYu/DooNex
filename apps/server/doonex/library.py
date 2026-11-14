@@ -7,6 +7,7 @@ from uuid import uuid4
 from psycopg.types.json import Jsonb
 from pydantic import Field
 
+from doonex.deadline import check_deadline
 from doonex.models import StrictModel
 from doonex.skills import SkillRegistry
 from doonex.store import now
@@ -29,19 +30,23 @@ class ReviewSkillInput(StrictModel):
 
 
 class Library:
-    def __init__(self, settings, store):
+    def __init__(self, settings, store, *, deadline: float | None = None):
+        check_deadline(deadline)
         self.settings, self.store = settings, store
-        self.skills = SkillRegistry(settings.home)
-        self.tasksets = TaskSetRegistry(settings.home)
+        self.skills = SkillRegistry(settings.home, deadline=deadline)
+        self.tasksets = TaskSetRegistry(settings.home, deadline=deadline)
+        check_deadline(deadline)
 
-    def get(self, kind, identifier, connection=None):
+    def get(self, kind, identifier, connection=None, *, deadline: float | None = None):
+        check_deadline(deadline)
         if connection is None:
             with self.store.connect() as c:
-                return self.get(kind, identifier, c)
+                return self.get(kind, identifier, c, deadline=deadline)
         row = connection.execute(
             "SELECT data FROM library_versions WHERE kind=%s AND id=%s",
             (kind, identifier),
         ).fetchone()
+        check_deadline(deadline)
         if not row:
             raise KeyError("找不到版本")
         return row["data"]
@@ -84,8 +89,11 @@ class Library:
             raise ValueError("已导入 Skill 与原保存凭据不一致；禁止重新绑定")
         return result
 
-    def skill(self, record, *, instructions=False):
-        integrity = self.skills.inspect(record["version_id"], record["report_sha256"])
+    def skill(self, record, *, instructions=False, deadline: float | None = None):
+        check_deadline(deadline)
+        integrity = self.skills.inspect(
+            record["version_id"], record["report_sha256"], deadline=deadline
+        )
         result = {
             **record,
             "integrity": {
@@ -95,7 +103,7 @@ class Library:
         }
         if instructions and integrity["valid"]:
             result["instructions"] = self.skills.context(
-                record["version_id"], record["report_sha256"]
+                record["version_id"], record["report_sha256"], deadline=deadline
             ).instructions
         return result
 
@@ -120,21 +128,23 @@ class Library:
             )
         return self.skill(record)
 
-    def freeze_skill(self, version_id):
+    def freeze_skill(self, version_id, *, deadline: float | None = None):
+        check_deadline(deadline)
         if version_id is None:
             return None
-        record = self.get("skill", version_id)
+        record = self.get("skill", version_id, deadline=deadline)
         if record["review_status"] != "approved":
             raise ValueError("只有明确审核批准的 Skill 版本可用于新运行")
-        if not self.skill(record)["integrity"]["valid"]:
+        if not self.skill(record, deadline=deadline)["integrity"]["valid"]:
             raise ValueError("Skill 内容或保存凭据已变化")
         return {
             key: record[key]
             for key in ("version_id", "content_digest", "report_sha256", "metadata")
         }
 
-    def skill_context(self, binding):
-        saved = self.get("skill", binding["version_id"])
+    def skill_context(self, binding, *, deadline: float | None = None):
+        check_deadline(deadline)
+        saved = self.get("skill", binding["version_id"], deadline=deadline)
         if any(
             binding.get(k) != saved.get(k)
             for k in ("version_id", "content_digest", "report_sha256", "metadata")
@@ -142,7 +152,9 @@ class Library:
             raise ValueError("运行中的 Skill 绑定已变化")
         # Review decisions affect new runs only. A frozen run still validates
         # its exact immutable bytes, rather than consulting mutable approval.
-        return self.skills.context(binding["version_id"], binding["report_sha256"])
+        return self.skills.context(
+            binding["version_id"], binding["report_sha256"], deadline=deadline
+        )
 
     def import_taskset(self, path):
         record = self.tasksets.import_local(Path(path).expanduser())
@@ -174,8 +186,11 @@ class Library:
             raise ValueError("已导入任务集与原保存凭据不一致；禁止重新绑定")
         return result
 
-    def taskset(self, record):
-        integrity = self.tasksets.inspect(record["taskset_id"], record["report_sha256"])
+    def taskset(self, record, *, deadline: float | None = None):
+        check_deadline(deadline)
+        integrity = self.tasksets.inspect(
+            record["taskset_id"], record["report_sha256"], deadline=deadline
+        )
         return {
             "id": record["taskset_id"],
             "name": record["name"],

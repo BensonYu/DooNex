@@ -410,7 +410,9 @@ def test_candidate_publish_crash_can_resume_without_reconstructing_output(
     monkeypatch.setattr(
         service,
         "_activate_candidate",
-        lambda *a: (_ for _ in ()).throw(RuntimeError("synthetic interruption")),
+        lambda *a, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("synthetic interruption")
+        ),
     )
     with pytest.raises(RuntimeError, match="synthetic interruption"):
         service.build_candidate(run, directory)

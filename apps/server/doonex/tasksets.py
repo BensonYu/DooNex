@@ -18,12 +18,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .deadline import check_deadline
+from .deadline import ExecutionDeadlineExceeded, check_deadline
 from .skills import (
     MAX_SKILL_ENTRIES,
     MAX_SKILL_FILE_BYTES,
     MAX_SKILL_TOTAL_BYTES,
     _json,
+    _names,
     _no_links,
     _sha,
 )
@@ -34,6 +35,7 @@ from .workspace import (
     FileContent,
     Workspace,
     WorkspaceError,
+    WorkspaceProcessUnknown,
     _allowed_path,
     _json_digest,
     manifest,
@@ -208,7 +210,14 @@ def _tree(
         check_deadline(deadline)
         if private and stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o700:
             raise TaskSetError("Task set directories must remain private (0700)")
-        for name in sorted(os.listdir(descriptor)):
+        names = []
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                check_deadline(deadline)
+                if count + len(names) >= limit:
+                    raise TaskSetError("Task set entry limit exceeded")
+                names.append(entry.name)
+        for name in sorted(names):
             check_deadline(deadline)
             count += 1
             if count > limit:
@@ -249,6 +258,7 @@ def _tree(
             else:
                 raise TaskSetError("Task set contains a symlink or special file")
 
+    check_deadline(deadline)
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         walk(descriptor)
@@ -290,9 +300,10 @@ def _snapshot(
 
 
 def _read_json(
-    path: Path, maximum: int, *, private: bool = False
+    path: Path, maximum: int, *, private: bool = False, deadline: float | None = None
 ) -> tuple[dict, bytes]:
-    _no_links(path)
+    check_deadline(deadline)
+    _no_links(path, deadline=deadline)
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         info = os.fstat(descriptor)
@@ -301,7 +312,15 @@ def _read_json(
         if private and stat.S_IMODE(info.st_mode) != 0o600:
             raise TaskSetError("Task set report must remain private (0600)")
         with os.fdopen(descriptor, "rb", closefd=False) as source:
-            content = source.read(maximum + 1)
+            chunks, size = [], 0
+            while size <= maximum:
+                check_deadline(deadline)
+                chunk = source.read(min(64 * 1024, maximum + 1 - size))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            content = b"".join(chunks)
         after = os.fstat(descriptor)
         if len(content) > maximum or (
             info.st_size,
@@ -311,9 +330,11 @@ def _read_json(
             raise TaskSetError("Task set JSON changed or exceeds its size limit")
     finally:
         os.close(descriptor)
+    check_deadline(deadline)
     data = json.loads(content)
     if not isinstance(data, dict):
         raise TaskSetError("Task set JSON must be an object")
+    check_deadline(deadline)
     return data, content
 
 
@@ -346,26 +367,30 @@ class TaskContext:
 
 
 class TaskSetRegistry:
-    def __init__(self, home: Path):
+    def __init__(self, home: Path, *, deadline: float | None = None):
+        check_deadline(deadline)
         home = Path(home).expanduser().absolute()
-        _no_links(home)
+        _no_links(home, deadline=deadline)
         home.mkdir(parents=True, exist_ok=True, mode=0o700)
         home.chmod(0o700)
         self.home, self.root = home, home / "tasksets"
         self.versions = self.root / "versions"
         for path in (self.root, self.versions):
-            _no_links(path)
+            check_deadline(deadline)
+            _no_links(path, deadline=deadline)
             path.mkdir(mode=0o700, exist_ok=True)
             if stat.S_IMODE(path.stat().st_mode) != 0o700:
                 raise TaskSetError(
                     "Task set registry directories must be private (0700)"
                 )
+        check_deadline(deadline)
 
-    def _version_path(self, taskset_id: str) -> Path:
+    def _version_path(self, taskset_id: str, *, deadline: float | None = None) -> Path:
+        check_deadline(deadline)
         if not isinstance(taskset_id, str) or _DIGEST.fullmatch(taskset_id) is None:
             raise TaskSetError("Invalid task set ID")
         path = self.versions / taskset_id
-        _no_links(path)
+        _no_links(path, deadline=deadline)
         return path
 
     def import_local(self, path: Path) -> dict:
@@ -500,6 +525,8 @@ class TaskSetRegistry:
                     return self._load(taskset_id, _sha(report_bytes))[0]
                 finally:
                     os.close(lock)
+        except (ExecutionDeadlineExceeded, WorkspaceProcessUnknown):
+            raise
         except (OSError, WorkspaceError, ValueError) as error:
             if isinstance(error, TaskSetError):
                 raise
@@ -508,21 +535,27 @@ class TaskSetRegistry:
             ) from error
 
     def _load(
-        self, taskset_id: str, expected_report_sha256: str | None
+        self,
+        taskset_id: str,
+        expected_report_sha256: str | None,
+        *,
+        deadline: float | None = None,
     ) -> tuple[dict, Path]:
-        root = self._version_path(taskset_id)
+        check_deadline(deadline)
+        root = self._version_path(taskset_id, deadline=deadline)
         for path in (self.home, self.root, self.versions, root, root / "context"):
-            _no_links(path)
+            check_deadline(deadline)
+            _no_links(path, deadline=deadline)
             if stat.S_IMODE(path.stat().st_mode) != 0o700:
                 raise TaskSetError(
                     "Task set storage directories must remain private (0700)"
                 )
-        if sorted(path.name for path in root.iterdir()) != ["context", "report.json"]:
+        if _names(root, 2, deadline=deadline) != ["context", "report.json"]:
             raise TaskSetError("Task set version contains unexpected entries")
         report, report_bytes = _read_json(
-            root / "report.json", MAX_REPORT_BYTES, private=True
+            root / "report.json", MAX_REPORT_BYTES, private=True, deadline=deadline
         )
-        report_hash = _sha(report_bytes)
+        report_hash = _sha(report_bytes, deadline=deadline)
         if expected_report_sha256 is not None and expected_report_sha256 != report_hash:
             raise TaskSetError("Task set report no longer matches its saved hash")
         expected_fields = {
@@ -546,6 +579,7 @@ class TaskSetRegistry:
         tasks, names, directories = [], [], ["tasks"]
         used_ids = set()
         for saved in report["tasks"]:
+            check_deadline(deadline)
             description = _description(saved, imported=True)
             if (
                 set(saved) != _TASK_FIELDS | _SNAPSHOT_FIELDS
@@ -557,7 +591,9 @@ class TaskSetRegistry:
             task = dict(description)
             directories.append(f"tasks/{description['id']}")
             for kind in ("source", "verifier"):
-                info, _ = _snapshot(task_root / kind, kind, private=True)
+                info, _ = _snapshot(
+                    task_root / kind, kind, private=True, deadline=deadline
+                )
                 task.update(info)
                 prefix = f"tasks/{description['id']}/{kind}"
                 directories.extend(
@@ -571,7 +607,11 @@ class TaskSetRegistry:
                 )
             tasks.append(task)
         actual_dirs, actual_files = _tree(
-            root / "context", limit=MAX_SUITE_ENTRIES + 1, depth=104, private=True
+            root / "context",
+            limit=MAX_SUITE_ENTRIES + 1,
+            depth=104,
+            private=True,
+            deadline=deadline,
         )
         if actual_dirs != sorted(directories) or actual_files != sorted(names):
             raise TaskSetError(
@@ -586,7 +626,7 @@ class TaskSetRegistry:
                 "provenance": report["provenance"],
                 "created_at": report["created_at"],
             }
-            or _sha(_json(identity)) != taskset_id
+            or _sha(_json(identity, deadline=deadline), deadline=deadline) != taskset_id
         ):
             raise TaskSetError("Task set source, verifier, modes or metadata changed")
         provenance = report["provenance"]
@@ -595,6 +635,7 @@ class TaskSetRegistry:
         }:
             raise TaskSetError("Invalid task set provenance")
         for origin in provenance.values():
+            check_deadline(deadline)
             if (
                 not isinstance(origin, dict)
                 or set(origin) != {"repo_path", "requested_ref"}
@@ -605,28 +646,46 @@ class TaskSetRegistry:
             _text(origin["requested_ref"], "provenance ref", 256)
         if not isinstance(report["created_at"], str):
             raise TaskSetError("Invalid task set import timestamp")
+        check_deadline(deadline)
         return {
             **report,
             "report_sha256": report_hash,
             "context_path": str(root / "context"),
         }, root / "context"
 
-    def inspect(self, taskset_id: str, expected_report_sha256: str) -> dict:
+    def inspect(
+        self,
+        taskset_id: str,
+        expected_report_sha256: str,
+        *,
+        deadline: float | None = None,
+    ) -> dict:
         try:
+            check_deadline(deadline)
             if (
                 not isinstance(expected_report_sha256, str)
                 or _DIGEST.fullmatch(expected_report_sha256) is None
             ):
                 raise TaskSetError("Task set requires its saved report hash")
-            record, _ = self._load(taskset_id, expected_report_sha256)
+            record, _ = self._load(
+                taskset_id, expected_report_sha256, deadline=deadline
+            )
             return {"valid": True, "errors": [], **record}
+        except (ExecutionDeadlineExceeded, WorkspaceProcessUnknown):
+            raise
         except (OSError, ValueError, TypeError, KeyError) as error:
             return {"valid": False, "errors": [str(error)]}
 
     def context(
-        self, taskset_id: str, expected_report_sha256: str, task_id: str
+        self,
+        taskset_id: str,
+        expected_report_sha256: str,
+        task_id: str,
+        *,
+        deadline: float | None = None,
     ) -> TaskContext:
-        status = self.inspect(taskset_id, expected_report_sha256)
+        check_deadline(deadline)
+        status = self.inspect(taskset_id, expected_report_sha256, deadline=deadline)
         if not status["valid"]:
             raise TaskSetError(
                 "Task set context is invalid: " + "; ".join(status["errors"])

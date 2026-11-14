@@ -26,6 +26,7 @@ from fastapi import HTTPException, Response
 from psycopg.types.json import Jsonb
 from pydantic import Field, field_validator
 
+from doonex.deadline import ExecutionDeadlineExceeded, check_deadline
 from doonex.discovery import check_license
 from doonex.evidence import Evidence
 from doonex.library import Library
@@ -36,6 +37,7 @@ from doonex.skills import (
     MAX_SKILL_ENTRIES,
     MAX_SKILL_FILE_BYTES,
     MAX_SKILL_TOTAL_BYTES,
+    _names,
     _no_links,
     _validate_content,
     prepare_bytes,
@@ -44,6 +46,7 @@ from doonex.store import dispatch_lock, now
 from doonex.workspace import (
     FileContent,
     Workspace,
+    WorkspaceProcessUnknown,
     manifest,
     manifest_digest,
     read_files,
@@ -78,18 +81,32 @@ class GenerationError(ValueError):
         self.code, self.status, self.generation_id = code, status, generation_id
 
 
-def canonical(value):
-    return json.dumps(
-        value, sort_keys=True, ensure_ascii=True, separators=(",", ":"), allow_nan=False
-    ).encode()
+def canonical(value, *, deadline: float | None = None):
+    check_deadline(deadline)
+    encoder = json.JSONEncoder(
+        sort_keys=True, ensure_ascii=True, separators=(",", ":"), allow_nan=False
+    )
+    chunks = []
+    for chunk in encoder.iterencode(value):
+        check_deadline(deadline)
+        chunks.append(chunk.encode())
+    check_deadline(deadline)
+    return b"".join(chunks)
 
 
-def sha(raw):
-    return hashlib.sha256(raw).hexdigest()
+def sha(raw, *, deadline: float | None = None):
+    check_deadline(deadline)
+    result = hashlib.sha256()
+    for index in range(0, len(raw), 64 * 1024):
+        check_deadline(deadline)
+        result.update(raw[index : index + 64 * 1024])
+    check_deadline(deadline)
+    return result.hexdigest()
 
 
-def digest(value):
-    return sha(canonical(value))
+def digest(value, *, deadline: float | None = None):
+    check_deadline(deadline)
+    return sha(canonical(value, deadline=deadline), deadline=deadline)
 
 
 def require(condition, code, status=400):
@@ -156,8 +173,9 @@ class ImportInput(RevisionInput):
         return value
 
 
-def _read(path, maximum=MAX_ARTIFACT_BYTES):
-    _no_links(path)
+def _read(path, maximum=MAX_ARTIFACT_BYTES, *, deadline: float | None = None):
+    check_deadline(deadline)
+    _no_links(path, deadline=deadline)
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         info = os.fstat(descriptor)
@@ -168,7 +186,15 @@ def _read(path, maximum=MAX_ARTIFACT_BYTES):
             "generation_artifact_not_private_regular_file",
         )
         with os.fdopen(descriptor, "rb", closefd=False) as source:
-            raw = source.read(maximum + 1)
+            chunks, size = [], 0
+            while size <= maximum:
+                check_deadline(deadline)
+                chunk = source.read(min(64 * 1024, maximum + 1 - size))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            raw = b"".join(chunks)
         require(
             len(raw) <= maximum and len(raw) == info.st_size, "generation_artifact_size"
         )
@@ -178,21 +204,28 @@ def _read(path, maximum=MAX_ARTIFACT_BYTES):
             == (after.st_size, after.st_mtime_ns, after.st_ctime_ns),
             "generation_artifact_changed_during_read",
         )
+        check_deadline(deadline)
         return raw
     finally:
         os.close(descriptor)
 
 
-def _write(path, raw):
+def _write(path, raw, *, deadline: float | None = None):
+    check_deadline(deadline)
     with path.open("xb") as output:
         os.fchmod(output.fileno(), 0o600)
-        output.write(raw)
+        for index in range(0, len(raw), 64 * 1024):
+            check_deadline(deadline)
+            output.write(raw[index : index + 64 * 1024])
+        check_deadline(deadline)
         output.flush()
         os.fsync(output.fileno())
+    check_deadline(deadline)
 
 
-def _snapshot(path):
-    _no_links(path)
+def _snapshot(path, *, deadline: float | None = None):
+    check_deadline(deadline)
+    _no_links(path, deadline=deadline)
     directories = []
     files = read_files(
         path,
@@ -202,50 +235,70 @@ def _snapshot(path):
         max_total_bytes=MAX_SKILL_TOTAL_BYTES,
         max_depth=MAX_SKILL_DEPTH,
         directories=directories,
+        deadline=deadline,
     )
     paths = tuple(entry["path"] for entry in directories if entry["path"])
-    _validate_content(files, paths)
+    _validate_content(files, paths, deadline=deadline)
     require(
         all(entry["mode"] == 0o700 for entry in directories),
         "generation_directory_mode_changed",
     )
-    identity = {"files": manifest(files), "directories": directories}
+    identity = {"files": manifest(files, deadline=deadline), "directories": directories}
     return files, identity
 
 
-def _tree(path, files, directories):
+def _tree(path, files, directories, *, deadline: float | None = None):
+    check_deadline(deadline)
     path.mkdir(mode=0o700)
     for entry in directories:
+        check_deadline(deadline)
         if entry["path"]:
             (path / entry["path"]).mkdir(mode=entry["mode"])
     for name, content in sorted(files.items()):
+        check_deadline(deadline)
         with (path / name).open("xb") as output:
             os.fchmod(output.fileno(), content.mode)
-            output.write(content.data)
+            for index in range(0, len(content.data), 64 * 1024):
+                check_deadline(deadline)
+                output.write(content.data[index : index + 64 * 1024])
             output.flush()
             os.fsync(output.fileno())
+    check_deadline(deadline)
 
 
-def _archive(files, directories):
+def _archive(files, directories, *, deadline: float | None = None):
+    check_deadline(deadline)
+
+    class CheckedReader(io.BytesIO):
+        def read(self, size=-1):
+            check_deadline(deadline)
+            value = super().read(size)
+            check_deadline(deadline)
+            return value
+
     output = io.BytesIO()
     with (
         gzip.GzipFile(fileobj=output, mode="wb", filename="", mtime=0) as compressed,
         tarfile.open(fileobj=compressed, mode="w") as archive,
     ):
         for entry in directories:
+            check_deadline(deadline)
             if entry["path"]:
                 member = tarfile.TarInfo(entry["path"] + "/")
                 member.type, member.mode = tarfile.DIRTYPE, entry["mode"]
                 archive.addfile(member)
         for name, content in sorted(files.items()):
+            check_deadline(deadline)
             member = tarfile.TarInfo(name)
             member.size, member.mode = len(content.data), content.mode
-            archive.addfile(member, io.BytesIO(content.data))
+            archive.addfile(member, CheckedReader(content.data))
+    check_deadline(deadline)
     return output.getvalue()
 
 
-def parse_output(raw):
+def parse_output(raw, *, deadline: float | None = None):
     """The one accepted model result is an object with one bounded text field."""
+    check_deadline(deadline)
     require(len(raw) <= MAX_OUTPUT_BYTES, "generation_output_too_large")
 
     def unique(pairs):
@@ -292,13 +345,16 @@ def parse_output(raw):
         ),
         "generation_append_rights_declaration",
     )
+    check_deadline(deadline)
     return encoded
 
 
 class Generation:
-    def __init__(self, settings, store):
+    def __init__(self, settings, store, *, deadline: float | None = None):
+        check_deadline(deadline)
         self.settings, self.store = settings, store
-        self.library = Library(settings, store)
+        self.library = Library(settings, store, deadline=deadline)
+        check_deadline(deadline)
 
     def _save(self, c, value):
         value["updated_at"] = now()
@@ -308,7 +364,8 @@ class Generation:
             (value["run_id"], Jsonb(value), value["id"]),
         )
 
-    def _get(self, identifier, c):
+    def _get(self, identifier, c, *, deadline: float | None = None):
+        check_deadline(deadline)
         row = c.execute(
             "SELECT data FROM skill_generations WHERE id=%s", (uuid(identifier),)
         ).fetchone()
@@ -317,16 +374,19 @@ class Generation:
         value = row["data"]
         require(
             value["revision"]
-            == digest({k: v for k, v in value.items() if k != "revision"}),
+            == digest(
+                {k: v for k, v in value.items() if k != "revision"}, deadline=deadline
+            ),
             "generation_receipt_changed",
         )
         return value
 
-    def get(self, identifier, connection=None):
+    def get(self, identifier, connection=None, *, deadline: float | None = None):
+        check_deadline(deadline)
         if connection is not None:
-            return self._get(identifier, connection)
+            return self._get(identifier, connection, deadline=deadline)
         with self.store.connect() as c:
-            return self._get(identifier, c)
+            return self._get(identifier, c, deadline=deadline)
 
     @contextmanager
     def locked(self, identifier, *, dispatch=False):
@@ -382,7 +442,15 @@ class Generation:
             ],
         }
 
-    def _tasks(self, identifier, task_ids, expected_report=None):
+    def _tasks(
+        self,
+        identifier,
+        task_ids,
+        expected_report=None,
+        *,
+        deadline: float | None = None,
+    ):
+        check_deadline(deadline)
         with self.store.connect() as c:
             marker = c.execute(
                 "SELECT data->>'split' AS split,data->>'report_sha256' AS report_sha256 "
@@ -429,13 +497,14 @@ class Generation:
                 "generation_visible_task_invalid",
             )
         require(
-            len(canonical(tasks)) <= MAX_PROJECTION_BYTES,
+            len(canonical(tasks, deadline=deadline)) <= MAX_PROJECTION_BYTES,
             "generation_visible_input_too_large",
         )
         return report, tasks
 
-    def _parent(self, binding, *, approval=False):
-        saved = self.library.get("skill", binding["version_id"])
+    def _parent(self, binding, *, approval=False, deadline: float | None = None):
+        check_deadline(deadline)
+        saved = self.library.get("skill", binding["version_id"], deadline=deadline)
         require(
             all(
                 saved.get(k) == binding.get(k)
@@ -452,7 +521,7 @@ class Generation:
             "generation_parent_license_status_unsupported",
         )
         record, files = self.library.skills._load(
-            binding["version_id"], binding["report_sha256"]
+            binding["version_id"], binding["report_sha256"], deadline=deadline
         )
         require(
             all(content.mode in {0o644, 0o755} for content in files.values()),
@@ -497,7 +566,7 @@ class Generation:
         ]
         return (
             files,
-            {"files": manifest(files), "directories": directories},
+            {"files": manifest(files, deadline=deadline), "directories": directories},
             license_receipt,
         )
 
@@ -621,7 +690,8 @@ class Generation:
             )
         return self.detail(identifier)
 
-    def _binding(self, value):
+    def _binding(self, value, *, deadline: float | None = None):
+        check_deadline(deadline)
         return {
             "id": value["id"],
             "input_sha256": value["input_sha256"],
@@ -705,7 +775,10 @@ class Generation:
                 )
         return self.detail(identifier)
 
-    def _frozen(self, value, *, approval=False, tasks=False):
+    def _frozen(
+        self, value, *, approval=False, tasks=False, deadline: float | None = None
+    ):
+        check_deadline(deadline)
         require(
             value["schema_version"] == SCHEMA_VERSION and value["policy"] == POLICY,
             "generation_policy_changed",
@@ -731,15 +804,18 @@ class Generation:
             )
         }
         require(
-            digest(frozen) == value["input_sha256"], "generation_frozen_input_changed"
+            digest(frozen, deadline=deadline) == value["input_sha256"],
+            "generation_frozen_input_changed",
         )
         require(
-            digest(value["visible_tasks"]) == value["projection_sha256"]
-            and sha(value["prompt"].encode()) == value["prompt_sha256"],
+            digest(value["visible_tasks"], deadline=deadline)
+            == value["projection_sha256"]
+            and sha(value["prompt"].encode(), deadline=deadline)
+            == value["prompt_sha256"],
             "generation_input_digest_changed",
         )
         files, identity, license_receipt = self._parent(
-            value["parent"], approval=approval
+            value["parent"], approval=approval, deadline=deadline
         )
         require(
             identity == value["parent_manifest"]
@@ -751,6 +827,7 @@ class Generation:
                 value["input"]["taskset_id"],
                 value["input"]["task_ids"],
                 value["taskset_report_sha256"],
+                deadline=deadline,
             )
             require(
                 visible == value["visible_tasks"],
@@ -758,7 +835,8 @@ class Generation:
             )
         return files
 
-    def _run(self, run, directory):
+    def _run(self, run, directory, *, deadline: float | None = None):
+        check_deadline(deadline)
         require(
             run["request"].get("purpose") == "skill_generation",
             "generation_run_purpose_invalid",
@@ -768,11 +846,12 @@ class Generation:
             isinstance(binding, dict) and "id" in binding,
             "generation_run_binding_missing",
         )
-        value = self.get(binding["id"])
+        value = self.get(binding["id"], deadline=deadline)
         require(
             value["run_id"] == run["id"]
-            and binding == self._binding(value)
-            and digest(run["request"]) == value["run_request_sha256"],
+            and binding == self._binding(value, deadline=deadline)
+            and digest(run["request"], deadline=deadline)
+            == value["run_request_sha256"],
             "generation_run_immutable_request_changed",
         )
         directory = Path(directory).absolute()
@@ -780,24 +859,33 @@ class Generation:
             directory == Path(self.settings.home).absolute() / "runs" / run["id"],
             "generation_run_directory_invalid",
         )
-        _no_links(directory)
-        files = self._frozen(value)
+        _no_links(directory, deadline=deadline)
+        files = self._frozen(value, deadline=deadline)
         return value, directory, files
 
     @contextmanager
-    def _publish_guard(self, run, *, states=("running",)):
+    def _publish_guard(
+        self, run, *, states=("running",), deadline: float | None = None
+    ):
+        check_deadline(deadline)
         require(bool(run.get("owner")), "generation_owner_missing")
         with self.store.locked(run["id"], run["owner"]) as (_c, current):
+            check_deadline(deadline)
             require(
                 current["state"] in states
-                and digest(current["request"]) == digest(run["request"]),
+                and digest(current["request"], deadline=deadline)
+                == digest(run["request"], deadline=deadline),
                 "generation_run_stopped_or_changed",
             )
             yield
+            check_deadline(deadline)
 
-    def _publish_tree(self, run, destination, files, identity):
+    def _publish_tree(
+        self, run, destination, files, identity, *, deadline: float | None = None
+    ):
+        check_deadline(deadline)
         if destination.exists():
-            existing, actual = _snapshot(destination)
+            existing, actual = _snapshot(destination, deadline=deadline)
             require(
                 existing == files and actual == identity,
                 "generation_existing_tree_changed",
@@ -807,12 +895,15 @@ class Generation:
             prefix=".generation-stage-", dir=destination.parent
         ) as temporary:
             staging = Path(temporary) / "tree"
-            _tree(staging, files, identity["directories"])
-            with self._publish_guard(run):
+            _tree(staging, files, identity["directories"], deadline=deadline)
+            with self._publish_guard(run, deadline=deadline):
                 require(not destination.exists(), "generation_tree_publish_race")
                 staging.rename(destination)
 
-    def _output(self, run, directory, *, require_binding=False):
+    def _output(
+        self, run, directory, *, require_binding=False, deadline: float | None = None
+    ):
+        check_deadline(deadline)
         root = directory / "generation-output"
         if not root.exists():
             require(
@@ -820,25 +911,27 @@ class Generation:
                 "generation_output_missing",
             )
             return None
-        _no_links(root)
+        _no_links(root, deadline=deadline)
         require(
             stat.S_IMODE(root.stat().st_mode) == 0o700
-            and sorted(p.name for p in root.iterdir())
-            == ["output.json", "report.json"],
+            and _names(root, 2, deadline=deadline) == ["output.json", "report.json"],
             "generation_output_layout_changed",
         )
-        raw = _read(root / "output.json", MAX_OUTPUT_BYTES)
-        report_raw = _read(root / "report.json")
+        raw = _read(root / "output.json", MAX_OUTPUT_BYTES, deadline=deadline)
+        report_raw = _read(root / "report.json", deadline=deadline)
         expected = {
             "schema_version": SCHEMA_VERSION,
             "generation_id": run["request"]["generation"]["id"],
             "run_id": run["id"],
             "assignment_id": run["assignments"]["executor"]["id"],
-            "output_sha256": sha(raw),
+            "output_sha256": sha(raw, deadline=deadline),
             "size": len(raw),
         }
-        require(report_raw == canonical(expected), "generation_output_report_changed")
-        binding = {**expected, "report_sha256": sha(report_raw)}
+        require(
+            report_raw == canonical(expected, deadline=deadline),
+            "generation_output_report_changed",
+        )
+        binding = {**expected, "report_sha256": sha(report_raw, deadline=deadline)}
         if run.get("generation_output") is not None:
             require(
                 run["generation_output"] == binding, "generation_output_binding_changed"
@@ -849,39 +942,49 @@ class Generation:
         )
         return raw, binding
 
-    def prepare_workspace(self, run, directory):
-        value, directory, files = self._run(run, directory)
-        self.validate_run(run, directory)
-        self._publish_tree(run, directory / "baseline", files, value["parent_manifest"])
-        candidate = self._candidate(run, directory, required=False)
+    def prepare_workspace(self, run, directory, *, deadline: float | None = None):
+        check_deadline(deadline)
+        value, directory, files = self._run(run, directory, deadline=deadline)
+        self.validate_run(run, directory, deadline=deadline)
+        self._publish_tree(
+            run,
+            directory / "baseline",
+            files,
+            value["parent_manifest"],
+            deadline=deadline,
+        )
+        candidate = self._candidate(run, directory, required=False, deadline=deadline)
         if candidate and candidate["valid"]:
             target_files, identity = _snapshot(
-                directory / "generation-candidate" / "context"
+                directory / "generation-candidate" / "context", deadline=deadline
             )
         else:
             target_files, identity = files, value["parent_manifest"]
         if candidate and candidate["valid"] and (directory / "workspace").exists():
-            self._activate_candidate(run, directory)
+            self._activate_candidate(run, directory, deadline=deadline)
         else:
-            self._publish_tree(run, directory / "workspace", target_files, identity)
+            self._publish_tree(
+                run, directory / "workspace", target_files, identity, deadline=deadline
+            )
         return Workspace(
             directory / "workspace",
             None,
             None,
             directory / "baseline",
-            manifest_digest(manifest(files)),
+            manifest_digest(manifest(files, deadline=deadline), deadline=deadline),
         )
 
-    def save_output(self, run, directory, message):
-        _value, directory, _files = self._run(run, directory)
-        self.validate_run(run, directory, require_workspace=True)
+    def save_output(self, run, directory, message, *, deadline: float | None = None):
+        check_deadline(deadline)
+        _value, directory, _files = self._run(run, directory, deadline=deadline)
+        self.validate_run(run, directory, require_workspace=True, deadline=deadline)
         require(isinstance(message, str), "generation_finish_message_missing")
         try:
             raw = message.encode("utf-8")
         except UnicodeError:
             raise GenerationError("generation_finish_invalid_utf8") from None
         require(len(raw) <= MAX_OUTPUT_BYTES, "generation_output_too_large")
-        existing = self._output(run, directory)
+        existing = self._output(run, directory, deadline=deadline)
         if existing:
             require(existing[0] == raw, "generation_completed_output_changed")
             return existing[1]
@@ -890,26 +993,27 @@ class Generation:
             "generation_id": run["request"]["generation"]["id"],
             "run_id": run["id"],
             "assignment_id": run["assignments"]["executor"]["id"],
-            "output_sha256": sha(raw),
+            "output_sha256": sha(raw, deadline=deadline),
             "size": len(raw),
         }
-        report_raw = canonical(report)
+        report_raw = canonical(report, deadline=deadline)
         with tempfile.TemporaryDirectory(
             prefix=".generation-output-", dir=directory
         ) as temporary:
             staging = Path(temporary) / "output"
             staging.mkdir(mode=0o700)
-            _write(staging / "output.json", raw)
-            _write(staging / "report.json", report_raw)
-            with self._publish_guard(run):
+            _write(staging / "output.json", raw, deadline=deadline)
+            _write(staging / "report.json", report_raw, deadline=deadline)
+            with self._publish_guard(run, deadline=deadline):
                 require(
                     not (directory / "generation-output").exists(),
                     "generation_output_publish_race",
                 )
                 staging.rename(directory / "generation-output")
-        return {**report, "report_sha256": sha(report_raw)}
+        return {**report, "report_sha256": sha(report_raw, deadline=deadline)}
 
-    def _candidate(self, run, directory, *, required):
+    def _candidate(self, run, directory, *, required, deadline: float | None = None):
+        check_deadline(deadline)
         root = directory / "generation-candidate"
         if not root.exists():
             require(
@@ -917,12 +1021,12 @@ class Generation:
                 "generation_candidate_missing",
             )
             return None
-        _no_links(root)
+        _no_links(root, deadline=deadline)
         require(
             stat.S_IMODE(root.stat().st_mode) == 0o700,
             "generation_candidate_directory_mode",
         )
-        report_raw = _read(root / "report.json")
+        report_raw = _read(root / "report.json", deadline=deadline)
         report = json.loads(report_raw)
         require(
             report["generation_id"] == run["request"]["generation"]["id"]
@@ -930,10 +1034,12 @@ class Generation:
             and report["policy"] == POLICY,
             "generation_candidate_identity_changed",
         )
-        _raw, output = self._output(run, directory, require_binding=True)
+        _raw, output = self._output(
+            run, directory, require_binding=True, deadline=deadline
+        )
         require(report["output"] == output, "generation_candidate_output_changed")
-        value = self.get(run["request"]["generation"]["id"])
-        parent_files = self._frozen(value)
+        value = self.get(run["request"]["generation"]["id"], deadline=deadline)
+        parent_files = self._frozen(value, deadline=deadline)
         expected_report = {
             "schema_version": SCHEMA_VERSION,
             "generation_id": value["id"],
@@ -942,11 +1048,13 @@ class Generation:
             "output": output,
             "valid": True,
             "errors": [],
-            "parent_manifest_sha256": digest(value["parent_manifest"]),
+            "parent_manifest_sha256": digest(
+                value["parent_manifest"], deadline=deadline
+            ),
             "parent_report_sha256": value["parent"]["report_sha256"],
         }
         try:
-            append = parse_output(_raw)
+            append = parse_output(_raw, deadline=deadline)
             expected_files = {
                 **parent_files,
                 "SKILL.md": FileContent(
@@ -959,24 +1067,32 @@ class Generation:
                 for entry in value["parent_manifest"]["directories"]
                 if entry["path"]
             )
-            _validate_content(expected_files, directory_names)
+            _validate_content(expected_files, directory_names, deadline=deadline)
             expected_manifest = {
-                "files": manifest(expected_files),
+                "files": manifest(expected_files, deadline=deadline),
                 "directories": value["parent_manifest"]["directories"],
             }
             expected_report.update(
                 manifest=expected_manifest,
-                manifest_sha256=digest(expected_manifest),
+                manifest_sha256=digest(expected_manifest, deadline=deadline),
                 archive_sha256=sha(
-                    _archive(expected_files, expected_manifest["directories"])
+                    _archive(
+                        expected_files,
+                        expected_manifest["directories"],
+                        deadline=deadline,
+                    ),
+                    deadline=deadline,
                 ),
                 content_digest=digest(
                     {
-                        "files": manifest(expected_files),
+                        "files": manifest(expected_files, deadline=deadline),
                         "directories": list(directory_names),
-                    }
+                    },
+                    deadline=deadline,
                 ),
             )
+        except (ExecutionDeadlineExceeded, WorkspaceProcessUnknown):
+            raise
         except (ValueError, UnicodeError) as error:
             expected_report.update(
                 valid=False,
@@ -987,31 +1103,32 @@ class Generation:
                 ],
             )
         require(
-            report_raw == canonical(expected_report),
+            report_raw == canonical(expected_report, deadline=deadline),
             "generation_candidate_structural_report_changed",
         )
         if report["valid"]:
             require(
-                sorted(p.name for p in root.iterdir())
+                _names(root, 4, deadline=deadline)
                 == ["candidate.tar.gz", "context", "manifest.json", "report.json"],
                 "generation_candidate_layout_changed",
             )
-            files, identity = _snapshot(root / "context")
+            files, identity = _snapshot(root / "context", deadline=deadline)
             manifest_raw, archive_raw = (
-                _read(root / "manifest.json"),
-                _read(root / "candidate.tar.gz"),
+                _read(root / "manifest.json", deadline=deadline),
+                _read(root / "candidate.tar.gz", deadline=deadline),
             )
             require(
                 identity == report["manifest"]
-                and canonical(identity) == manifest_raw
-                and sha(manifest_raw) == report["manifest_sha256"]
-                and sha(archive_raw) == report["archive_sha256"]
-                and archive_raw == _archive(files, identity["directories"]),
+                and canonical(identity, deadline=deadline) == manifest_raw
+                and sha(manifest_raw, deadline=deadline) == report["manifest_sha256"]
+                and sha(archive_raw, deadline=deadline) == report["archive_sha256"]
+                and archive_raw
+                == _archive(files, identity["directories"], deadline=deadline),
                 "generation_candidate_artifact_changed",
             )
-            value = self.get(report["generation_id"])
-            parent_files = self._frozen(value)
-            append = parse_output(_raw)
+            value = self.get(report["generation_id"], deadline=deadline)
+            parent_files = self._frozen(value, deadline=deadline)
+            append = parse_output(_raw, deadline=deadline)
             expected = {
                 **parent_files,
                 "SKILL.md": FileContent(
@@ -1026,7 +1143,7 @@ class Generation:
             )
         else:
             require(
-                sorted(p.name for p in root.iterdir()) == ["report.json"]
+                _names(root, 1, deadline=deadline) == ["report.json"]
                 and bool(report["errors"]),
                 "generation_invalid_report_changed",
             )
@@ -1037,7 +1154,7 @@ class Generation:
             "valid": report["valid"],
             "errors": report["errors"],
             "output_sha256": output["output_sha256"],
-            "report_sha256": sha(report_raw),
+            "report_sha256": sha(report_raw, deadline=deadline),
             "manifest_sha256": report.get("manifest_sha256"),
             "archive_sha256": report.get("archive_sha256"),
             "content_digest": report.get("content_digest"),
@@ -1050,10 +1167,13 @@ class Generation:
             )
         return binding
 
-    def _activate_candidate(self, run, directory):
-        value, _directory, parent = self._run(run, directory)
-        files, identity = _snapshot(directory / "generation-candidate" / "context")
-        actual, actual_identity = _snapshot(directory / "workspace")
+    def _activate_candidate(self, run, directory, *, deadline: float | None = None):
+        check_deadline(deadline)
+        value, _directory, parent = self._run(run, directory, deadline=deadline)
+        files, identity = _snapshot(
+            directory / "generation-candidate" / "context", deadline=deadline
+        )
+        actual, actual_identity = _snapshot(directory / "workspace", deadline=deadline)
         if actual == files and actual_identity == identity:
             return
         require(
@@ -1067,29 +1187,38 @@ class Generation:
             content = files["SKILL.md"]
             with replacement.open("xb") as output:
                 os.fchmod(output.fileno(), content.mode)
-                output.write(content.data)
+                for index in range(0, len(content.data), 64 * 1024):
+                    check_deadline(deadline)
+                    output.write(content.data[index : index + 64 * 1024])
+                check_deadline(deadline)
                 output.flush()
                 os.fsync(output.fileno())
-            with self._publish_guard(run):
-                before, before_identity = _snapshot(directory / "workspace")
+            with self._publish_guard(run, deadline=deadline):
+                before, before_identity = _snapshot(
+                    directory / "workspace", deadline=deadline
+                )
                 require(
                     before == parent and before_identity == value["parent_manifest"],
                     "generation_workspace_changed",
                 )
+                check_deadline(deadline)
                 os.replace(replacement, directory / "workspace" / "SKILL.md")
 
-    def build_candidate(self, run, directory):
-        value, directory, files = self._run(run, directory)
-        self.validate_run(run, directory, require_workspace=True)
-        raw, output = self._output(run, directory, require_binding=True)
-        existing = self._candidate(run, directory, required=False)
+    def build_candidate(self, run, directory, *, deadline: float | None = None):
+        check_deadline(deadline)
+        value, directory, files = self._run(run, directory, deadline=deadline)
+        self.validate_run(run, directory, require_workspace=True, deadline=deadline)
+        raw, output = self._output(
+            run, directory, require_binding=True, deadline=deadline
+        )
+        existing = self._candidate(run, directory, required=False, deadline=deadline)
         if existing:
             if existing["valid"]:
-                self._activate_candidate(run, directory)
+                self._activate_candidate(run, directory, deadline=deadline)
             return existing
         errors = []
         try:
-            append = parse_output(raw)
+            append = parse_output(raw, deadline=deadline)
             candidate = {
                 **files,
                 "SKILL.md": FileContent(
@@ -1101,7 +1230,9 @@ class Generation:
                 for entry in value["parent_manifest"]["directories"]
                 if entry["path"]
             )
-            _validate_content(candidate, directories)
+            _validate_content(candidate, directories, deadline=deadline)
+        except (ExecutionDeadlineExceeded, WorkspaceProcessUnknown):
+            raise
         except (ValueError, UnicodeError) as error:
             errors = [
                 error.code
@@ -1116,7 +1247,9 @@ class Generation:
             "output": output,
             "valid": not errors,
             "errors": errors,
-            "parent_manifest_sha256": digest(value["parent_manifest"]),
+            "parent_manifest_sha256": digest(
+                value["parent_manifest"], deadline=deadline
+            ),
             "parent_report_sha256": value["parent"]["report_sha256"],
         }
         with tempfile.TemporaryDirectory(
@@ -1126,87 +1259,115 @@ class Generation:
             staging.mkdir(mode=0o700)
             if not errors:
                 identity = {
-                    "files": manifest(candidate),
+                    "files": manifest(candidate, deadline=deadline),
                     "directories": value["parent_manifest"]["directories"],
                 }
-                _tree(staging / "context", candidate, identity["directories"])
-                manifest_raw, archive_raw = (
-                    canonical(identity),
-                    _archive(candidate, identity["directories"]),
+                _tree(
+                    staging / "context",
+                    candidate,
+                    identity["directories"],
+                    deadline=deadline,
                 )
-                _write(staging / "manifest.json", manifest_raw)
-                _write(staging / "candidate.tar.gz", archive_raw)
+                manifest_raw, archive_raw = (
+                    canonical(identity, deadline=deadline),
+                    _archive(candidate, identity["directories"], deadline=deadline),
+                )
+                _write(staging / "manifest.json", manifest_raw, deadline=deadline)
+                _write(staging / "candidate.tar.gz", archive_raw, deadline=deadline)
                 report.update(
                     manifest=identity,
-                    manifest_sha256=sha(manifest_raw),
-                    archive_sha256=sha(archive_raw),
+                    manifest_sha256=sha(manifest_raw, deadline=deadline),
+                    archive_sha256=sha(archive_raw, deadline=deadline),
                     content_digest=digest(
-                        {"files": manifest(candidate), "directories": list(directories)}
+                        {
+                            "files": manifest(candidate, deadline=deadline),
+                            "directories": list(directories),
+                        },
+                        deadline=deadline,
                     ),
                 )
-            _write(staging / "report.json", canonical(report))
-            with self._publish_guard(run):
+            _write(
+                staging / "report.json",
+                canonical(report, deadline=deadline),
+                deadline=deadline,
+            )
+            with self._publish_guard(run, deadline=deadline):
                 require(
                     not (directory / "generation-candidate").exists(),
                     "generation_candidate_publish_race",
                 )
                 staging.rename(directory / "generation-candidate")
-        binding = self._candidate(run, directory, required=True)
+        binding = self._candidate(run, directory, required=True, deadline=deadline)
         if binding["valid"]:
-            self._activate_candidate(run, directory)
+            self._activate_candidate(run, directory, deadline=deadline)
         return binding
 
-    def validate_run(self, run, directory, require_workspace=False):
+    def validate_run(
+        self, run, directory, require_workspace=False, *, deadline: float | None = None
+    ):
+        check_deadline(deadline)
         try:
-            return self._validate_run(run, directory, require_workspace)
-        except GenerationError:
+            return self._validate_run(
+                run, directory, require_workspace, deadline=deadline
+            )
+        except (GenerationError, ExecutionDeadlineExceeded, WorkspaceProcessUnknown):
             raise
         except (OSError, KeyError, TypeError, ValueError):
             raise GenerationError("generation_run_integrity_invalid") from None
 
-    def _validate_run(self, run, directory, require_workspace):
-        value, directory, files = self._run(run, directory)
+    def _validate_run(
+        self, run, directory, require_workspace, *, deadline: float | None = None
+    ):
+        check_deadline(deadline)
+        value, directory, files = self._run(run, directory, deadline=deadline)
         if (directory / "baseline").exists():
-            baseline, identity = _snapshot(directory / "baseline")
+            baseline, identity = _snapshot(directory / "baseline", deadline=deadline)
             require(
                 baseline == files and identity == value["parent_manifest"],
                 "generation_baseline_changed",
             )
             require(
-                run.get("baseline_digest") in (None, manifest_digest(manifest(files))),
+                run.get("baseline_digest")
+                in (
+                    None,
+                    manifest_digest(
+                        manifest(files, deadline=deadline), deadline=deadline
+                    ),
+                ),
                 "generation_baseline_binding_changed",
             )
         else:
             require(not require_workspace, "generation_baseline_missing")
-        self._output(run, directory)
-        candidate = self._candidate(run, directory, required=False)
+        self._output(run, directory, deadline=deadline)
+        candidate = self._candidate(run, directory, required=False, deadline=deadline)
         if (directory / "workspace").exists():
-            current, identity = _snapshot(directory / "workspace")
+            current, identity = _snapshot(directory / "workspace", deadline=deadline)
             valid_parent = current == files and identity == value["parent_manifest"]
             valid_candidate = False
             if candidate and candidate["valid"]:
                 expected, expected_identity = _snapshot(
-                    directory / "generation-candidate" / "context"
+                    directory / "generation-candidate" / "context", deadline=deadline
                 )
                 valid_candidate = current == expected and identity == expected_identity
             require(valid_parent or valid_candidate, "generation_workspace_changed")
         else:
             require(not require_workspace, "generation_workspace_missing")
         if (directory / "generation-final").exists():
-            self._final(run, directory)
+            self._final(run, directory, deadline=deadline)
         return value
 
-    def _final(self, run, directory):
+    def _final(self, run, directory, *, deadline: float | None = None):
+        check_deadline(deadline)
         root = directory / "generation-final"
-        _no_links(root)
+        _no_links(root, deadline=deadline)
         require(
             stat.S_IMODE(root.stat().st_mode) == 0o700
-            and sorted(p.name for p in root.iterdir()) == ["report.json"],
+            and _names(root, 1, deadline=deadline) == ["report.json"],
             "generation_final_layout_changed",
         )
-        raw = _read(root / "report.json")
+        raw = _read(root / "report.json", deadline=deadline)
         report = json.loads(raw)
-        binding = self._candidate(run, directory, required=True)
+        binding = self._candidate(run, directory, required=True, deadline=deadline)
         require(
             set(report)
             == {
@@ -1225,21 +1386,38 @@ class Generation:
             and report["valid"] is True,
             "generation_final_binding_changed",
         )
-        require(raw == canonical(report), "generation_final_encoding_changed")
-        candidate_files, _identity = _snapshot(
-            directory / "generation-candidate" / "context"
+        require(
+            raw == canonical(report, deadline=deadline),
+            "generation_final_encoding_changed",
         )
-        current_files, _current_identity = _snapshot(directory / "workspace")
+        candidate_files, _identity = _snapshot(
+            directory / "generation-candidate" / "context", deadline=deadline
+        )
+        current_files, _current_identity = _snapshot(
+            directory / "workspace", deadline=deadline
+        )
         require(candidate_files == current_files, "generation_final_workspace_changed")
         workspace = Workspace(
             directory / "workspace",
             None,
             None,
             directory / "baseline",
-            manifest_digest(manifest(self._frozen(self.get(binding["generation_id"])))),
+            manifest_digest(
+                manifest(
+                    self._frozen(
+                        self.get(binding["generation_id"], deadline=deadline),
+                        deadline=deadline,
+                    ),
+                    deadline=deadline,
+                ),
+                deadline=deadline,
+            ),
         )
         evidence = Evidence.inspect(
-            workspace, directory, report["evidence_report_sha256"]
+            workspace,
+            directory,
+            report["evidence_report_sha256"],
+            deadline=deadline,
         )
         require(
             evidence["valid"]
@@ -1256,7 +1434,7 @@ class Generation:
         final = {
             **binding,
             "evidence_report_sha256": report["evidence_report_sha256"],
-            "final_report_sha256": sha(raw),
+            "final_report_sha256": sha(raw, deadline=deadline),
         }
         if run.get("generation_candidate", {}).get("final_report_sha256"):
             require(
@@ -1265,20 +1443,28 @@ class Generation:
             )
         return final, report
 
-    def finalize_candidate(self, run, directory, evidence):
-        _value, directory, files = self._run(run, directory)
-        self.validate_run(run, directory, require_workspace=True)
-        candidate = self._candidate(run, directory, required=True)
+    def finalize_candidate(
+        self, run, directory, evidence, *, deadline: float | None = None
+    ):
+        check_deadline(deadline)
+        _value, directory, files = self._run(run, directory, deadline=deadline)
+        self.validate_run(run, directory, require_workspace=True, deadline=deadline)
+        candidate = self._candidate(run, directory, required=True, deadline=deadline)
         require(candidate["valid"], "generation_candidate_invalid")
-        self._activate_candidate(run, directory)
+        self._activate_candidate(run, directory, deadline=deadline)
         workspace = Workspace(
             directory / "workspace",
             None,
             None,
             directory / "baseline",
-            manifest_digest(manifest(files)),
+            manifest_digest(manifest(files, deadline=deadline), deadline=deadline),
         )
-        checked = Evidence.inspect(workspace, directory, evidence.get("report_sha256"))
+        checked = Evidence.inspect(
+            workspace,
+            directory,
+            evidence.get("report_sha256"),
+            deadline=deadline,
+        )
         require(
             checked["valid"]
             and checked["report"]["run_id"] == run["id"]
@@ -1288,7 +1474,7 @@ class Generation:
         )
         root = directory / "generation-final"
         if root.exists():
-            final, report = self._final(run, directory)
+            final, report = self._final(run, directory, deadline=deadline)
             require(
                 report["evidence_report_sha256"] == evidence["report_sha256"],
                 "generation_final_evidence_changed",
@@ -1307,11 +1493,15 @@ class Generation:
         ) as temporary:
             staging = Path(temporary) / "final"
             staging.mkdir(mode=0o700)
-            _write(staging / "report.json", canonical(report))
-            with self._publish_guard(run, states=("verifying",)):
+            _write(
+                staging / "report.json",
+                canonical(report, deadline=deadline),
+                deadline=deadline,
+            )
+            with self._publish_guard(run, states=("verifying",), deadline=deadline):
                 require(not root.exists(), "generation_final_publish_race")
                 staging.rename(root)
-        return self._final(run, directory)[0]
+        return self._final(run, directory, deadline=deadline)[0]
 
     def _completed(self, value):
         require(value["run_id"] is not None, "generation_not_started", 409)
