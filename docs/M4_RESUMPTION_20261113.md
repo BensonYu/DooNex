@@ -369,3 +369,18 @@ full02 遗留一个、八项复现遗留两个 Created 容器，均按实际 ins
 
 
 上述父修复的 `m4-closure-fix-target-01` 已完成 **7 passed / exit 0**，pytest 37.97 秒、外层 52.241600 秒，176 个实际捕获输入前后不变、watchdog 未触发。日志 SHA256 `b036e99bcb9fcee5883b44f75ea3c29e8a68950d12b4fa2489d65fb2347b6857`。运行时 HEAD 仍为 `a375ed4`，含收据逐文件绑定的未提交 scheduling 与五份测试修改，不能写成干净旧 HEAD 通过；恢复 GET 不在这七项中。相关模块整合与最终全量仍待。
+
+### 相邻调用方整合与故障夹具完整复核
+
+父提交 `3429eed` 的八模块 `m4-closure-related-01` 全部执行，**197 passed / 1 failed / exit 1**，pytest 469.62 秒、外层 484.735457 秒，176 个非 Markdown 输入前后不变，无 watchdog；日志 SHA256 `8d25fde40f90608fe517c14fbd211dfac5c0dc11c3634256843e106e476d272e`。唯一失败为旧 `test_create_ack_loss_is_cleaned_by_preselected_name`，实际 operations 中没有 create，`next(create)` 抛 StopIteration；不是清理成功或安全要求失败。结束后 Run/test 库存成功查询为空。
+
+同类启动窗口问题再次出现后，停止按节点追加时间数字，重新逐项审查整个 Sandbox 故障模块的 24 个测试函数。先前只修已报错样本的判断不足：多个夹具共享“登记、DB 复检及 Python 子进程初始化在几百毫秒内完成”的隐含前提，部分宽泛异常断言还可能在目标注入点前满足。独立完整表 `m4-sandbox-deadline-fixture-audit-01.json` SHA256 `318f4cb60529123297a8027eff2d13e5ce5241c9d3023d1e8e09834377ff347b`，先行 diff 审查 `m4-sandbox-workspace-failure-review-01.json` 为 `72313ac7104c942d79d73d9d889781eaa12a0a95e51aabc818e4ec4b5c3e5565`。
+
+模块性修正保留生产 Sandbox/Workspace/controller：run 级故障从入口取得一次性 3 秒窗口，common-create/start 及 caller 场景被动核对各阶段实际绝对期限和持久 controller 期限；cancel 仅在 fake create 实际写入后触发；继承管道要求真实 fork 标记；copy、ACK、列表解码/限额和最终残留检查明确证明目标阶段。原未知保留、原 repair 不解除 fence、零新派发、清理窗口不刷新及外层耗时断言继续存在。默认夹具清理 0.35 秒、专用 stalled-cleanup 1 秒和生产配置均未更改；这些仍是健康本机下的附加测试条件，不能外推永久失联时成功。
+
+恢复报告修复已整合为 `235e67f`，暂停任务显式重新核查入口为 `abea283`：已有全局或本 Run 阻止时 GET 在 Review/Git/scan/Docker 前返回报告，`containers/workspace_ok=null` 明确未核查，普通 POST 与确认界面仍拒绝；阻止解除后可以重新核查。子片仅做静态检查、构建及收集，没有把它们写成 API 行为通过；父当前以 `m4-closure-recovery-fixtures-01` 联合验证完整 Sandbox 故障、Responses fence、清理、API、多项目及生成调用方。
+
+最终两轮准备改用新的私有系统盘 TMPDIR `/private/tmp/doonex-m4-verification-20261114`。现场系统卷可用约 115 GiB，T7 的全部原失败与收据保留；该变更使最后完整回归实际执行大小写别名场景，未减少范围。由于本轮有产品恢复路径变更，将在同一最终源码重新运行全部 **43 配置 / 39 唯一 nodeid** 正常专项，再运行无筛选全量；两个 session nodeid 各自输出 warm/startup/restore 三配置。90 秒目标不变，不用产品差异豁免替代新观测。两轮尚未执行，仍不能合并 main。
+
+
+父联合 `m4-closure-recovery-fixtures-01` 已完成 **130 passed / exit 0**，pytest 147.97 秒、外层 161.208987 秒；176 个实际捕获输入不变、无 watchdog，日志 SHA256 `9d05beaa6f9ba741e38df4a3c1813335ab1098d7d8f83bae9e78a910aec2c959`。绑定为 `abea283` 加捕获的未提交 Sandbox fixture，不称干净 HEAD 全部通过。随后仅补充 ACK 实际副作用与真实 leader/fork 的严格证明，完整模块 `m4-closure-sandbox-phases-01` **42 passed / exit 0**，pytest 46.01 秒、外层 58.732973 秒，输入不变、无 watchdog；日志 SHA256 `b4c6b6cc2fdb9b91cbedc191770511a9aa8f2c1bc43a6c6312667f1c4a1f9e14`。结束后独立 Run/test 容器库存成功查询为空。以上关闭针对性整合检查，最终 43 正常配置专项及无筛选全量仍待。

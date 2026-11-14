@@ -53,6 +53,7 @@ if operation == 'create':
             os._exit(0)
     else:
         state.write_text(name)
+        (root / 'create-side-effect').write_text(name)
     time.sleep(settings.get('create_delay', 0))
     sys.stdout.write(settings.get('create_output', 'a' * 64 + '\n'))
 elif operation == 'start':
@@ -132,35 +133,74 @@ def assert_reaped_and_eof(evidence):
     json.dumps(evidence)
 
 
+def observe_process_deadlines(monkeypatch):
+    original = implementation._Supervisor.process
+    calls = []
+
+    def observed(self, arguments, **options):
+        calls.append((options["operation"], options["deadline"]))
+        return original(self, arguments, **options)
+
+    monkeypatch.setattr(implementation._Supervisor, "process", observed)
+    return calls
+
+
 @pytest.mark.postgres
-def test_common_deadline_covers_create_and_attach(fake_docker, tmp_path):
+def test_common_deadline_covers_create_and_attach(fake_docker, tmp_path, monkeypatch):
     control, configure, context = fake_docker
-    sandbox = configure(create_delay=0.2, start_delay=0.8)
+    deadlines = observe_process_deadlines(monkeypatch)
+    sandbox = configure(create_delay=1, start_delay=30)
     entered = time.monotonic()
-    result = sandbox.run(tmp_path, "true", 0.70, context.run_id, **context.binding)
+    result = sandbox.run(tmp_path, "true", 3, context.run_id, **context.binding)
     elapsed = time.monotonic() - entered
     assert result["timed_out"]
-    assert elapsed < 0.70 + 0.35 + 0.3
+    assert elapsed < 3 + 0.35 + 0.3
     assert not result["cleanup_unknown"], result
     assert not (control / "container").exists()
+    assert [item["operation"] for item in operations(control)][:2] == [
+        "create",
+        "start",
+    ]
     assert "inspect" not in [item["operation"] for item in operations(control)]
+    business = [
+        (phase, at)
+        for phase, at in deadlines
+        if phase in {"mount_validation", "create", "start"}
+    ]
+    assert [phase for phase, _ in business] == ["mount_validation", "create", "start"]
+    assert len({at for _, at in business}) == 1
+    assert context.records()[0]["business_deadline_monotonic_ns"] == int(
+        business[0][1] * 1_000_000_000
+    )
     assert_reaped_and_eof(result["cleanup_evidence"])
 
 
 @pytest.mark.postgres
-def test_caller_deadline_does_not_refresh_at_sandbox_entry(fake_docker, tmp_path):
+def test_caller_deadline_does_not_refresh_at_sandbox_entry(
+    fake_docker, tmp_path, monkeypatch
+):
     control, configure, context = fake_docker
+    deadlines = observe_process_deadlines(monkeypatch)
     sandbox = configure(create_delay=30)
-    deadline = time.monotonic() + 0.55
+    deadline = time.monotonic() + 3
     time.sleep(0.12)
     result = sandbox.run(
-        tmp_path, "true", 3, context.run_id, deadline=deadline, **context.binding
+        tmp_path, "true", 10, context.run_id, deadline=deadline, **context.binding
     )
     assert result["timed_out"]
     assert result["cleanup_unknown"], result
     assert result["cleanup_evidence"]["daemon_request_unknown"]
     assert time.monotonic() < deadline + 0.35 + 0.3
     assert not (control / "container").exists()
+    assert any(item["operation"] == "create" for item in operations(control))
+    assert [
+        (phase, at)
+        for phase, at in deadlines
+        if phase in {"mount_validation", "create"}
+    ] == [("mount_validation", deadline), ("create", deadline)]
+    assert context.records()[0]["business_deadline_monotonic_ns"] == int(
+        deadline * 1_000_000_000
+    )
 
 
 @pytest.mark.postgres
@@ -189,13 +229,14 @@ def test_expired_caller_deadline_never_launches_a_process(
 def test_create_ack_loss_is_cleaned_by_preselected_name(fake_docker, tmp_path):
     control, configure, context = fake_docker
     sandbox = configure(create_delay=30)
-    result = sandbox.run(tmp_path, "true", 0.35, context.run_id, **context.binding)
+    result = sandbox.run(tmp_path, "true", 3, context.run_id, **context.binding)
     assert result["timed_out"] and result["container_id"] is None
     assert result["cleanup_unknown"], result
     calls = operations(control)
     created = next(item for item in calls if item["operation"] == "create")
     removed = next(item for item in calls if item["operation"] == "rm")
     name = created["arguments"][created["arguments"].index("--name") + 1]
+    assert (control / "create-side-effect").read_text() == name
     assert removed["arguments"] == ["-f", name]
     listed = next(item for item in calls if item["operation"] == "ps")
     assert "label=doonex.run_id=" + context.run_id in listed["arguments"]
@@ -253,7 +294,8 @@ def test_invalid_or_excess_create_ack_never_bypasses_cleanup(
     fake_docker, tmp_path, output
 ):
     control, configure, context = fake_docker
-    with pytest.raises(SandboxError) as raised:
+    expected = "output_limit" if len(output) > 65 else "malformed container identifier"
+    with pytest.raises(SandboxError, match=expected) as raised:
         configure(create_output=output).run(
             tmp_path, "true", 3, context.run_id, **context.binding
         )
@@ -278,10 +320,18 @@ def test_invalid_or_excess_create_ack_never_bypasses_cleanup(
 )
 @pytest.mark.postgres
 def test_incomplete_or_malformed_container_lists_are_never_empty(fake_docker, output):
-    _, configure, context = fake_docker
+    control, configure, context = fake_docker
     sandbox = configure(ps_output=output)
-    with pytest.raises(SandboxError):
+    expected = (
+        "output_limit"
+        if len(output) > MAX_CONTAINER_IDS * 65
+        else "not ASCII"
+        if not output.isascii()
+        else "incomplete or malformed"
+    )
+    with pytest.raises(SandboxError, match=expected):
         sandbox.containers(context.run_id, **context.binding)
+    assert [item["operation"] for item in operations(control)] == ["ps"]
     original = context.records()[0]
     with pytest.raises(co.RegistryError, match="fenced"):
         sandbox.stop_run(context.run_id, **context.binding)
@@ -299,7 +349,7 @@ def test_incomplete_or_malformed_container_lists_are_never_empty(fake_docker, ou
 def test_container_count_limit_is_strict(fake_docker):
     _, configure, context = fake_docker
     output = "".join(f"{index:064x}\n" for index in range(MAX_CONTAINER_IDS + 1))
-    with pytest.raises(SandboxError):
+    with pytest.raises(SandboxError, match="output_limit"):
         configure(ps_output=output).containers(context.run_id, **context.binding)
 
 
@@ -325,6 +375,14 @@ def test_final_absence_check_covers_every_container_with_run_label(
     )
     assert result["cleanup_unknown"]
     assert result["cleanup_evidence"]["container_absence_confirmed"] is False
+    assert [item["operation"] for item in operations(control)] == [
+        "create",
+        "start",
+        "inspect",
+        "rm",
+        "ps",
+    ]
+    assert not result["timed_out"]
     listed = next(item for item in operations(control) if item["operation"] == "ps")
     assert listed["arguments"] == [
         "-aq",
@@ -377,10 +435,11 @@ def test_control_output_is_finite_and_raises(fake_docker):
 
 @pytest.mark.postgres
 def test_exited_cli_with_inherited_pipe_is_not_completed(fake_docker, tmp_path):
-    _, configure, context = fake_docker
+    control, configure, context = fake_docker
     result = configure(pipe_child=True).run(
-        tmp_path, "true", 0.5, context.run_id, **context.binding
+        tmp_path, "true", 3, context.run_id, **context.binding
     )
+    assert (control / "child.pid").exists()
     assert result["timed_out"]
     assert not result["cleanup_unknown"], result
     record = next(
@@ -389,6 +448,12 @@ def test_exited_cli_with_inherited_pipe_is_not_completed(fake_docker, tmp_path):
         if item["operation"] == "start"
     )
     assert record["reaped"] and record["pipe_eof"]
+    start = next(
+        row
+        for row in context.records()[0]["processes"]
+        if row["phase"] == "docker_start"
+    )
+    assert start["exit_code"] == 0
 
 
 @pytest.mark.postgres
@@ -466,17 +531,17 @@ def test_finite_cleanup_window_cannot_refresh_for_stalled_ps(
 
 @pytest.mark.postgres
 def test_cancel_during_create_preserves_cleanup_proof(fake_docker, tmp_path):
-    _, configure, context = fake_docker
-    stop_at = time.monotonic() + 0.35
+    control, configure, context = fake_docker
     result = configure(create_delay=30).run(
         tmp_path,
         "true",
         3,
         context.run_id,
-        lambda: time.monotonic() >= stop_at,
+        lambda: (control / "container").exists(),
         **context.binding,
     )
     assert result["cancelled"] and not result["timed_out"]
+    assert any(item["operation"] == "create" for item in operations(control))
     assert result["cleanup_unknown"]
     assert result["cleanup_evidence"]["daemon_request_unknown"]
     assert_reaped_and_eof(result["cleanup_evidence"])
@@ -496,8 +561,8 @@ def test_mount_scan_uses_same_deadline_and_is_reaped(
 
     monkeypatch.setattr(implementation.subprocess, "Popen", delayed_mount)
     entered = time.monotonic()
-    result = configure().run(tmp_path, "true", 0.2, context.run_id, **context.binding)
-    assert time.monotonic() - entered < 0.8
+    result = configure().run(tmp_path, "true", 3, context.run_id, **context.binding)
+    assert time.monotonic() - entered < 3 + 0.35 + 0.3
     assert result["timed_out"] and not result["cleanup_unknown"]
     # The controller requires a complete observation to finish a Sandbox group,
     # even when mount validation prevented every container mutation.
@@ -577,7 +642,7 @@ def test_callback_failure_before_launch_starts_no_process(monkeypatch, sandbox_c
 
 @pytest.mark.postgres
 def test_inherited_pipe_keeps_leader_identity_until_group_signal(
-    monkeypatch, sandbox_context
+    monkeypatch, sandbox_context, tmp_path
 ):
     monkeypatch.setattr(implementation, "CLEANUP_SECONDS", 0.3)
     original_launch = subprocess.Popen
@@ -609,14 +674,22 @@ def test_inherited_pipe_keeps_leader_identity_until_group_signal(
         [
             sys.executable,
             "-c",
-            "import os, time; child = os.fork(); time.sleep(30) if child == 0 else None",
+            (
+                "import os, time, sys; from pathlib import Path; root = Path(sys.argv[1]); "
+                "child = os.fork(); "
+                "(root / ('child.pid' if child == 0 else 'leader-exit')).write_text(str(os.getpid())); "
+                "time.sleep(30) if child == 0 else None"
+            ),
+            str(tmp_path),
         ],
-        deadline=time.monotonic() + 0.2,
+        deadline=time.monotonic() + 3,
         operation="mount_validation",
         capability=supervisor.capability,
         maximum=100,
     )
-    assert result.reason == "timeout"
+    assert result.reason == "timeout" and result.returncode == 0
+    assert (tmp_path / "child.pid").exists()
+    assert (tmp_path / "leader-exit").read_text() == str(signals[0])
     assert polls_before_signal == []
     assert len(signals) == 1
     assert_reaped_and_eof(evidence)
