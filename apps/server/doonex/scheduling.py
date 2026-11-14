@@ -201,6 +201,18 @@ class Scheduler:
             with self.store.locked(run["id"]) as (c, current):
                 if current["state"] != "yielded":
                     return False
+                if isinstance(error, SandboxError):
+                    from doonex.cleanup import merge_cleanup
+
+                    current["recovery"] = merge_cleanup(
+                        {
+                            "remaining": ["unknown"],
+                            "stopped": [],
+                            "errors": [type(error).__name__],
+                        },
+                        previous=current.get("recovery"),
+                        error=error,
+                    )
                 current.update(state="interrupted", reason=str(error))
                 self.store.event(
                     run["id"], "scheduling_resume_refused", {"reason": str(error)}, c

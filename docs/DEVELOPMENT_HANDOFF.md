@@ -6,14 +6,14 @@
 
 | 对象 | 当前事实 |
 | --- | --- |
-| 开发入口 | `codex/responses-transport`；应用源码 `b4625026e1e247dedeee8859b8cd5cf36086b040`，文档提交在其后 |
+| 开发入口 | `codex/responses-transport`；真实后台验收源码 `b4625026e1e247dedeee8859b8cd5cf36086b040`；其后新增离线控制器终态保护，状态见下文 |
 | 开发目录 | `/Users/benson/.codex/worktrees/doonex-delivery-docs/doonex` |
 | 固定真实验收目录 | `/Users/benson/.codex/worktrees/responses-process-transport-tests/doonex`，detached `b462502`；保持干净，不在此开发 |
 | main | `a965d7faaf83f6f70f22971da21ab5aa03e27257`，M3 已验收版本，尚未推进 |
 | 常驻服务 | API、worker 均未加载；保留 plist 仍指向 M5 `f7a1161`，没有升级，不能自动恢复旧 worker |
 | 数据库 | 原产品 PostgreSQL 保留；两轮历史超时、全部未知预留和旧日账保持 |
 
-共享 `.venv` 指向 `/Users/benson/.codex/worktrees/doonex-m1/doonex/.venv`；Python 3.12.16 / SDK 1.60.1。该旧工作区仍是环境依赖，不能直接归档删除。前端 node_modules 也复用原 M1 目录。本轮没有升级依赖或新建分支/worktree。
+共享 `.venv` 指向 `/Users/benson/.codex/worktrees/doonex-m1/doonex/.venv`；Python 3.12.16 / SDK 1.60.1。该旧工作区仍是环境依赖，不能直接归档删除。前端 node_modules 也复用原 M1 目录。后台验收轮没有升级依赖或新建分支/worktree；后续 Sandbox 和 Git/export 实施各使用独立 worktree，父继续整合到已有入口，不另开整合分支。
 
 续接先只读核对真实状态：
 
@@ -37,6 +37,7 @@ PYTHONPATH=apps/server:tests .venv/bin/python -c 'import doonex; print(doonex.__
 - 10 个生产维护索引及 `actions_helper_fenced_v2` 的实际定义和 valid/ready/live 核对通过。数据库维护每次最多一个重单位，worker 每循环两次；规模查询计划不等于完整延迟保证。
 - SDK 会话容量 `42688c7` 已整合，正式 file_store=、无缓存有限 inventory、故障锁存、源形状/事件/fanout 限额和 close finally，详见[容量合同](M4_SESSION_CAPACITY.md)。worker 尚未传入整链共同 persistence deadline。
 - 严格 Responses 投影在 `b462502` 支持本网关已核验的中性元数据及细分用量；任意字段、非法工具和非零内置工具仍拒绝。无 retry/fallback，不改写 aggregate 用量。
+- 后续离线切片增加共同 monotonic deadline 基础和已观察控制进程未知的持久阻止；11 项实际 Worker.run/一次性 PostgreSQL 合成故障专项通过，没有真实 API 调用。Sandbox/Git/export 切片尚在独立实施。Popen 后、回执持久前崩溃窗口及整链 deadline 仍未完成，不能据此推进 main；具体证据和限制见[续接记录](M4_RESUMPTION_20261113.md#下一步与合并条件)。
 
 ## 本轮真实验收：全部已经执行，禁止重放
 

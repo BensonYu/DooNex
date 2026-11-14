@@ -6,6 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from doonex.budget import Halt, Ledger, elapsed, guard
+from doonex.cleanup import merge_cleanup
 from doonex.config import Settings, redact
 from doonex.models import model_for_role, run_roles
 from doonex.store import OwnershipLost, Store, now
@@ -33,15 +34,27 @@ def exception_cause(error, expected):
     return None
 
 
-def stop_containers(sandbox, run_id):
+def stop_containers(sandbox, run_id, *, previous=None, error=None):
     try:
-        return sandbox.stop_run(run_id)
-    except Exception as error:  # noqa: BLE001 - preserve unknown termination state
-        return {
+        result = sandbox.stop_run(run_id)
+    except Exception as cleanup_error:  # noqa: BLE001 - preserve unknown termination state
+        result = {
             "remaining": ["unknown"],
             "stopped": [],
-            "errors": [type(error).__name__],
+            "errors": [type(cleanup_error).__name__],
         }
+        result = merge_cleanup(result, error=cleanup_error)
+    return merge_cleanup(result, previous=previous, error=error)
+
+
+def check_sandbox_cleanup(result):
+    from doonex.sandbox import SandboxError
+
+    if result.get("cleanup_error") or result.get("cleanup_unknown"):
+        error = SandboxError("任务容器或本机控制进程清理失败，不能确认执行已经终止")
+        error.cleanup_unknown = bool(result.get("cleanup_unknown"))
+        error.cleanup_evidence = result.get("cleanup_evidence") or {}
+        raise error
 
 
 def get_workspace(run, directory):
@@ -108,7 +121,9 @@ class Worker:
         for run in self.store.list_runs(limit=None, states=ACTIVE | {"interrupted"}):
             with self.store.locked(run["id"]) as (c, current):
                 self.lease()
-                result = stop_containers(sandbox, run["id"])
+                result = stop_containers(
+                    sandbox, run["id"], previous=current.get("recovery")
+                )
                 if result.get("remaining") or result.get("errors"):
                     self.cleanup_blocked = True
                 self.store.mark_pending_unknown(run["id"], c, current)
@@ -435,8 +450,7 @@ class Worker:
                             **options,
                         )
                         result = redact(result, secrets)
-                        if result.get("cleanup_error"):
-                            raise SandboxError("工具容器清理失败，不能确认执行已经终止")
+                        check_sandbox_cleanup(result)
                         self.lease()
                         if read_only:
                             saved_handoff = self.store.get(run_id).get("handoff")
@@ -854,8 +868,7 @@ class Worker:
                         raise Yielded() from None
                     try:
                         result = sandbox.run(*args, **kwargs)
-                        if result.get("cleanup_error"):
-                            raise SandboxError("验证容器清理失败，不能确认执行已经终止")
+                        check_sandbox_cleanup(result)
                         self.lease()
                         self.store.finish_action(
                             action,
@@ -1017,7 +1030,9 @@ class Worker:
             # A new lock holder owns cleanup after a connection loss.
             self.lease()
             with self.store.locked(run_id, self.owner) as (c, current):
-                cleanup = stop_containers(sandbox, run_id)
+                cleanup = stop_containers(
+                    sandbox, run_id, previous=current.get("recovery"), error=exc
+                )
                 reason = str(redact(str(exc), secrets))[:1500]
                 if cleanup.get("remaining") or cleanup.get("errors"):
                     self.cleanup_blocked = True

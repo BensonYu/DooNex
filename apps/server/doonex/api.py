@@ -429,7 +429,9 @@ def create_app(settings=None):
                 from doonex.sandbox import Sandbox
                 from doonex.worker import stop_containers
 
-                cleanup = stop_containers(Sandbox(), run["id"])
+                cleanup = stop_containers(
+                    Sandbox(), run["id"], previous=current.get("recovery")
+                )
                 current["recovery"] = cleanup
                 store.mark_pending_unknown(run["id"], c, current)
                 if cleanup["remaining"] or cleanup["errors"]:
@@ -471,6 +473,9 @@ def create_app(settings=None):
 
         run = load_run(run_id)
         directory = run_directory(settings, run["id"])
+        from doonex.cleanup import controller_process_unknown
+
+        controller_blocked = controller_process_unknown(run.get("recovery"))
         workspace_ok = not run["first_started_at"]
         notes = []
         try:
@@ -528,12 +533,15 @@ def create_app(settings=None):
             notes.append(
                 "存在未决动作；未知模型用量保留预留额度。请核对现有文件再确认续接。"
             )
+        if controller_blocked:
+            notes.append("本机控制进程或输出管道终态未核实；空容器列表不能解除此阻止。")
         return {
             "containers": result.stdout.split(),
             "pending_actions": pending,
             "workspace_ok": workspace_ok,
             "notes": notes,
             "transport_blocked": transport_blocked,
+            "controller_process_blocked": controller_blocked,
         }
 
     @app.post("/api/runs/{run_id}/resume", dependencies=auth)
@@ -546,6 +554,8 @@ def create_app(settings=None):
         if run["state"] not in {"paused", "interrupted"}:
             raise ValueError("仅暂停或中断的运行可以续接")
         report = recovery(run_id)
+        if report["controller_process_blocked"]:
+            raise ValueError("本机控制进程尚未完成独立核查；普通续接不能解除阻止")
         if report["containers"] or not report["workspace_ok"]:
             raise ValueError("工作区或在途容器尚未完成核查")
         uncertain = bool(report["pending_actions"]) or run["state"] == "interrupted"
@@ -568,6 +578,10 @@ def create_app(settings=None):
 
             if helper_fenced(c):
                 raise ValueError("模型传输进程尚未完成独立核查；普通续接不能解除阻止")
+            from doonex.cleanup import controller_process_unknown
+
+            if controller_process_unknown(current.get("recovery")):
+                raise ValueError("本机控制进程尚未完成独立核查；普通续接不能解除阻止")
             if reset_session:
                 current["session_generation"] = current.get("session_generation", 0) + 1
                 current["resume_session"] = False

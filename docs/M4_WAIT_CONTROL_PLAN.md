@@ -23,7 +23,11 @@ helper 的启动、传输和 IPC 使用一个绝对 monotonic deadline；所有�
 
 先从一次 sandbox 入口贯穿挂载验证、create、执行和输出管道，以同一 monotonic deadline 计算每个阶段的剩余时间。业务停止后仍需独立、明确且有限的必要清理期限；不能在每个 Docker 子操作重新取得完整额度，或因 Run 时长已到期而跳过清理。
 
-限制 Docker CLI stdout/stderr、容器 ID 数与解析工作量；超限和超时不能解释为没有容器。子进程需真实终止、回收并观测 EOF，不能用存活的 daemon reader、遗弃 future 或关闭可能被持锁的 stdout 伪称清理完成。最终完整零残留检查失败、lost ACK、CLI 未回收或状态不明必须保留 unknown 并阻止前台派发。
+限制 Docker CLI stdout/stderr、容器 ID 数与解析工作量；超限和超时不能解释为没有容器。子进程需真实终止、回收并观测 EOF，不能用存活的 daemon reader、遗弃 future 或关闭可能被持锁的 stdout 伪称清理完成。最终完整零残留检查失败、lost ACK、CLI 未回收或状态不明必须保留 unknown 并阻止前台派发。rm 的 ACK 丢失后，只有该 CLI 已实际 reap、管道已观察 EOF、随后完整 run label 查询独立证明零残留，才能消解该容器的不确定；空列表不能消解本机进程或管道未知。
+
+已接入“观察到未知之后”的持久阻止：异常链或返回结果中的 `local_process_unknown` 合并入 recovery.errors，因此复用原全局阻止索引。重启核查、普通暂停/取消/续接及 Arena 恢复不能覆盖此证据。最多保留 16 份不同未决回执，超限保留 overflow 阻止；最新清理尝试及未决回执分开保存，并写入原 cleanup 事件。当前没有自动解除此类本机进程未知的入口。
+
+这尚未覆盖控制器在子进程启动后、终态回执持久前崩溃的窗口。后续需在 Popen 前持久 logical operation 身份，按同一 owner/operation 的实际 reap/EOF 回执 CAS 结算；已有 shell/verification action 可以复用准入身份，Git/export、mount 和清理探测还需相应登记。普通 unknown→acknowledged、空容器列表或重启不能被当作该证明。此窗口继续阻止宣称完整等待与崩溃恢复验收完成。
 
 容器清理移出数据库行锁前须另行冻结 cleanup 身份和持久阻止，外部清理后按 owner/状态 CAS；不得只移动调用并省略 fence。实现优先沿用现有标准库与 Sandbox，不新增服务或通用监管框架。以真实 Docker 正常/故障检查、原账本及首次时钟保留作为切片完成条件。
 

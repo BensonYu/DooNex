@@ -57,6 +57,8 @@ def environment():
                 "sandbox.py",
                 "worker.py",
                 "budget.py",
+                "cleanup.py",
+                "deadline.py",
                 "evidence.py",
                 "arena.py",
                 "arena_metrics.py",
@@ -485,6 +487,7 @@ class Arena:
                     )
 
     def resume(self, identifier, acknowledge_unknown):
+        from doonex.cleanup import controller_process_unknown
         from doonex.responses_registry import helper_fenced
         from doonex.sandbox import Sandbox
         from doonex.worker import get_workspace, run_directory
@@ -504,6 +507,8 @@ class Arena:
         assistance = {}
         for run in children:
             if run["state"] in {"paused", "interrupted"}:
+                if controller_process_unknown(run.get("recovery")):
+                    raise ValueError("本机控制进程尚未完成独立核查；禁止恢复批次")
                 directory = run_directory(self.settings, run["id"])
                 if Sandbox().containers(run["id"]):
                     raise ValueError("子运行仍有容器，不能恢复")
@@ -535,6 +540,8 @@ class Arena:
                     raise ValueError("子运行状态已变化，请重新核查")
                 if helper_fenced(c):
                     raise ValueError("模型传输进程尚未完成独立核查；禁止恢复批次")
+                if controller_process_unknown(current.get("recovery")):
+                    raise ValueError("本机控制进程尚未完成独立核查；禁止恢复批次")
                 if current["request"].get("background"):
                     from doonex.background import Background
 
