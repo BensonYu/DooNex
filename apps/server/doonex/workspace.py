@@ -12,11 +12,14 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from .controller_operations import RegistryError, current_registry, scope
 from .deadline import ExecutionDeadlineExceeded
 from .deadline import check_deadline as _check_deadline
+from .store import OwnershipLost
 
 MAX_FILES = 10_000
 MAX_FILE_BYTES = 10 * 1024 * 1024
@@ -90,7 +93,7 @@ class WorkspaceProcessUnknown(WorkspaceError):
 
     cleanup_unknown = True
 
-    def __init__(self, process: subprocess.Popen):
+    def __init__(self, process: subprocess.Popen, *, pipe_eof: bool = False):
         super().__init__("Git termination could not be confirmed")
         self.cleanup_evidence = {
             "container_name": None,
@@ -100,15 +103,145 @@ class WorkspaceProcessUnknown(WorkspaceError):
                     "operation": "git",
                     "pid": process.pid,
                     "reaped": process.returncode is not None,
-                    "pipe_eof": all(
-                        source is not None and source.closed
-                        for source in (process.stdout, process.stderr)
-                    ),
+                    # Closing a descriptor in finally is not an observed EOF.
+                    "pipe_eof": pipe_eof,
                 }
             ],
             "errors": ["git_termination_unconfirmed"],
             "local_process_unknown": True,
         }
+
+
+class _GitControllerGroup:
+    """Live supervisor receipts for one already-durable controller group."""
+
+    def __init__(self, registry, operation, capability):
+        self.registry, self.operation, self.capability = registry, operation, capability
+        self.attempts = 0
+        self.receipts = []
+
+    def before_process(self):
+        self.check_live()
+        permit = self.capability.before_process("git")
+        self.attempts += 1
+        return permit
+
+    def check_live(self):
+        if current_registry() is not self.registry:
+            raise RegistryError(
+                "registry_changed", operation_id=self.operation.operation_id
+            )
+
+    def after_process(self, permit, process, *, pipe_eof):
+        receipt = {
+            "pid": process.pid,
+            "exit_code": process.returncode,
+            "reaped": process.returncode is not None,
+            "pipe_eof": pipe_eof,
+        }
+        self.capability.after_process(permit, **receipt)
+        self.receipts.append(receipt)
+
+    @property
+    def terminal(self):
+        return (
+            bool(self.attempts)
+            and len(self.receipts) == self.attempts
+            and all(item["reaped"] and item["pipe_eof"] for item in self.receipts)
+        )
+
+    def finish(self, error=None):
+        if self.terminal and not isinstance(error, (RegistryError, OwnershipLost)):
+            reason = (
+                "success"
+                if error is None
+                else "deadline"
+                if isinstance(
+                    error, (ExecutionDeadlineExceeded, _GitLocalDeadlineExceeded)
+                )
+                else "command_failed"
+                if any(item["exit_code"] != 0 for item in self.receipts)
+                else "operation_failed"
+            )
+            self.operation.finish(
+                {
+                    "outcome": "success" if error is None else "failed",
+                    "reason": reason,
+                    "local_process_unknown": False,
+                    "daemon_request_unknown": False,
+                    "docker": None,
+                }
+            )
+        else:
+            self.operation.mark_unknown(
+                "supervision_unknown" if not self.terminal else "interrupted"
+            )
+
+
+def _git_intent(repository, kind, intent):
+    encoded = os.fsencode(repository)
+    if len(encoded) > MAX_GIT_PATH_BYTES:
+        raise WorkspaceError("Git project path limit exceeded")
+    source = hashlib.sha256(b"doonex-git-source-v1\0" + encoded).hexdigest()
+    if (
+        type(intent) is not tuple
+        or len(intent) > 64
+        or any(type(item) is not str for item in intent)
+    ):
+        raise WorkspaceError("Git operation intent limit exceeded")
+    parts, total = [], 0
+    for item in intent:
+        if len(item) > MAX_GIT_CONFIG_BYTES:
+            raise WorkspaceError("Git operation intent limit exceeded")
+        part = item.encode("utf-8", errors="surrogatepass")
+        total += len(part)
+        if total > MAX_GIT_CONFIG_BYTES:
+            raise WorkspaceError("Git operation intent limit exceeded")
+        parts.append(part)
+    digest = hashlib.sha256(
+        b"doonex-git-intent-v1\0" + kind.encode("ascii") + source.encode("ascii")
+    )
+    for part in parts:
+        digest.update(len(part).to_bytes(8, "big"))
+        digest.update(part)
+    return scope(intent_digest=digest.hexdigest(), repository_digest=source)
+
+
+def _controller_context(operation_context):
+    context = {} if operation_context is None else operation_context
+    if type(context) is not dict or set(context) - {
+        "run_id",
+        "project_id",
+        "parent_action_id",
+        "expected_run_owner",
+    }:
+        raise RegistryError("operation_context")
+    return dict(context)
+
+
+@contextmanager
+def _controller_group(repository, kind, deadline, *, intent=(), operation_context=None):
+    registry = current_registry()
+    context = _controller_context(operation_context)
+    operation = registry.reserve(
+        kind,
+        scope=_git_intent(repository, kind, intent),
+        deadline_monotonic_ns=int(deadline * 1_000_000_000),
+        cleanup_allowance_seconds=GIT_CLEANUP_TIMEOUT,
+        **context,
+    )
+    capability = operation.launch()
+    group = _GitControllerGroup(registry, operation, capability)
+    try:
+        yield group
+    except BaseException as error:
+        try:
+            group.finish(error)
+        except BaseException as registry_error:
+            raise registry_error from error
+        raise
+    else:
+        group.finish()
 
 
 def _check_git_deadline(deadline: float, outer_deadline: float | None) -> None:
@@ -133,7 +266,7 @@ def _allowed_path(name: str) -> None:
             raise WorkspaceError(f"Sensitive or management path is excluded: {name}")
 
 
-def _terminate_git(process: subprocess.Popen) -> None:
+def _terminate_git(process: subprocess.Popen, *, observed_eof=None) -> None:
     """Reap the child and observe both pipe EOFs, without a reader thread."""
     deadline = time.monotonic() + GIT_CLEANUP_TIMEOUT
     # Never signal a numeric process group after its leader has been reaped.
@@ -162,6 +295,8 @@ def _terminate_git(process: subprocess.Popen) -> None:
                 except BlockingIOError:
                     continue
                 if not chunk:
+                    if observed_eof is not None:
+                        observed_eof.add(key.fileobj)
                     selector.unregister(key.fileobj)
                     key.fileobj.close()
         try:
@@ -179,8 +314,14 @@ def _run_git_command(
     outer_deadline: float | None = None,
     input_bytes: bytes | None = None,
     consume: Callable[[bytes], None] | None = None,
+    controller: _GitControllerGroup | None = None,
 ) -> subprocess.CompletedProcess:
     """Read finite Git pipes under one deadline; callbacks consume bounded chunks."""
+    if controller is None:
+        raise RegistryError("capability_missing")
+    _check_git_deadline(deadline, outer_deadline)
+    permit = controller.before_process()
+    controller.check_live()
     _check_git_deadline(deadline, outer_deadline)
     process = subprocess.Popen(
         command,
@@ -195,6 +336,8 @@ def _run_git_command(
     stderr = bytearray()
     stdout_count = 0
     written = 0
+    observed_eof = set()
+    recorded = False
     try:
         with selectors.DefaultSelector() as selector:
             for source in (process.stdout, process.stderr):
@@ -233,6 +376,7 @@ def _run_git_command(
                     except BlockingIOError:
                         continue
                     if not chunk:
+                        observed_eof.add(key.fileobj)
                         selector.unregister(key.fileobj)
                         key.fileobj.close()
                         continue
@@ -251,14 +395,36 @@ def _run_git_command(
             _check_git_deadline(deadline, outer_deadline)
             process.wait(timeout=max(deadline - time.monotonic(), 0.001))
         _check_git_deadline(deadline, outer_deadline)
+        controller.after_process(
+            permit,
+            process,
+            pipe_eof=all(
+                source in observed_eof for source in (process.stdout, process.stderr)
+            ),
+        )
+        recorded = True
         return subprocess.CompletedProcess(
             command, process.returncode, bytes(stdout), bytes(stderr)
         )
     except BaseException as error:
         try:
-            _terminate_git(process)
+            _terminate_git(process, observed_eof=observed_eof)
         except (OSError, WorkspaceError) as cleanup_error:
-            raise WorkspaceProcessUnknown(process) from cleanup_error
+            eof = all(
+                source in observed_eof for source in (process.stdout, process.stderr)
+            )
+            if not recorded:
+                controller.after_process(permit, process, pipe_eof=eof)
+            raise WorkspaceProcessUnknown(process, pipe_eof=eof) from cleanup_error
+        if not recorded:
+            controller.after_process(
+                permit,
+                process,
+                pipe_eof=all(
+                    source in observed_eof
+                    for source in (process.stdout, process.stderr)
+                ),
+            )
         if isinstance(error, subprocess.TimeoutExpired):
             _check_deadline(outer_deadline)
             raise _GitLocalDeadlineExceeded(
@@ -277,6 +443,7 @@ def _git_config_names(
     *,
     deadline: float,
     outer_deadline: float | None = None,
+    controller: _GitControllerGroup | None = None,
 ) -> bytes:
     """Inspect effective keys, including includes, without printing their values."""
     try:
@@ -286,6 +453,7 @@ def _git_config_names(
             deadline=min(deadline, time.monotonic() + GIT_CONFIG_TIMEOUT),
             stdout_limit=MAX_GIT_CONFIG_BYTES,
             outer_deadline=outer_deadline,
+            controller=controller,
         )
     except _GitOutputLimitExceeded as error:
         raise WorkspaceError("Git configuration key limit exceeded") from error
@@ -297,7 +465,10 @@ def _git_config_names(
 
 
 def _git_context(
-    repository: Path, deadline: float, outer_deadline: float | None
+    repository: Path,
+    deadline: float,
+    outer_deadline: float | None,
+    controller: _GitControllerGroup | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     environment = os.environ.copy()
     for key in list(environment):
@@ -324,7 +495,11 @@ def _git_context(
         str(repository),
     ]
     names = _git_config_names(
-        command, environment, deadline=deadline, outer_deadline=outer_deadline
+        command,
+        environment,
+        deadline=deadline,
+        outer_deadline=outer_deadline,
+        controller=controller,
     ).split(b"\0")
     drivers = set()
     for name in names:
@@ -359,12 +534,23 @@ class _GitOperation:
     """One export uses one inspected configuration and one absolute deadline."""
 
     def __init__(
-        self, repository: Path, deadline: float, *, outer_deadline: float | None = None
+        self,
+        repository: Path,
+        deadline: float,
+        *,
+        outer_deadline: float | None = None,
+        controller: _GitControllerGroup | None = None,
     ):
         self.deadline = deadline
         self.outer_deadline = outer_deadline
+        if controller is None:
+            raise RegistryError("capability_missing")
+        self.controller = controller
         self.command, self.environment = _git_context(
-            repository, deadline, outer_deadline
+            repository,
+            deadline,
+            outer_deadline,
+            controller,
         )
 
     def check_deadline(self) -> None:
@@ -395,6 +581,7 @@ class _GitOperation:
             outer_deadline=self.outer_deadline,
             input_bytes=input_bytes,
             consume=consume,
+            controller=self.controller,
         )
         if check and result.returncode:
             raise WorkspaceError(
@@ -410,15 +597,27 @@ def _git(
     check: bool = True,
     deadline: float | None = None,
     stdout_limit: int = MAX_GIT_OUTPUT_BYTES,
+    operation_context: dict | None = None,
 ) -> subprocess.CompletedProcess:
     _check_deadline(deadline)
     local_deadline = time.monotonic() + GIT_OPERATION_TIMEOUT
     effective_deadline = (
         local_deadline if deadline is None else min(deadline, local_deadline)
     )
-    return _GitOperation(repository, effective_deadline, outer_deadline=deadline).run(
-        *arguments, check=check, stdout_limit=stdout_limit
-    )
+    repository = _repository_path(repository)
+    with _controller_group(
+        repository,
+        "git_api_read",
+        effective_deadline,
+        intent=arguments,
+        operation_context=operation_context,
+    ) as controller:
+        return _GitOperation(
+            repository,
+            effective_deadline,
+            outer_deadline=deadline,
+            controller=controller,
+        ).run(*arguments, check=check, stdout_limit=stdout_limit)
 
 
 def _repository_path(repository: Path) -> Path:
@@ -445,17 +644,33 @@ def _validate_root(repository: Path, operation: _GitOperation) -> Path:
     return root
 
 
-def validate_repository(repository: Path, *, deadline: float | None = None) -> Path:
+def validate_repository(
+    repository: Path,
+    *,
+    deadline: float | None = None,
+    operation_context: dict | None = None,
+) -> Path:
     _check_deadline(deadline)
     local_deadline = time.monotonic() + GIT_OPERATION_TIMEOUT
     effective_deadline = (
         local_deadline if deadline is None else min(deadline, local_deadline)
     )
     repository = _repository_path(repository)
-    return _validate_root(
+    with _controller_group(
         repository,
-        _GitOperation(repository, effective_deadline, outer_deadline=deadline),
-    )
+        "git_validate",
+        effective_deadline,
+        operation_context=operation_context,
+    ) as controller:
+        return _validate_root(
+            repository,
+            _GitOperation(
+                repository,
+                effective_deadline,
+                outer_deadline=deadline,
+                controller=controller,
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -812,6 +1027,7 @@ class Workspace:
     base_commit: str | None = None
     baseline_path: Path | None = None
     baseline_digest: str | None = None
+    operation_context: dict | None = None
 
     @classmethod
     def create(
@@ -822,21 +1038,37 @@ class Workspace:
         *,
         baseline_path: Path | None = None,
         deadline: float | None = None,
+        operation_context: dict | None = None,
     ) -> Workspace:
         _check_deadline(deadline)
         local_deadline = time.monotonic() + GIT_OPERATION_TIMEOUT
         effective_deadline = (
             local_deadline if deadline is None else min(deadline, local_deadline)
         )
+        operation_context = (
+            _controller_context(operation_context)
+            if operation_context is not None
+            else None
+        )
         try:
-            return cls._create(
+            repository = _repository_path(repository)
+            with _controller_group(
                 repository,
-                commit,
-                destination,
-                baseline_path=baseline_path,
-                deadline=effective_deadline,
-                outer_deadline=deadline,
-            )
+                "git_export",
+                effective_deadline,
+                intent=(commit,),
+                operation_context=operation_context,
+            ) as controller:
+                return cls._create(
+                    repository,
+                    commit,
+                    destination,
+                    baseline_path=baseline_path,
+                    deadline=effective_deadline,
+                    outer_deadline=deadline,
+                    controller=controller,
+                    operation_context=operation_context,
+                )
         except ExecutionDeadlineExceeded:
             _check_deadline(deadline)
             # A larger outer allowance never widens the export's local limit.
@@ -854,10 +1086,14 @@ class Workspace:
         baseline_path: Path | None,
         deadline: float,
         outer_deadline: float | None,
+        controller: _GitControllerGroup | None = None,
+        operation_context: dict | None = None,
     ) -> Workspace:
         _check_deadline(deadline)
         repository = _repository_path(repository)
-        operation = _GitOperation(repository, deadline, outer_deadline=outer_deadline)
+        operation = _GitOperation(
+            repository, deadline, outer_deadline=outer_deadline, controller=controller
+        )
         repository = _validate_root(repository, operation)
         if (
             not isinstance(commit, str)
@@ -926,9 +1162,12 @@ class Workspace:
             resolved,
             baseline_path,
             baseline_digest,
+            dict(operation_context) if operation_context is not None else None,
         )
 
-    def base_files(self, *, deadline: float | None = None) -> dict[str, FileContent]:
+    def base_files(
+        self, *, deadline: float | None = None, operation_context: dict | None = None
+    ) -> dict[str, FileContent]:
         """Read a database-bound initial copy, with a legacy M1 export fallback."""
         if self.baseline_path is not None or self.baseline_digest is not None:
             if self.baseline_path is None or not self.baseline_digest:
@@ -950,12 +1189,22 @@ class Workspace:
                 self.base_commit,
                 Path(temporary) / "baseline",
                 deadline=deadline,
+                operation_context=self.operation_context
+                if operation_context is None
+                else operation_context,
             )
             return read_files(exported.path, deadline=deadline)
 
     @staticmethod
-    def validate_repository(path: Path, *, deadline: float | None = None) -> Path:
-        return validate_repository(path, deadline=deadline)
+    def validate_repository(
+        path: Path,
+        *,
+        deadline: float | None = None,
+        operation_context: dict | None = None,
+    ) -> Path:
+        return validate_repository(
+            path, deadline=deadline, operation_context=operation_context
+        )
 
     @staticmethod
     def scan(path: Path, *, deadline: float | None = None) -> list[dict]:
