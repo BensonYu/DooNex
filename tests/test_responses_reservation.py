@@ -265,7 +265,8 @@ def test_actual_parent_sigkill_at_reserve_boundary_and_strict_human_recovery(
     # No task container was created by this pre-register fixture. Exercise the
     # real model-action reconcile while the irrelevant container probe is empty.
     monkeypatch.setattr(
-        "doonex.worker.stop_containers", lambda *args: {"remaining": [], "errors": []}
+        "doonex.worker.stop_containers",
+        lambda *args, **kwargs: {"remaining": [], "errors": []},
     )
     with pytest.raises(RuntimeError, match="模型传输进程"):
         Worker(settings).run(once=True)

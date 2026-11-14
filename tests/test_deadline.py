@@ -1,7 +1,6 @@
 import math
 
 import pytest
-
 from doonex.deadline import (
     ExecutionDeadlineExceeded,
     check_deadline,

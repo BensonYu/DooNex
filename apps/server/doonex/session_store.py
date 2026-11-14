@@ -126,19 +126,22 @@ def check_source(value, *, max_bytes=16 * MIB, check=lambda: None):
     walk(value)
 
 
-def canonical_sha256(value, *, limit=128 * MIB):
+def canonical_sha256(value, *, limit=128 * MIB, check=lambda: None):
     """Same canonical bytes as before, hashed without a second whole JSON copy."""
     import hashlib
 
     digest, size = hashlib.sha256(), 0
+    check()
     for chunk in json.JSONEncoder(
         sort_keys=True, ensure_ascii=True, separators=(",", ":")
     ).iterencode(value):
+        check()
         encoded = chunk.encode("utf-8")
         size += len(encoded)
         if size > limit:
             raise SessionStorageError("Session canonical capacity exceeded")
         digest.update(encoded)
+    check()
     return digest.hexdigest()
 
 
@@ -158,6 +161,7 @@ class SessionFileStore(FileStore):
         self.root = str(root)
         self.limits, self.deadline = limits, deadline
         self._failure = None
+        self._failure_cause = None
         self._fd = None
         self._files, self._dirs = {}, {}
         self._total = 0
@@ -171,15 +175,20 @@ class SessionFileStore(FileStore):
             self.close()
             raise
 
-    def _fail(self, reason):
-        self._failure = self._failure or reason
-        raise SessionStorageError(self._failure) from None
+    def _fail(self, reason, *, cause=None):
+        if self._failure is None:
+            self._failure, self._failure_cause = reason, cause
+        raise SessionStorageError(self._failure) from self._failure_cause
 
     def check_ok(self):
         if self._failure is not None:
-            raise SessionStorageError(self._failure)
-        if self.deadline is not None and time.monotonic() >= self.deadline:
-            self._fail("Session persistence deadline exceeded")
+            raise SessionStorageError(self._failure) from self._failure_cause
+        from doonex.deadline import ExecutionDeadlineExceeded, check_deadline
+
+        try:
+            check_deadline(self.deadline)
+        except ExecutionDeadlineExceeded as error:
+            self._fail("Session persistence deadline exceeded", cause=error)
 
     def validate_source(self, value, *, max_bytes=16 * MIB):
         with self._operation():
@@ -622,6 +631,7 @@ class SessionFileStore(FileStore):
                                 - time.monotonic()
                             )
                             if remaining <= 0:
+                                self.check_ok()
                                 self._fail("Session lock deadline exceeded")
                             time.sleep(min(remaining, 0.01))
                     yield

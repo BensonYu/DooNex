@@ -1,7 +1,6 @@
 """Authenticated loopback API. Only the worker dispatches model and tool work."""
 
 import hmac
-import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -473,9 +472,12 @@ def create_app(settings=None):
 
         run = load_run(run_id)
         directory = run_directory(settings, run["id"])
-        from doonex.cleanup import controller_process_unknown
+        from doonex.cleanup import (
+            controller_cleanup_unknown,
+            controller_process_unknown,
+        )
 
-        controller_blocked = controller_process_unknown(run.get("recovery"))
+        controller_blocked = controller_cleanup_unknown(run.get("recovery"))
         workspace_ok = not run["first_started_at"]
         notes = []
         try:
@@ -505,30 +507,25 @@ def create_app(settings=None):
             except (ValueError, OSError, KeyError):
                 workspace_ok = False
                 notes.append("生成来源、工具策略或完整父基线校验失败")
-        # Read-only container reconciliation; no code is started by this route.
-        result = subprocess.run(
-            [
-                "docker",
-                "ps",
-                "--filter",
-                "label=doonex.run_id=" + run["id"],
-                "--format",
-                "{{.ID}}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-        if result.returncode:
-            raise ValueError("无法核查 Docker 状态，禁止恢复")
+        # Inspect containers without starting task code. Probe failures are
+        # evidence: a failed CLI cannot be treated as a complete empty listing.
+        from doonex.sandbox import Sandbox, SandboxError
+        from doonex.worker import record_probe_failure
+
+        try:
+            containers = Sandbox().containers(run["id"])
+        except SandboxError as error:
+            record_probe_failure(store, run["id"], error)
+            raise ValueError("无法核查 Docker 状态，禁止恢复") from error
         pending = store.pending(run["id"])
         from doonex.responses_registry import helper_fenced
 
         with store.connect() as connection:
             transport_blocked = helper_fenced(connection)
         if transport_blocked:
-            notes.append("存在未核查的模型传输进程；请先在模型设置中打开模型传输恢复核查。")
+            notes.append(
+                "存在未核查的模型传输进程；请先在模型设置中打开模型传输恢复核查。"
+            )
         if pending:
             notes.append(
                 "存在未决动作；未知模型用量保留预留额度。请核对现有文件再确认续接。"
@@ -536,12 +533,15 @@ def create_app(settings=None):
         if controller_blocked:
             notes.append("本机控制进程或输出管道终态未核实；空容器列表不能解除此阻止。")
         return {
-            "containers": result.stdout.split(),
+            "containers": containers,
             "pending_actions": pending,
             "workspace_ok": workspace_ok,
             "notes": notes,
             "transport_blocked": transport_blocked,
-            "controller_process_blocked": controller_blocked,
+            "controller_process_blocked": controller_process_unknown(
+                run.get("recovery")
+            ),
+            "controller_cleanup_blocked": controller_blocked,
         }
 
     @app.post("/api/runs/{run_id}/resume", dependencies=auth)
@@ -554,8 +554,10 @@ def create_app(settings=None):
         if run["state"] not in {"paused", "interrupted"}:
             raise ValueError("仅暂停或中断的运行可以续接")
         report = recovery(run_id)
-        if report["controller_process_blocked"]:
-            raise ValueError("本机控制进程尚未完成独立核查；普通续接不能解除阻止")
+        if report["controller_cleanup_blocked"]:
+            raise ValueError(
+                "控制进程或 Docker 请求尚未完成独立核查；普通续接不能解除阻止"
+            )
         if report["containers"] or not report["workspace_ok"]:
             raise ValueError("工作区或在途容器尚未完成核查")
         uncertain = bool(report["pending_actions"]) or run["state"] == "interrupted"
@@ -578,10 +580,12 @@ def create_app(settings=None):
 
             if helper_fenced(c):
                 raise ValueError("模型传输进程尚未完成独立核查；普通续接不能解除阻止")
-            from doonex.cleanup import controller_process_unknown
+            from doonex.cleanup import controller_cleanup_unknown
 
-            if controller_process_unknown(current.get("recovery")):
-                raise ValueError("本机控制进程尚未完成独立核查；普通续接不能解除阻止")
+            if controller_cleanup_unknown(current.get("recovery")):
+                raise ValueError(
+                    "控制进程或 Docker 请求尚未完成独立核查；普通续接不能解除阻止"
+                )
             if reset_session:
                 current["session_generation"] = current.get("session_generation", 0) + 1
                 current["resume_session"] = False

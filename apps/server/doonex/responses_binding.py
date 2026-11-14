@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from doonex.budget import elapsed
+from doonex.deadline import remaining_time
 from doonex.responses_adapter import HelperReportedError
 from doonex.responses_process import (
     HelperAttempt,
@@ -35,11 +36,13 @@ class ResponsesBinding:
         check_dispatch,
         model,
         api_key,
+        execution_deadline=None,
     ):
         self.settings, self.store = settings, store
         self.run_id, self.owner, self.check_owner = run_id, owner, check_owner
         self.check_dispatch = check_dispatch
         self.model, self.api_key = dict(model), api_key
+        self.execution_deadline = execution_deadline
         self._entered: set[str] = set()
 
     def prepare_intent(self, client_request_id):
@@ -58,9 +61,14 @@ class ResponsesBinding:
             self.model["timeout_seconds"],
             run["request"]["budget"]["max_seconds"] - elapsed(run),
         )
+        if self.execution_deadline is not None:
+            remaining = min(remaining, remaining_time(self.execution_deadline))
         if remaining <= 0:
             raise ValueError("Responses request has no remaining time")
         observed = time.monotonic_ns()
+        deadline = observed + int(remaining * 1_000_000_000)
+        if self.execution_deadline is not None:
+            deadline = min(deadline, int(self.execution_deadline * 1_000_000_000))
         return HelperAttempt(
             str(uuid4()),
             client_request_id,
@@ -70,7 +78,7 @@ class ResponsesBinding:
             _PARENT_BOOT_ID,
             datetime.now(UTC).isoformat(),
             lease.expected_identity,
-            observed + int(remaining * 1_000_000_000),
+            deadline,
         )
 
     def _registry(self, reservation):
@@ -152,12 +160,16 @@ class ResponsesBinding:
             remaining = min(
                 call["timeout"], run["request"]["budget"]["max_seconds"] - elapsed(run)
             )
+            if self.execution_deadline is not None:
+                remaining = min(remaining, remaining_time(self.execution_deadline))
             if remaining <= 0:
                 raise ValueError("Responses request has no remaining time")
             deadline = min(
                 attempt.deadline_monotonic_ns,
                 time.monotonic_ns() + int(remaining * 1_000_000_000),
             )
+            if self.execution_deadline is not None:
+                deadline = min(deadline, int(self.execution_deadline * 1_000_000_000))
             lease = LeaseSpec(
                 self.settings.home / "responses-helper" / "lifetime.lease",
                 attempt.lease_identity,

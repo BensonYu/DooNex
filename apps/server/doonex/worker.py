@@ -8,6 +8,7 @@ from uuid import uuid4
 from doonex.budget import Halt, Ledger, elapsed, guard
 from doonex.cleanup import merge_cleanup
 from doonex.config import Settings, redact
+from doonex.deadline import ExecutionDeadlineExceeded, check_deadline, remaining_time
 from doonex.models import model_for_role, run_roles
 from doonex.store import OwnershipLost, Store, now
 
@@ -55,6 +56,17 @@ def check_sandbox_cleanup(result):
         error.cleanup_unknown = bool(result.get("cleanup_unknown"))
         error.cleanup_evidence = result.get("cleanup_evidence") or {}
         raise error
+
+
+def record_probe_failure(store, run_id, error):
+    """A read-only Docker probe may itself leave a local process unresolved."""
+    with store.locked(run_id) as (c, current):
+        current["recovery"] = merge_cleanup(
+            {"remaining": ["unknown"], "stopped": [], "errors": [type(error).__name__]},
+            previous=current.get("recovery"),
+            error=error,
+        )
+        store.event(run_id, "container_probe_failed", current["recovery"], c)
 
 
 def get_workspace(run, directory):
@@ -204,8 +216,28 @@ class Worker:
                 current.update(state="running", owner=self.owner, reason="Agent 执行中")
                 if current["first_started_at"] is None:
                     current["first_started_at"] = now()
+                execution_deadline = time.monotonic() + max(
+                    0, request["budget"]["max_seconds"] - elapsed(current)
+                )
                 self.store.event(run_id, "running", {}, c)
-            self.fence()
+
+            def execution_fence():
+                self.fence()
+                check_deadline(execution_deadline)
+
+            def remaining_execution():
+                nonlocal execution_deadline
+                # Persisted wall time remains the cross-restart authority. A
+                # backwards clock step cannot extend this process's allowance.
+                current = self.store.get(run_id)
+                execution_deadline = min(
+                    execution_deadline,
+                    time.monotonic()
+                    + max(0, request["budget"]["max_seconds"] - elapsed(current)),
+                )
+                return remaining_time(execution_deadline)
+
+            execution_fence()
             if generation_service:
                 generation_service.validate_run(self.store.get(run_id), directory)
             if not all(role_keys.values()):
@@ -254,16 +286,27 @@ class Worker:
                     from doonex.workspace import manifest, manifest_digest, write_files
 
                     files = read_files(
-                        task_context.source_path, exclude_generated=False
+                        task_context.source_path,
+                        exclude_generated=False,
+                        deadline=execution_deadline,
                     )
-                    baseline_digest = manifest_digest(manifest(files))
+                    baseline_digest = manifest_digest(
+                        manifest(files, deadline=execution_deadline),
+                        deadline=execution_deadline,
+                    )
                     for target in (directory / "baseline", directory / "workspace"):
                         if target.exists():
-                            if Workspace.snapshot_digest(target) != baseline_digest:
+                            if (
+                                Workspace.snapshot_digest(
+                                    target, deadline=execution_deadline
+                                )
+                                != baseline_digest
+                            ):
                                 raise ValueError("不完整的起始快照已变化，不能自动覆盖")
                         else:
-                            write_files(files, target)
+                            write_files(files, target, deadline=execution_deadline)
                             for relative in task_context.metadata["source_directories"]:
+                                check_deadline(execution_deadline)
                                 (target / relative).mkdir(
                                     mode=0o700, parents=True, exist_ok=True
                                 )
@@ -280,20 +323,27 @@ class Worker:
                         request["base_commit"],
                         directory / "workspace",
                         baseline_path=directory / "baseline",
+                        deadline=execution_deadline,
                     )
+                checkpoint_digest = (
+                    Workspace.execution_digest(
+                        workspace.path, deadline=execution_deadline
+                    )
+                    if arena
+                    else None
+                )
                 with self.store.locked(run_id, self.owner) as (_, current):
                     current["baseline_digest"] = workspace.baseline_digest
                     if arena:
-                        current["workspace_checkpoint_digest"] = (
-                            Workspace.execution_digest(workspace.path)
-                        )
+                        current["workspace_checkpoint_digest"] = checkpoint_digest
             else:
                 workspace = get_workspace(self.store.get(run_id), directory)
-                Workspace.scan(workspace.path)
+                Workspace.scan(workspace.path, deadline=execution_deadline)
                 if run.get("assignments") and workspace.baseline_digest is None:
                     raise ValueError("持久化基线尚未绑定，须核对后重新创建任务")
 
             def execute_role(role, shell_path, *, read_only=False):
+                remaining_execution()
                 selected_model = model_for_role(request, role)
                 with self.store.locked(run_id, self.owner) as (c, current):
                     guard(current)
@@ -323,7 +373,10 @@ class Worker:
                     self.store,
                     run_id,
                     self.owner,
-                    dispatch_check=self.scheduler.preflight,
+                    dispatch_check=lambda c, current: (
+                        check_deadline(execution_deadline),
+                        self.scheduler.preflight(c, current),
+                    ),
                 )
                 attribution = ledger.attribution()
                 responses_transport = None
@@ -336,12 +389,14 @@ class Worker:
                         run_id=run_id,
                         owner=self.owner,
                         check_owner=self.lease,
-                        check_dispatch=self.fence,
+                        check_dispatch=execution_fence,
                         model=selected_model,
                         api_key=role_keys[role],
+                        execution_deadline=execution_deadline,
                     )
 
                 def role_stop():
+                    check_deadline(execution_deadline)
                     if self.stop_requested(run_id):
                         return True
                     current = self.store.get(run_id)
@@ -371,7 +426,7 @@ class Worker:
                 def before_model(
                     input_tokens, output_tokens, *, responses_request_id=None
                 ):
-                    self.fence()
+                    execution_fence()
                     if role_stop():
                         raise Halt("运行或角色已停止派发新动作")
                     intent = None
@@ -398,7 +453,7 @@ class Worker:
                     try:
                         if generation_service:
                             raise PermissionViolation("候选生成没有 shell 工具权限")
-                        self.fence()
+                        execution_fence()
                         if role_stop():
                             raise Halt("运行或角色已停止派发新动作")
                         # These references have no legitimate model-tool purpose.
@@ -432,11 +487,7 @@ class Worker:
                         action_id = ledger.tool_intent(
                             command, action_identity=action_identity
                         )
-                        remaining = max(
-                            0.1,
-                            request["budget"]["max_seconds"]
-                            - elapsed(self.store.get(run_id)),
-                        )
+                        remaining = remaining_execution()
                         options = {"read_only": True} if read_only else {}
                         if role == "executor" and skill_context:
                             fresh_skill = library.skill_context(request["skill"])
@@ -447,6 +498,7 @@ class Worker:
                             min(60, remaining),
                             run_id,
                             should_stop=role_stop,
+                            deadline=execution_deadline,
                             **options,
                         )
                         result = redact(result, secrets)
@@ -461,11 +513,13 @@ class Worker:
                                     "审查工具结束时交接材料或代码快照发生变化"
                                 )
                         else:
-                            Workspace.scan(shell_path)
+                            Workspace.scan(shell_path, deadline=execution_deadline)
                             if skill_context:
                                 library.skill_context(request["skill"])
                         checkpoint_digest = (
-                            Workspace.execution_digest(workspace.path)
+                            Workspace.execution_digest(
+                                workspace.path, deadline=execution_deadline
+                            )
                             if arena and not read_only
                             else None
                         )
@@ -578,10 +632,7 @@ class Worker:
                             1,
                             min(
                                 selected_model["timeout_seconds"],
-                                int(
-                                    request["budget"]["max_seconds"]
-                                    - elapsed(self.store.get(run_id))
-                                ),
+                                int(remaining_execution()),
                             ),
                         ),
                     },
@@ -591,6 +642,7 @@ class Worker:
                     shell=shell,
                     on_event=lambda payload: role_event("sdk", payload),
                     should_stop=role_stop,
+                    persistence_deadline=execution_deadline,
                     **(
                         {"responses_transport": responses_transport}
                         if responses_transport is not None
@@ -781,7 +833,7 @@ class Worker:
                 self.store.event(run_id, "verifying", {}, c)
 
             def verify_stop():
-                self.fence()
+                execution_fence()
                 current = self.store.get(run_id)
                 return (
                     current["state"] != "verifying"
@@ -792,7 +844,7 @@ class Worker:
                     )
                 )
 
-            remaining = max(0.1, request["budget"]["max_seconds"] - elapsed(current))
+            remaining = remaining_execution()
             evidence_path = directory / "evidence"
             saved_generation_evidence = None
             if generation_service and run.get("evidence"):
@@ -835,6 +887,7 @@ class Worker:
                                 raise Halt("验证已经停止")
                             if elapsed(current) >= request["budget"]["max_seconds"]:
                                 raise Halt("原运行时长已达上限")
+                            check_deadline(execution_deadline)
                             from doonex.budget import _locked_batch
                             from doonex.store import execution_fenced
 
@@ -867,6 +920,7 @@ class Worker:
                         self.scheduler.save_yield(run_id, self.owner, None, workspace)
                         raise Yielded() from None
                     try:
+                        kwargs["deadline"] = execution_deadline
                         result = sandbox.run(*args, **kwargs)
                         check_sandbox_cleanup(result)
                         self.lease()
@@ -1053,6 +1107,11 @@ class Worker:
                     )
                 elif exception_cause(exc, Halt):
                     state, reason = "budget_exceeded", str(exception_cause(exc, Halt))
+                elif exception_cause(exc, ExecutionDeadlineExceeded):
+                    state, reason = (
+                        "budget_exceeded",
+                        str(exception_cause(exc, ExecutionDeadlineExceeded)),
+                    )
                 elif isinstance(exc, (KeyboardInterrupt, SystemExit)) or self.stopping:
                     state = "interrupted"
                 else:

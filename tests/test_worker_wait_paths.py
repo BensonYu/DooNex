@@ -39,7 +39,7 @@ def test_stop_commits_while_shell_checkpoint_is_computed(
     original_digest = Workspace.execution_digest
     changed = []
 
-    def digest(workspace):
+    def digest(workspace, **kwargs):
         if (workspace / "digest-ready").exists() and not changed:
             # A second connection must acquire the Run while the scan is active.
             # The old lock-held scan times out here instead of accepting stop.
@@ -55,7 +55,7 @@ def test_stop_commits_while_shell_checkpoint_is_computed(
                     (current["state"], Jsonb(current), run_id),
                 )
             changed.append(True)
-        return original_digest(workspace)
+        return original_digest(workspace, **kwargs)
 
     monkeypatch.setattr(Workspace, "execution_digest", staticmethod(digest))
     calls = scripted_model(
@@ -77,12 +77,12 @@ def test_shell_checkpoint_failure_keeps_action_unknown(evaluation, store, monkey
     original_digest = Workspace.execution_digest
     prior = []
 
-    def digest(workspace):
+    def digest(workspace, **kwargs):
         if (workspace / "digest-ready").exists():
             prior.append(store.get(run_id)["workspace_checkpoint_digest"])
             assert shell_actions(store, run_id)[0]["status"] == "pending"
             raise WorkspaceError("Synthetic checkpoint scan failure")
-        return original_digest(workspace)
+        return original_digest(workspace, **kwargs)
 
     monkeypatch.setattr(Workspace, "execution_digest", staticmethod(digest))
     calls = scripted_model(monkeypatch, ["touch digest-ready"])
@@ -112,10 +112,10 @@ def test_unknown_shell_stops_remaining_tools_and_finish_in_same_response(
     settings, _, _, run_id = evaluation
     original_digest = Workspace.execution_digest
 
-    def digest(workspace):
+    def digest(workspace, **kwargs):
         if (workspace / "digest-ready").exists():
             raise WorkspaceError("Synthetic checkpoint scan failure")
-        return original_digest(workspace)
+        return original_digest(workspace, **kwargs)
 
     monkeypatch.setattr(Workspace, "execution_digest", staticmethod(digest))
     answer = response("doonex_shell", {"command": "touch digest-ready"}, 0)
@@ -205,11 +205,11 @@ def test_shell_recovery_record_failure_cannot_become_sdk_tool_error(
     original_finish, original_lease = Store.finish_action, Worker.lease
     failed_scan, injected = [], []
 
-    def digest(workspace):
+    def digest(workspace, **kwargs):
         if (workspace / "digest-ready").exists():
             failed_scan.append(True)
             raise WorkspaceError("Synthetic checkpoint scan failure")
-        return original_digest(workspace)
+        return original_digest(workspace, **kwargs)
 
     def finish(current_store, action_id, status, *args, **kwargs):
         if failure == "unknown_record" and status == "unknown" and not injected:
@@ -281,7 +281,7 @@ def test_owner_change_during_checkpoint_prevents_old_worker_completion(
     replacement = str(uuid4())
     prior = []
 
-    def digest(workspace):
+    def digest(workspace, **kwargs):
         if (workspace / "digest-ready").exists() and not prior:
             with store.connect() as c:
                 c.execute("SET LOCAL lock_timeout='200ms'")
@@ -293,7 +293,7 @@ def test_owner_change_during_checkpoint_prevents_old_worker_completion(
                 c.execute(
                     "UPDATE runs SET data=%s WHERE id=%s", (Jsonb(current), run_id)
                 )
-        return original_digest(workspace)
+        return original_digest(workspace, **kwargs)
 
     monkeypatch.setattr(Workspace, "execution_digest", staticmethod(digest))
     calls = scripted_model(monkeypatch, ["touch digest-ready"])

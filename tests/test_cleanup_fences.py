@@ -4,7 +4,13 @@ from copy import deepcopy
 
 import pytest
 from doonex.api import create_app
-from doonex.cleanup import PROCESS_UNKNOWN, controller_process_unknown, merge_cleanup
+from doonex.cleanup import (
+    DAEMON_UNKNOWN,
+    PROCESS_UNKNOWN,
+    controller_cleanup_unknown,
+    controller_process_unknown,
+    merge_cleanup,
+)
 from doonex.sandbox import Sandbox, SandboxError
 from doonex.scheduling import Scheduler
 from doonex.store import execution_fenced, now
@@ -29,10 +35,18 @@ def receipt(*, local_unknown=True):
     }
 
 
-def unknown_error():
+def unknown_error(*, daemon=False):
     error = SandboxError("Synthetic local process uncertainty")
     error.cleanup_unknown = True
     error.cleanup_evidence = receipt()
+    if daemon:
+        error.cleanup_evidence.update(
+            container_absence_confirmed=False,
+            container_snapshot_absence_confirmed=True,
+            local_process_unknown=False,
+            daemon_request_unknown=True,
+        )
+        error.cleanup_evidence["processes"][0].update(reaped=True, pipe_eof=True)
     return error
 
 
@@ -57,9 +71,7 @@ def test_latch_survives_wrapped_error_then_repeated_empty_cleanup():
 
 def test_proven_empty_docker_cannot_clear_returned_local_unknown():
     with pytest.raises(SandboxError) as raised:
-        check_sandbox_cleanup(
-            {"cleanup_unknown": True, "cleanup_evidence": receipt()}
-        )
+        check_sandbox_cleanup({"cleanup_unknown": True, "cleanup_evidence": receipt()})
     sandbox = type("SafeDocker", (), {"stop_run": staticmethod(empty_cleanup)})()
     result = stop_containers(sandbox, "unused", error=raised.value)
     assert result["remaining"] == []
@@ -100,18 +112,24 @@ def test_latest_completed_cleanup_proof_is_not_replaced_by_prior_unknown():
 
 
 @pytest.mark.postgres
+@pytest.mark.parametrize("daemon", [False, True])
 def test_worker_records_observed_unknown_and_restart_cannot_erase_it(
-    settings, store, request_data, tmp_path, monkeypatch
+    settings, store, request_data, tmp_path, monkeypatch, daemon
 ):
     run, _, _ = prepare_run(store, settings, request_data, tmp_path)
     monkeypatch.setattr(Sandbox, "stop_run", empty_cleanup)
-    monkeypatch.setattr(Sandbox, "run", lambda *_a, **_k: (_ for _ in ()).throw(unknown_error()))
+    monkeypatch.setattr(
+        Sandbox,
+        "run",
+        lambda *_a, **_k: (_ for _ in ()).throw(unknown_error(daemon=daemon)),
+    )
     calls = scripted_model(monkeypatch, ["touch must-stop"])
     worker = Worker(settings)
     worker.run(once=True)
     final = store.get(run["id"])
     assert final["state"] == "interrupted"
-    assert controller_process_unknown(final["recovery"])
+    assert controller_cleanup_unknown(final["recovery"])
+    assert controller_process_unknown(final["recovery"]) is not daemon
     assert len(calls) == 1 and len(store.pending(run["id"])) == 1
     before = deepcopy(final)
     with pytest.raises(RuntimeError, match="终止状态不明"):
@@ -126,21 +144,16 @@ def test_worker_records_observed_unknown_and_restart_cannot_erase_it(
 
 @pytest.mark.postgres
 @pytest.mark.parametrize("action", ["pause", "cancel", "resume"])
+@pytest.mark.parametrize("daemon", [False, True])
 def test_ordinary_api_control_cannot_clear_local_fence(
-    settings, store, request_data, tmp_path, monkeypatch, action
+    settings, store, request_data, tmp_path, monkeypatch, action, daemon
 ):
     run, _, _ = prepare_run(store, settings, request_data, tmp_path)
-    recovery = merge_cleanup(empty_cleanup(), error=unknown_error())
+    recovery = merge_cleanup(empty_cleanup(), error=unknown_error(daemon=daemon))
     with store.locked(run["id"]) as (_, current):
         current.update(state="interrupted", first_started_at=now(), recovery=recovery)
     monkeypatch.setattr(Sandbox, "stop_run", empty_cleanup)
     monkeypatch.setattr(Sandbox, "containers", lambda *_a, **_k: [])
-    # The recovery route currently still uses its legacy Docker read. It is a
-    # read-only stub here; component coverage exercises the actual bounded CLI.
-    monkeypatch.setattr(
-        "doonex.api.subprocess.run",
-        lambda *_a, **_k: type("DockerResult", (), {"returncode": 0, "stdout": ""})(),
-    )
     with TestClient(create_app(settings)) as client:
         client.headers["Authorization"] = "Bearer " + settings.token
         response = client.post(
@@ -156,11 +169,12 @@ def test_ordinary_api_control_cannot_clear_local_fence(
 
 
 @pytest.mark.postgres
+@pytest.mark.parametrize("daemon", [False, True])
 def test_arena_acknowledgment_cannot_clear_local_process_fence(
-    evaluation, store, monkeypatch
+    evaluation, store, monkeypatch, daemon
 ):
     _, arena, batch, run_id = evaluation
-    recovery = merge_cleanup(empty_cleanup(), error=unknown_error())
+    recovery = merge_cleanup(empty_cleanup(), error=unknown_error(daemon=daemon))
     with store.locked(run_id) as (_, current):
         current.update(state="interrupted", first_started_at=now(), recovery=recovery)
     batch.update(state="interrupted", first_started_at=now())
@@ -174,6 +188,73 @@ def test_arena_acknowledgment_cannot_clear_local_process_fence(
         arena.resume(batch["id"], True)
     assert store.get(run_id)["recovery"] == recovery
     assert store.get(run_id)["state"] == "interrupted"
+    with store.connect() as c:
+        assert execution_fenced(c)
+
+
+def test_create_daemon_uncertainty_survives_empty_ps_and_reaped_cli():
+    error = unknown_error()
+    evidence = receipt(local_unknown=False)
+    evidence.update(container_absence_confirmed=False, daemon_request_unknown=True)
+    evidence["processes"][0].update(reaped=True, pipe_eof=True)
+    error.cleanup_evidence = evidence
+    result = merge_cleanup(empty_cleanup(), error=error)
+    for _ in range(3):
+        result = merge_cleanup(empty_cleanup(), previous=result)
+    assert not controller_process_unknown(result)
+    assert controller_cleanup_unknown(result)
+    assert result[DAEMON_UNKNOWN] is True and DAEMON_UNKNOWN in result["errors"]
+    assert result["cleanup_evidence"] == evidence
+
+
+@pytest.mark.parametrize("marker", [PROCESS_UNKNOWN, DAEMON_UNKNOWN])
+def test_missing_receipt_cannot_clear_a_persisted_marker(marker):
+    prior = {"errors": [marker], marker: True}
+    result = merge_cleanup(empty_cleanup(), previous=prior)
+    assert result[marker] is True and marker in result["errors"]
+    assert controller_cleanup_unknown(result)
+
+
+@pytest.mark.postgres
+def test_api_failed_probe_records_its_new_process_evidence(
+    settings, store, request_data, tmp_path, monkeypatch
+):
+    run, _, _ = prepare_run(store, settings, request_data, tmp_path)
+
+    def probe(*_args, **_kwargs):
+        raise unknown_error()
+
+    monkeypatch.setattr(Sandbox, "containers", probe)
+    with TestClient(create_app(settings)) as client:
+        client.headers["Authorization"] = "Bearer " + settings.token
+        response = client.get(f"/api/runs/{run['id']}/recovery")
+    assert response.status_code == 400
+    assert controller_process_unknown(store.get(run["id"])["recovery"])
+    with store.connect() as c:
+        assert execution_fenced(c)
+
+
+@pytest.mark.postgres
+def test_arena_failed_probe_records_its_new_process_evidence(
+    evaluation, store, monkeypatch
+):
+    _, arena, batch, run_id = evaluation
+    with store.locked(run_id) as (_, current):
+        current.update(state="interrupted", first_started_at=now())
+    batch.update(state="interrupted", first_started_at=now())
+    with store.connect() as c:
+        c.execute(
+            "UPDATE arena_evaluations SET state=%s,data=%s WHERE id=%s",
+            (batch["state"], Jsonb(batch), batch["id"]),
+        )
+
+    def probe(*_args, **_kwargs):
+        raise unknown_error()
+
+    monkeypatch.setattr(Sandbox, "containers", probe)
+    with pytest.raises(ValueError, match="无法核查"):
+        arena.resume(batch["id"], True)
+    assert controller_process_unknown(store.get(run_id)["recovery"])
     with store.connect() as c:
         assert execution_fenced(c)
 

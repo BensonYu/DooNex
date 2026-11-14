@@ -487,10 +487,10 @@ class Arena:
                     )
 
     def resume(self, identifier, acknowledge_unknown):
-        from doonex.cleanup import controller_process_unknown
+        from doonex.cleanup import controller_cleanup_unknown
         from doonex.responses_registry import helper_fenced
-        from doonex.sandbox import Sandbox
-        from doonex.worker import get_workspace, run_directory
+        from doonex.sandbox import Sandbox, SandboxError
+        from doonex.worker import get_workspace, record_probe_failure, run_directory
 
         with self.store.connect() as connection:
             if helper_fenced(connection):
@@ -507,10 +507,17 @@ class Arena:
         assistance = {}
         for run in children:
             if run["state"] in {"paused", "interrupted"}:
-                if controller_process_unknown(run.get("recovery")):
-                    raise ValueError("本机控制进程尚未完成独立核查；禁止恢复批次")
+                if controller_cleanup_unknown(run.get("recovery")):
+                    raise ValueError(
+                        "控制进程或 Docker 请求尚未完成独立核查；禁止恢复批次"
+                    )
                 directory = run_directory(self.settings, run["id"])
-                if Sandbox().containers(run["id"]):
+                try:
+                    containers = Sandbox().containers(run["id"])
+                except SandboxError as error:
+                    record_probe_failure(self.store, run["id"], error)
+                    raise ValueError("无法核查子运行容器，禁止恢复批次") from error
+                if containers:
                     raise ValueError("子运行仍有容器，不能恢复")
                 workspace = get_workspace(run, directory)
                 from doonex.workspace import Workspace
@@ -540,8 +547,10 @@ class Arena:
                     raise ValueError("子运行状态已变化，请重新核查")
                 if helper_fenced(c):
                     raise ValueError("模型传输进程尚未完成独立核查；禁止恢复批次")
-                if controller_process_unknown(current.get("recovery")):
-                    raise ValueError("本机控制进程尚未完成独立核查；禁止恢复批次")
+                if controller_cleanup_unknown(current.get("recovery")):
+                    raise ValueError(
+                        "控制进程或 Docker 请求尚未完成独立核查；禁止恢复批次"
+                    )
                 if current["request"].get("background"):
                     from doonex.background import Background
 

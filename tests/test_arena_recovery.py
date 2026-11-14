@@ -270,7 +270,9 @@ def test_observed_check_failure_survives_interruption_and_later_assistance(
 
         def bounded_verifier(self, path, command, timeout, run_id, *args, **kwargs):
             if kwargs.get("verifier_path"):
-                timeout = 0.1
+                # Sandbox now counts mount/create in this allowance. Leave
+                # time for real startup, then prove the command itself began.
+                timeout = 5
             return original_run(self, path, command, timeout, run_id, *args, **kwargs)
 
         monkeypatch.setattr(Sandbox, "run", bounded_verifier)
@@ -279,7 +281,7 @@ def test_observed_check_failure_survives_interruption_and_later_assistance(
             response(
                 "doonex_shell",
                 {
-                    "command": "printf 'import time\\ntime.sleep(30)\\nanswer = 1\\n' > hello.py"
+                    "command": "printf 'import time\\nprint(\"verifier-entered\", flush=True)\\ntime.sleep(30)\\nanswer = 1\\n' > hello.py"
                 },
                 0,
             ),
@@ -295,6 +297,11 @@ def test_observed_check_failure_survives_interruption_and_later_assistance(
     assert failure["report_sha256"] == before["evidence"]["report_sha256"]
     assert before["evidence"]["checks"][0]["exit_code"] != 0
     assert before["evidence"]["checks"][0]["timed_out"] == (failure_kind == "timeout")
+    if failure_kind == "timeout":
+        check_log = before["evidence"]["checks"][0]["log"]
+        assert "verifier-entered" in (
+            run_directory(settings, run_id) / "evidence" / check_log
+        ).read_text()
     assert before["assignments"]["executor"]["state"] == "completed"
     monkeypatch.setattr(Evidence, "inspect", original_inspect)
     monkeypatch.setattr(Sandbox, "run", original_run)

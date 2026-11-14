@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import re
-import stat
 import sys
 import threading
 import time
@@ -180,8 +179,28 @@ class SessionScheduling:
     authorize_resume: Callable[[dict], bool] | None = None
 
 
-def _canonical_sha256(value: Any) -> str:
-    return canonical_sha256(value)
+def _canonical_sha256(value: Any, *, check=lambda: None) -> str:
+    return canonical_sha256(value, check=check)
+
+
+@contextmanager
+def _session_lock(session_store):
+    from doonex.deadline import remaining_time
+
+    session_store.check_ok()
+    acquired = (
+        _RUN_LOCK.acquire()
+        if session_store.deadline is None
+        else _RUN_LOCK.acquire(timeout=remaining_time(session_store.deadline))
+    )
+    try:
+        session_store.check_ok()
+        if not acquired:
+            raise SessionStorageError("SDK session lock deadline exceeded")
+        yield
+    finally:
+        if acquired:
+            _RUN_LOCK.release()
 
 
 def _branch_events(conversation):
@@ -197,7 +216,10 @@ def _branch_events(conversation):
     return events
 
 
-def _action_identity(event, session_id: str, generation: int, secret: str = ""):
+def _action_identity(
+    event, session_id: str, generation: int, secret: str = "", check=lambda: None
+):
+    check()
     data = _redact(event.model_dump(mode="json"), secret)
     return {
         "schema": 1,
@@ -206,8 +228,8 @@ def _action_identity(event, session_id: str, generation: int, secret: str = ""):
         "action_id": data["id"],
         "tool_call_id": data.get("tool_call_id"),
         "tool_name": data["tool_name"],
-        "action_sha256": _canonical_sha256(data.get("action")),
-        "event_sha256": _canonical_sha256(data),
+        "action_sha256": _canonical_sha256(data.get("action"), check=check),
+        "event_sha256": _canonical_sha256(data, check=check),
         "llm_response_id": data.get("llm_response_id"),
     }
 
@@ -218,6 +240,7 @@ class _SchedulingRuntime:
     session_id: str
     secret: str = field(repr=False)
     shell_with_action: Callable[[str, dict], dict] | None
+    check: Callable[[], None] = field(default=lambda: None, repr=False)
     settled_responses: dict[str, dict] = field(default_factory=dict)
     unknown_response: bool = False
     active_action: dict | None = None
@@ -251,7 +274,9 @@ class _SchedulingRuntime:
         events = _branch_events(conversation)
         pending = ConversationState.get_unmatched_actions(events)
         identities = [
-            _action_identity(event, self.session_id, self.hooks.generation)
+            _action_identity(
+                event, self.session_id, self.hooks.generation, "", self.check
+            )
             for event in pending
         ]
         if self.unknown_response or any(
@@ -268,7 +293,7 @@ class _SchedulingRuntime:
             "execution_status": conversation.state.execution_status.value,
             "leaf_event_id": conversation.state.leaf_event_id,
             "branch_sha256": _canonical_sha256(
-                [event.model_dump(mode="json") for event in events]
+                [event.model_dump(mode="json") for event in events], check=self.check
             ),
             "pending_actions": identities,
             "settled_responses": [
@@ -290,6 +315,7 @@ class _SchedulingRuntime:
             if not isinstance(responses, list):
                 raise TypeError
             for response in responses:
+                self.check()
                 if (
                     not isinstance(response, dict)
                     or set(response) != {"response_id", "input_tokens", "output_tokens"}
@@ -550,15 +576,14 @@ def _runtime_skill(skill: dict | None) -> _OpaqueSkill | None:
     )
 
 
-def _verify_skill_resume(saved_path: Path, skill: _OpaqueSkill | None) -> None:
+def _verify_skill_resume(
+    session_store: SessionFileStore, skill: _OpaqueSkill | None
+) -> None:
     # The SDK intentionally permits replacing AgentContext during resume. Runs
     # freeze their selected version, so require the same opaque context first.
     # Do not call Skill.load or deserialize an unverified Skill to compare it.
     try:
-        with (saved_path / "base_state.json").open("rb") as source:
-            raw = source.read(16 * 1024 * 1024 + 1)
-        if len(raw) > 16 * 1024 * 1024:
-            raise ValueError
+        raw = session_store.read("base_state.json")
         context = json.loads(raw)["agent"].get("agent_context") or {}
         expected = [skill.model_dump(mode="json", exclude_none=True)] if skill else []
         if (
@@ -580,7 +605,7 @@ def _verify_skill_resume(saved_path: Path, skill: _OpaqueSkill | None) -> None:
 
 
 def _verify_execution_policy_resume(
-    saved_path: Path,
+    session_store: SessionFileStore,
     run_id: str,
     execution_policy: str,
     generation_prompt_sha256: str | None = None,
@@ -589,12 +614,9 @@ def _verify_execution_policy_resume(
     # Check the saved contract before any SDK deserialization or autosave can
     # replace that evidence. Missing policy/identity fields are legacy workspace.
     try:
-        with (saved_path / "base_state.json").open("rb") as source:
-            raw = source.read(16 * 1024 * 1024 + 1)
-        if len(raw) > 16 * 1024 * 1024:
-            raise ValueError
+        raw = session_store.read("base_state.json")
         saved = json.loads(raw)
-        check_source(saved)
+        session_store.validate_source(saved)
         if (
             set(saved) - ConversationState.model_fields.keys()
             or saved.get("hook_config") is not None
@@ -657,7 +679,9 @@ def _generation_system_message() -> dict:
     ).model_dump(mode="json", exclude_none=True)
 
 
-def _verify_generation_prompt_resume(saved_path: Path, expected: dict) -> None:
+def _verify_generation_prompt_resume(
+    session_store: SessionFileStore, expected: dict
+) -> None:
     # Read primitive JSON before the SDK can load or autosave the conversation.
     # Require one fixed system and frozen user, including on abandoned branches.
     def unique_object(pairs):
@@ -669,10 +693,11 @@ def _verify_generation_prompt_resume(saved_path: Path, expected: dict) -> None:
         return result
 
     try:
-        events = saved_path / "events"
-        if saved_path.is_symlink() or events.is_symlink() or not events.is_dir():
-            raise ValueError
-        paths = sorted(events.glob("event-*.json"))
+        paths = sorted(
+            path
+            for path in session_store.list("events")
+            if path.startswith("events/event-") and path.endswith(".json")
+        )
         if not paths or len(paths) > 128:
             raise ValueError
         remaining, users, systems = 16 * 1024 * 1024, [], []
@@ -682,12 +707,8 @@ def _verify_generation_prompt_resume(saved_path: Path, expected: dict) -> None:
             for tool in FinishTool.create()
         ]
         for path in paths:
-            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-            with os.fdopen(descriptor, "rb") as source:
-                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
-                    raise ValueError
-                raw = source.read(remaining + 1)
-            remaining -= len(raw)
+            raw = session_store.read(path)
+            remaining -= len(raw.encode("utf-8"))
             if remaining < 0:
                 raise ValueError
             event = json.loads(raw, object_pairs_hook=unique_object)
@@ -998,6 +1019,8 @@ class GuardedLLM(LLM):
             raise _AcceptedSchedulerYield(self._scheduling) from None
         started = time.monotonic()
         try:
+            if self._session_store is not None:
+                self._session_store.check_ok()
             if mode == "responses":
                 expected_tools = (
                     [
@@ -1277,6 +1300,7 @@ class _M1Agent(Agent):
                 scheduling.session_id,
                 scheduling.hooks.generation,
                 scheduling.secret,
+                scheduling.check,
             )
             try:
                 super()._execute_actions(conversation, [action], on_event)
@@ -1396,8 +1420,11 @@ def run_session(
         raise ValueError("SDK action identity requires the scheduling contract")
     if scheduling is not None and resume and prompt is not None:
         raise ValueError("Scheduling resume cannot append a new prompt")
-    check_source(prompt)
-    check_source(skill)
+    from doonex.deadline import check_deadline
+
+    check = lambda: check_deadline(persistence_deadline)
+    check_source(prompt, check=check)
+    check_source(skill, check=check)
     selected_skill = _runtime_skill(_redact(skill, api_key))
     if version("openhands-sdk") != SDK_VERSION:
         raise RuntimeError(f"OpenHands SDK must be pinned to {SDK_VERSION}")
@@ -1447,7 +1474,11 @@ def run_session(
     ) as session_store:
         scheduling_runtime = (
             _SchedulingRuntime(
-                scheduling, str(conversation_id), api_key, shell_with_action
+                scheduling,
+                str(conversation_id),
+                api_key,
+                shell_with_action,
+                check=session_store.check_ok,
             )
             if scheduling is not None
             else None
@@ -1461,15 +1492,15 @@ def run_session(
             raise ValueError("A new conversation requires a prompt")
         if resume:
             _verify_execution_policy_resume(
-                saved_path, run_id, execution_policy, generation_prompt_sha256
+                session_store, run_id, execution_policy, generation_prompt_sha256
             )
-            _verify_skill_resume(saved_path, selected_skill)
+            _verify_skill_resume(session_store, selected_skill)
             if generation_user is not None:
-                _verify_generation_prompt_resume(saved_path, generation_user)
+                _verify_generation_prompt_resume(session_store, generation_user)
 
         # Include LLM/Agent construction, restoration and close in the log boundary.
         # One SDK session per worker process; callback references never serialize.
-        with _RUN_LOCK, _filtered_logs(api_key):
+        with _session_lock(session_store), _filtered_logs(api_key):
             model_id = model["model_id"]
             provider = model.get("provider")
             if provider and not model_id.startswith(f"{provider}/"):
