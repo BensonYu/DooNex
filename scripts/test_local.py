@@ -51,7 +51,11 @@ def main():
             .split(":")[-1]
         )
         database_url = f"postgresql://doonex:{password}@127.0.0.1:{port}/doonex_test"
-        for _ in range(60):
+        # Fresh initdb fsync/checkpoint can take more than 15 seconds on the
+        # local Docker VM. This setup wait precedes pytest and all measured
+        # Worker timelines; keep probing the actual TCP server within one window.
+        startup_deadline = time.monotonic() + 60
+        while time.monotonic() < startup_deadline:
             try:
                 # The image briefly exposes a bootstrap Unix socket before its
                 # actual TCP server. Probe the same connection the tests use.

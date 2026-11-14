@@ -1,7 +1,6 @@
 import json
 import os
 import subprocess
-import time
 
 import pytest
 from doonex.sandbox import Sandbox, SandboxError
@@ -90,22 +89,38 @@ def test_timeout_kills_and_removes_container(tmp_path, sandbox_context):
 def test_cancel_stops_current_and_future_action(tmp_path, sandbox_context):
     sandbox = Sandbox()
     run_id = sandbox_context.run_id
-    deadline = time.monotonic() + 0.6
+    # Cancel the running shell, not an unacknowledged Docker create. The
+    # original ten-second business deadline still covers all preparation.
+    started = tmp_path / "started"
     result = sandbox.run(
         tmp_path,
-        "sleep 30",
+        "printf running > started; sleep 30; touch late",
         10,
         run_id,
-        lambda: time.monotonic() > deadline,
+        lambda: started.exists() and started.read_text() == "running",
         **sandbox_context.binding,
     )
-    assert result["cancelled"]
+    assert started.read_text() == "running"
+    assert result["container_id"]
+    assert result["cancelled"] and not result["timed_out"]
+    assert not result["cleanup_error"] and not result["cleanup_unknown"]
+    assert not (tmp_path / "late").exists()
     assert sandbox.containers(run_id, **sandbox_context.binding) == []
     result = sandbox.run(
         tmp_path, "touch forbidden", 10, run_id, lambda: True, **sandbox_context.binding
     )
     assert result["cancelled"] and result["container_id"] is None
+    assert not result["timed_out"]
+    assert not result["cleanup_error"] and not result["cleanup_unknown"]
     assert not (tmp_path / "forbidden").exists()
+    operation = next(
+        row
+        for row in sandbox_context.records()
+        if row["operation_id"] == result["cleanup_evidence"]["controller_operation_id"]
+    )
+    assert not {"mount_validation", "docker_create", "docker_start"}.intersection(
+        process["phase"] for process in operation["processes"]
+    )
 
 
 @pytest.mark.postgres

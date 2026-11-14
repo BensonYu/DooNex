@@ -384,3 +384,21 @@ full02 遗留一个、八项复现遗留两个 Created 容器，均按实际 ins
 
 
 父联合 `m4-closure-recovery-fixtures-01` 已完成 **130 passed / exit 0**，pytest 147.97 秒、外层 161.208987 秒；176 个实际捕获输入不变、无 watchdog，日志 SHA256 `9d05beaa6f9ba741e38df4a3c1813335ab1098d7d8f83bae9e78a910aec2c959`。绑定为 `abea283` 加捕获的未提交 Sandbox fixture，不称干净 HEAD 全部通过。随后仅补充 ACK 实际副作用与真实 leader/fork 的严格证明，完整模块 `m4-closure-sandbox-phases-01` **42 passed / exit 0**，pytest 46.01 秒、外层 58.732973 秒，输入不变、无 watchdog；日志 SHA256 `b4c6b6cc2fdb9b91cbedc191770511a9aa8f2c1bc43a6c6312667f1c4a1f9e14`。结束后独立 Run/test 容器库存成功查询为空。以上关闭针对性整合检查，最终 43 正常配置专项及无筛选全量仍待。
+
+### 第三轮完整回归与取消阶段实证
+
+固定源码 `05ee7bb54c0671fbb777fb787fbe643f03d93304` 的 `m4-normal43-specialized-01` 完整执行 **39 passed / 43 正常配置 / exit 0**，pytest 828.97 秒、外层 842.225874 秒；176 个非 Markdown 输入与提交及前后文件一致，无 watchdog。独立原始时间线审计最大较大等待区间端点为 **59.875066125 秒**（原 60 秒 Responses），预冻结 90 秒目标不变。专项日志 SHA256 `b679db259bbaa97e7c553f24d06a5e21f44a8024c4b24a3f1343255b0942444a`。
+
+同一源码无筛选 `m4-closure-full-03` 全部执行，**2612 passed / 1 failed / 3 warnings / 0 skipped / exit 1**，pytest 4979.42 秒、外层 4993.158180 秒。176 个输入不变，无 watchdog；系统盘 TMPDIR 实际执行了大小写别名场景。日志 SHA256 `5e64c0010a420402623027179f0a802f0f38f534cd14899d5f31a96924ffd855`，收据 SHA256 `889994a323ab80f5d9b212189e66415d994ec79e2008b93842faef68432e54b5`。恢复 GET 的五类副作用前阻止、yielded 原时钟到期拒绝、全部 Sandbox deadline 及 Worker 正常/故障/容量场景通过；唯一失败是 `test_cancel_stops_current_and_future_action` 的后续普通容器探测遇到 `RegistryError(fenced)`。这不是最终整合通过。
+
+冻结 v3 独立审计据 full03 非零退出码返回 **invalid / exit 1**，`final=null`，43 项 final 仍 pending。原正常观测只作为诊断保存，最大端点 60.852313917 秒，最终覆盖计数为零；没有改 manifest 或增加源码差异豁免。失败审计 SHA256 `bd90154ec2803b1d19843191cb491cdf4530ee8203de45dd4974d5df017765af`。Ruff 与前端构建在 05ee7bb 均通过，但不改变整轮失败。后续源码改变后仍须新正常 43 专项及新无筛选完整回归。
+
+取消原样例连续两次诊断 `m4-cancel-reproduce-01/02` 均在一次性 PostgreSQL 启动时退出 1，分别 17.482544 / 17.472217 秒，**未进入 pytest**。第二次只读保存删除前日志，initdb 尚未完成，没有凭连接拒绝推断产品问题或数据库崩溃。随后停止盲重试，独立 `m4-pg-startup-diagnostic-01` 使用相同固定镜像、相同 TCP SELECT 1，观察到 **25.773145 秒**后成功：initdb 落盘约 18 秒，临时服务 checkpoint sync 4.816 秒；VM 磁盘/内存充足、无 OOM，精确回收后库存为空。诊断收据 SHA256 `59b38de157f0d86f79fe33fb35810486d71a5885343f1caf089c720eac8e62b1`，该诊断不是测试通过。
+
+最小 harness 修正仅将 `scripts/test_local.py` 的 60 次 × 0.25 秒准备探测改成一个 monotonic 60 秒启动窗口；固定镜像、真实 TCP 查询、失败退出、精确 finally 回收保持。连接/查询和最后 sleep 仍可跨过探测截止，这不是脚本严格总上界。此步骤在 pytest 和所有 Worker 测量前，不改变 90 秒验收目标、产品任何期限或模型配置。
+
+修改 harness 后，原取消 fixture 的 `m4-cancel-reproduce-03` 实际进入 pytest 并复现 **1 failed / exit 1**，外层 28.790699 秒。只读 observer 在 teardown 前保存 result 和 controller：mount 成功，`docker_create` 被 0.6 秒回调取消（exit -9、实际 reap/EOF），没有 ACK/container ID，持久 `daemon_unknown`；后续 rm/ps 虽返回零且当时为空，普通新 probe 仍按合同拒绝。结束后 inspect 仍发现同身份 Created 容器，进一步证明不能把空快照视为原请求完成；其元数据不用于推断 daemon 创建的绝对先后。日志 SHA256 `adfba8a8fc04b23a61d7f1e4465186c192999b8e482765f2fc5b89c298003e2a`。逐项核对精确 name、Run ID、原 sleep 命令和测试 mount 后仅删除此容器，保留原未知；资源收据 SHA256 `4b5e07df79620bde197b161d75326add78aec39b3f10a204588c40c5aaf947c5`，最终 Run/test 库存为空。
+
+本次确认为测试阶段前提不足，生产 Sandbox/controller 不改。原 fixture 用墙钟 0.6 秒推测 shell 已运行，新 fixture 必须观察真实容器命令写完 `running` 标记再取消，仍保留原 10 秒总业务窗口；断言实际 container ID、cancelled 且非 timeout、清理已知无错、零残留及后续命令未执行。第二次立即取消核对无 mount/create/start 业务派发，允许必要最终 ps。未到阶段、结果未知或清理失败不能通过；有针对性和相关整合结果待实际收据。
+
+取消阶段单例 `m4-cancel-phase-target-01` **1 passed / exit 0**，外层 31.245800 秒，日志 SHA256 `78cdaa37efb36eff05e279dc386baf8d327c31bde84ab4596a06e7f8cfb30cde`。随后三个完整相关模块 `m4-cancel-related-01` **90 passed / exit 0**，pytest 83.12 秒、外层 110.143134 秒，日志 SHA256 `d8a1f61c7b2fcb4dd1d356f60485347c3599f48ea14331c658cb41a5ca96a651`。两轮 176 输入前后不变、无 watchdog，绑定 05ee7bb 加收据内未提交的 harness/fixture，不能称干净 05ee7bb 的新证据。原 create ACK 未知、迟到创建、EOF、旧 owner/context 拒绝和真实 SIGKILL 持久阻止均继续通过。修正后的测试准备实际正常进入 pytest；此处只关闭针对性与相邻整合，随后固定候选重新进行 43 专项与完整全量。
