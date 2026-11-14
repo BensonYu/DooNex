@@ -1,6 +1,6 @@
 # M4：显式 Responses 传输子进程
 
-更新：2026-11-06（纽约）。本切片实现 `isolated_direct_v1` 可选模式，沿用 SDK 1.60.1 与现有预算账本；本机整合验证 1650 项通过。**尚未验证真实网关，也没有升级常驻服务。** 正常前台等待上界与完整真实后台矩阵仍是独立未通过项，见 [M4 记录](M4_IMPLEMENTATION.md) 和 [等待控制计划](M4_WAIT_CONTROL_PLAN.md)。
+更新：2026-11-14（纽约；最新收据 UTC 2026-11-14）。可选 `isolated_direct_v1` 沿用 SDK 1.60.1 和原预算。`b462502` 已通过 Sol 普通样例及完整真实后台闭环、独立账目和界面核验；常驻服务尚未升级。**正常完整前台等待上界仍未通过。** 当前证据与初轮结构失败见[续接记录](M4_RESUMPTION_20261113.md)。下文 1650 项回归明确属于此前 `31d937f`。
 
 ## 选择与使用
 
@@ -46,11 +46,11 @@ helper lifetime lease 使用永久 inode。父子只关闭描述符，不显式 
 
 解除要求没有活 worker 持有全局锁，并再次检查现场 lease。界面确认绑定确切 action 和记录摘要，刷新、切换或新操作清除确认；服务端继续执行独立核对。结果为 `operator_resolved`，不是 `reaped`，不修改原 Run 预算、不释放未知预留。之后仍须按原 Run/Arena 的恢复规则处理。
 
-**当前可达限制**：预算 reserve 已提交而 helper register 尚未持久化时，如果父进程硬退出，会留下有传输标记但无 helper 记录的 action。系统保持全局阻止，核查显示 `record_missing`；由于没有 hash、nonce 和 lease 身份，当前 resolver 无法解除。不能凭当前空闲锁推断从未启动，也不能手改数据库跳过核查。后续须单独设计 reservation 与初始 helper 身份的原子绑定，当前不承诺从任意中断点恢复。
+新动作从 `83fe6d0` 起在预算事务外核验永久 lease inode，在同一预算事务保存完整 reserved helper 身份，随后沿原 attempt/request/nonce/hash CAS；reserved→registered 的持久 CAS 确认后才 spawn，READY 与持久 ARM 确认后才发送请求密钥，deadline 只能收紧。新状态使用显式 `actions_helper_fenced_v2` 迁移，实际生产定义与 valid/ready/live 已核对，不能只凭 IF NOT EXISTS 认为旧谓词已升级。
 
-schema 初始化使用 `IF NOT EXISTS`。将来若修改终态谓词、字段或状态集合，必须显式迁移相应索引，不能以重复初始化代替迁移。
+**历史恢复限制**：旧版 reserve 已提交、register 未持久化就硬退出的 action 仍可能是 record_missing。它缺少 hash、nonce 和 lease 身份，继续全局阻止，当前 resolver 不能补造身份或解除。新原子记录不追溯修补历史，unknown 不返还；reserved 的人工核查同样不代表请求没发出或费用结清。
 
-## 已取得的检查与未通过项
+## 早期整合检查（应用源码 `31d937f`）
 
 组件检查覆盖严格协议和 HTTP 限额、子进程期限与父进程退出、重复中断和描述符继承、Registry 真实文件锁和索引、SDK 单次预算上下文、全局阻止与私有恢复 API。固定 bootstrap 对本地 HTTP 的独立纵线 7 项通过；一次性 PostgreSQL、真实 SDK、helper 与 Docker 的组合 26 项通过，包含固定快照交付、429 保留未知以及准备失败的 `not_spawned`。这些结果不相加为完整整合测试总数。
 
@@ -62,4 +62,10 @@ schema 初始化使用 `IF NOT EXISTS`。将来若修改终态谓词、字段或
 
 最终完整回归为 **1650 passed、3 warnings、732.81 秒、退出 0，无跳过**。测试开始时 HEAD 为 `a350f25` 加接线改动，前后 132 份非 Markdown 输入摘要一致，并与 `31d937f` 提交逐项匹配；一次性 PostgreSQL 已确认清理。Ruff 全范围通过，已成功构建的 22 份前端输入与最终提交逐项一致。`full-02.json`、`full-02.log`、`verified-commit-01.json` 保存命令、环境绑定和核验收据，完整日志 SHA-256 为 `55c8f29a476a0c0dfe257e7344aa36d6985fbe9051a6170373969743fc8ad57c`。私有证据位于 `verification/m4-responses-transport/`，生命周期、协议和 Registry 的交接及独立审查分别位于 `verification/m4-helper-lifecycle-implementation/`、`verification/m4-helper-process-transport/`、`verification/m4-helper-registry/`、`verification/m4-helper-binding-review/` 和 `verification/m4-helper-fence-review/`。时钟调查在 `verification/m4-recovery-clock-review/`。这些路径相对于本机私有 DooNex 数据目录，不属于产品仓库。
 
-下一步处理预留与 helper 身份原子绑定、有限维护、文件/会话容量、清理及前台初始化的完整等待路径。实际网关验证、新 UTC 日完整后台矩阵及独立账目仍待执行；原失败、日预算和未知预留保留。
+## 本轮整合与真实验证
+
+原子身份、有限维护、SDK 会话容量及严格提供方投影已整合到 `b462502`。有限元数据先校验再移除，IPC 和父端继续接受原严格核心；非法工具、任意字段、非零内置工具用量、损坏/重复 call 与未知用量仍拒绝。模型统计 input/output/total 不改写，不增加重试或 fallback。具体字段合同、四次结构失败和最终离线复现见[续接记录](M4_RESUMPTION_20261113.md)。
+
+真实普通样例 3 calls / 2,842 tokens、三个 helper reaped、固定快照验证通过；UTC 2026-11-14 的完整后台矩阵 15/15 验证完成，后台 45 calls / 56,689 tokens，前台 3 calls / 3,219 tokens，48 个 helper 均实际 reaped。原会话续接、独立审计 259 项与浏览器 32 项通过，原失败和未知预留保留。全部为当前本机、网关、Sol 与固定样例的证据，不是通用兼容或完整等待保证。
+
+当前源码最终全量结果以续接记录为准。接下来实施共同剩余期限、Docker 管道/清理、有限文件及前台初始化，再验证实际 Worker.run 的完整时间线；顺序见[等待控制计划](M4_WAIT_CONTROL_PLAN.md)。旧常驻服务没有升级，不自动恢复旧 worker。
