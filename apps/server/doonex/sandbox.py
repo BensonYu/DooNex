@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -17,8 +18,16 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .controller_operations import (
+    LaunchCapability,
+    ProcessPermit,
+    RegistryError,
+    current_registry,
+    scope,
+)
 from .deadline import check_deadline
 from .skills import _check_name, _no_links
+from .store import OwnershipLost
 from .tasksets import _overlaps, _snapshot
 
 TASK_IMAGE = "python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0fde4134606dd40d8dd8dbcade98e669c"
@@ -28,6 +37,7 @@ MAX_CONTAINER_IDS = 64
 MAX_MOUNT_OUTPUT_BYTES = 16 * 1024
 CLEANUP_SECONDS = 15.0
 POLL_SECONDS = 0.05
+_UNSET = object()
 
 
 def _evidence() -> dict:
@@ -39,6 +49,8 @@ def _evidence() -> dict:
         "errors": [],
         "local_process_unknown": False,
         "daemon_request_unknown": False,
+        "controller_record_unknown": False,
+        "controller_operation_id": None,
     }
 
 
@@ -46,6 +58,7 @@ def _unknown(evidence: dict) -> bool:
     return (
         evidence["local_process_unknown"]
         or evidence.get("daemon_request_unknown", False)
+        or evidence.get("controller_record_unknown", False)
         or (evidence["container_absence_confirmed"] is False)
     )
 
@@ -116,12 +129,16 @@ def _validated_mounts(payload: str) -> None:
 class _Cleanup:
     """One separate necessary-cleanup window, never refreshed by a child call."""
 
-    def __init__(self):
+    def __init__(self, *, business_deadline: float | None = None):
         self.deadline: float | None = None
+        self.business_deadline = business_deadline
 
     def start(self) -> float:
         if self.deadline is None:
-            self.deadline = time.monotonic() + CLEANUP_SECONDS
+            started = time.monotonic()
+            if self.business_deadline is not None:
+                started = min(started, self.business_deadline)
+            self.deadline = started + CLEANUP_SECONDS
         return self.deadline
 
 
@@ -131,11 +148,20 @@ class _ProcessResult:
     stdout: bytes
     reason: str | None = None
     truncated: bool = False
+    permit: ProcessPermit | None = None
 
 
 class _Supervisor:
-    def __init__(self, evidence: dict, cleanup: _Cleanup):
-        self.evidence, self.cleanup = evidence, cleanup
+    def __init__(
+        self, evidence: dict, cleanup: _Cleanup, *, capability: LaunchCapability
+    ):
+        if type(capability) is not LaunchCapability:
+            raise RegistryError("capability")
+        self.evidence, self.cleanup, self.capability = evidence, cleanup, capability
+        self.create_attempted = False
+        self.create_acknowledged = False
+        self.observation_complete = False
+        self.remaining_containers: list[str] | None = None
 
     def process(
         self,
@@ -144,10 +170,24 @@ class _Supervisor:
         deadline: float,
         operation: str,
         maximum: int,
+        capability: LaunchCapability,
+        target: str | None = None,
         truncate: bool = False,
         should_stop: Callable[[], bool] | None = None,
         env: dict | None = None,
     ) -> _ProcessResult:
+        if (
+            type(capability) is not LaunchCapability
+            or capability is not self.capability
+        ):
+            raise RegistryError("capability")
+        phase = operation if operation == "mount_validation" else "docker_" + operation
+        if phase != "mount_validation" and (
+            len(arguments) < 2
+            or arguments[1] != operation
+            or _docker_target(tuple(arguments[1:])) != target
+        ):
+            raise RegistryError("scope")
         if should_stop is not None and should_stop():
             return _ProcessResult(None, b"", "cancelled")
         if not math.isfinite(deadline):
@@ -160,6 +200,30 @@ class _Supervisor:
             deadline = min(deadline, self.cleanup.deadline - min(1.0, remaining / 4))
         if time.monotonic() >= deadline:
             return _ProcessResult(None, b"", "timeout")
+        # Complete the last potentially blocking caller callback before the
+        # capability rechecks the actual Run owner and action binding in DB.
+        if should_stop is not None and should_stop():
+            return _ProcessResult(None, b"", "cancelled")
+        permit = capability.before_process(phase, target=target)
+        if phase == "docker_create":
+            self.create_attempted = True
+        try:
+            if current_registry() is not capability._operation.registry:
+                raise RegistryError("capability")
+        except BaseException:
+            capability.after_process(
+                permit, pid=None, exit_code=None, reaped=False, pipe_eof=False
+            )
+            self.evidence["local_process_unknown"] = True
+            raise
+        # before_process may wait for the database. The durable launching gate
+        # and checked local permit cannot replace this final deadline check.
+        if time.monotonic() >= deadline:
+            capability.after_process(
+                permit, pid=None, exit_code=None, reaped=False, pipe_eof=False
+            )
+            self.evidence["local_process_unknown"] = True
+            return _ProcessResult(None, b"", "timeout", permit=permit)
         try:
             process = subprocess.Popen(
                 arguments,
@@ -171,6 +235,10 @@ class _Supervisor:
                 env=env,
             )
         except OSError as error:
+            capability.after_process(
+                permit, pid=None, exit_code=None, reaped=False, pipe_eof=False
+            )
+            self.evidence["local_process_unknown"] = True
             raise SandboxError(
                 f"Sandbox {operation} could not start: {type(error).__name__}",
                 cleanup_evidence=self.evidence,
@@ -279,12 +347,163 @@ class _Supervisor:
             record.update(
                 returncode=process.returncode, reason=reason, truncated=truncated
             )
+            try:
+                capability.after_process(
+                    permit,
+                    pid=process.pid,
+                    exit_code=process.returncode if record["reaped"] else None,
+                    reaped=record["reaped"],
+                    pipe_eof=record["pipe_eof"],
+                )
+            except BaseException:
+                self.evidence["controller_record_unknown"] = True
+                raise
         if failure is not None:
             raise SandboxError(
                 f"Sandbox {operation} supervision failed: {type(failure).__name__}",
                 cleanup_evidence=self.evidence,
             ) from failure
-        return _ProcessResult(process.returncode, bytes(collected), reason, truncated)
+        return _ProcessResult(
+            process.returncode, bytes(collected), reason, truncated, permit
+        )
+
+
+def _reserve(
+    kind,
+    *,
+    run_id,
+    deadline,
+    intent,
+    container_name=None,
+    project_id=None,
+    parent_action_id=None,
+    expected_run_owner=_UNSET,
+    repair_of=None,
+):
+    # A label alone must never detach a real Run from its execution authority.
+    if expected_run_owner is _UNSET:
+        raise RegistryError("run_owner_missing")
+    registry = current_registry()
+    run_label = "doonex.run_id=" + run_id
+    if repair_of is not None:
+        if kind != "sandbox_cleanup" or parent_action_id is not None:
+            raise RegistryError("repair_scope")
+        operation = registry.repair_only(
+            repair_of,
+            deadline_monotonic_ns=int(deadline * 1_000_000_000),
+            expected_run_owner=expected_run_owner,
+        )
+        record = operation.record
+        if (
+            record["run_id"] != run_id
+            or record["scope"]["run_label"] != run_label
+            or project_id is not None
+            and record["project_id"] != project_id
+        ):
+            operation.mark_unknown("interrupted")
+            raise RegistryError("repair_scope", operation_id=operation.operation_id)
+        return operation
+    return registry.reserve(
+        kind,
+        scope=scope(
+            intent_digest=hashlib.sha256(
+                json.dumps(intent, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+            container_name=container_name,
+            run_label=run_label,
+        ),
+        deadline_monotonic_ns=int(deadline * 1_000_000_000),
+        run_id=run_id,
+        project_id=project_id,
+        parent_action_id=parent_action_id,
+        expected_run_owner=expected_run_owner,
+        cleanup_allowance_seconds=math.ceil(CLEANUP_SECONDS),
+    )
+
+
+def _launch(operation, evidence):
+    evidence["controller_operation_id"] = operation.operation_id
+    try:
+        return operation.launch()
+    except BaseException as error:
+        evidence["controller_record_unknown"] = True
+        try:
+            operation.mark_unknown("interrupted")
+        except BaseException:  # noqa: BLE001 - preserve the launch uncertainty
+            evidence["errors"].append("Controller launch state remains unknown")
+        error.cleanup_unknown, error.cleanup_evidence = True, evidence
+        raise
+
+
+def _settle(operation, supervisor, *, reason):
+    evidence = supervisor.evidence
+    known = (
+        not _unknown(evidence)
+        and supervisor.observation_complete
+        and supervisor.remaining_containers is not None
+        and (not supervisor.create_attempted or supervisor.create_acknowledged)
+    )
+    try:
+        if not known:
+            evidence["controller_record_unknown"] = True
+            operation.mark_unknown(
+                "daemon_unknown"
+                if evidence["daemon_request_unknown"]
+                else "supervision_unknown"
+            )
+            return
+        operation.finish(
+            {
+                "outcome": "success" if reason == "success" else "failed",
+                "reason": reason,
+                "local_process_unknown": False,
+                "daemon_request_unknown": False,
+                "docker": {
+                    "create_attempted": supervisor.create_attempted,
+                    "create_acknowledged": supervisor.create_acknowledged,
+                    "container_removed": supervisor.create_acknowledged
+                    and supervisor.remaining_containers == [],
+                    "observation_complete": True,
+                    "run_label": operation.record["scope"]["run_label"],
+                    "remaining_containers": len(supervisor.remaining_containers),
+                },
+            }
+        )
+    except BaseException as error:
+        evidence["controller_record_unknown"] = True
+        evidence["errors"].append("Controller terminal receipt remains unknown")
+        error.cleanup_unknown, error.cleanup_evidence = True, evidence
+        raise
+
+
+def _docker_target(arguments):
+    operation = arguments[0] if arguments else None
+    if operation == "create" and arguments.count("--name") == 1:
+        index = arguments.index("--name")
+        if index + 1 < len(arguments):
+            return arguments[index + 1]
+    elif operation == "start" and len(arguments) == 3 and arguments[1] == "-a":
+        return arguments[2]
+    elif (
+        operation == "inspect"
+        and len(arguments) == 4
+        and arguments[1:3]
+        == (
+            "--format",
+            "{{.State.ExitCode}}",
+        )
+    ):
+        return arguments[3]
+    elif operation == "rm" and len(arguments) == 3 and arguments[1] == "-f":
+        return arguments[2]
+    elif (
+        operation == "ps"
+        and len(arguments) == 5
+        and arguments[1:4] == ("-aq", "--no-trunc", "--filter")
+        and arguments[4].startswith("label=doonex.run_id=")
+    ):
+        return arguments[4].removeprefix("label=")
+    raise RegistryError("scope")
 
 
 class Sandbox:
@@ -304,13 +523,18 @@ class Sandbox:
         _maximum: int = MAX_CONTROL_OUTPUT_BYTES,
         _should_stop: Callable[[], bool] | None = None,
     ) -> subprocess.CompletedProcess:
-        supervisor = _supervisor or _Supervisor(_evidence(), _Cleanup())
+        if _supervisor is None:
+            raise RegistryError("capability")
+        supervisor = _supervisor
+        target = _docker_target(arguments)
         result = supervisor.process(
             [self.docker, *arguments],
             deadline=_deadline if _deadline is not None else time.monotonic() + timeout,
             operation=arguments[0],
             maximum=_maximum,
             should_stop=_should_stop,
+            capability=supervisor.capability,
+            target=target,
         )
         if result.reason is not None:
             raise SandboxError(
@@ -324,7 +548,11 @@ class Sandbox:
                 + result.stdout[:1000].decode(errors="replace"),
                 cleanup_evidence=supervisor.evidence,
             )
-        return subprocess.CompletedProcess(arguments, result.returncode, result.stdout)
+        completed = subprocess.CompletedProcess(
+            arguments, result.returncode, result.stdout
+        )
+        completed.controller_permit = result.permit
+        return completed
 
     def _containers(
         self, run_id: str, deadline: float, supervisor: _Supervisor
@@ -358,23 +586,82 @@ class Sandbox:
                 "Docker container list is incomplete or malformed",
                 cleanup_evidence=supervisor.evidence,
             )
+        supervisor.capability.observe_containers(
+            result.controller_permit,
+            identifiers,
+            run_label="doonex.run_id=" + run_id,
+            complete=True,
+        )
+        supervisor.observation_complete = True
+        supervisor.remaining_containers = identifiers
         return identifiers
 
-    def containers(self, run_id: str, *, deadline: float | None = None) -> list[str]:
+    def containers(
+        self,
+        run_id: str,
+        *,
+        deadline: float | None = None,
+        project_id=None,
+        parent_action_id=None,
+        expected_run_owner=_UNSET,
+    ) -> list[str]:
         check_deadline(deadline)
+        run_id = _run_id(run_id)
         deadline = (
             min(time.monotonic() + CLEANUP_SECONDS, deadline)
             if deadline is not None
             else time.monotonic() + CLEANUP_SECONDS
         )
-        supervisor = _Supervisor(_evidence(), _Cleanup())
+        evidence = _evidence()
+        operation = _reserve(
+            "sandbox_probe",
+            run_id=run_id,
+            deadline=deadline,
+            intent={"operation": "probe", "run_id": run_id},
+            project_id=project_id,
+            parent_action_id=parent_action_id,
+            expected_run_owner=expected_run_owner,
+        )
+        supervisor = _Supervisor(
+            evidence, _Cleanup(), capability=_launch(operation, evidence)
+        )
         supervisor.cleanup.deadline = deadline
-        return self._containers(_run_id(run_id), deadline, supervisor)
+        try:
+            identifiers = self._containers(run_id, deadline, supervisor)
+        except BaseException as error:
+            _settle(operation, supervisor, reason="operation_failed")
+            error.cleanup_evidence = supervisor.evidence
+            error.cleanup_unknown = _unknown(supervisor.evidence)
+            raise
+        _settle(operation, supervisor, reason="success")
+        return identifiers
 
-    def stop_run(self, run_id: str) -> dict:
+    def stop_run(
+        self,
+        run_id: str,
+        *,
+        project_id=None,
+        parent_action_id=None,
+        expected_run_owner=_UNSET,
+        repair_of=None,
+    ) -> dict:
         run_id = _run_id(run_id)
-        supervisor = _Supervisor(_evidence(), _Cleanup())
-        deadline = supervisor.cleanup.start()
+        deadline = time.monotonic() + CLEANUP_SECONDS
+        evidence = _evidence()
+        operation = _reserve(
+            "sandbox_cleanup",
+            run_id=run_id,
+            deadline=deadline,
+            intent={"operation": "cleanup", "run_id": run_id},
+            project_id=project_id,
+            parent_action_id=parent_action_id,
+            expected_run_owner=expected_run_owner,
+            repair_of=repair_of,
+        )
+        supervisor = _Supervisor(
+            evidence, _Cleanup(), capability=_launch(operation, evidence)
+        )
+        supervisor.cleanup.deadline = deadline
         stopped, errors, remaining = [], [], ["unknown"]
         try:
             identifiers = self._containers(run_id, deadline, supervisor)
@@ -397,8 +684,16 @@ class Sandbox:
             remaining = self._containers(run_id, deadline, supervisor)
         except SandboxError as error:
             errors.append(str(error)[:1000])
+        except BaseException as error:
+            _settle(operation, supervisor, reason="operation_failed")
+            error.cleanup_evidence = supervisor.evidence
+            error.cleanup_unknown = _unknown(supervisor.evidence)
+            raise
         supervisor.evidence["container_absence_confirmed"] = remaining == []
         supervisor.evidence["container_snapshot_absence_confirmed"] = remaining == []
+        _settle(
+            operation, supervisor, reason="operation_failed" if errors else "success"
+        )
         errors.extend(supervisor.evidence["errors"])
         return {
             "remaining": remaining,
@@ -420,6 +715,9 @@ class Sandbox:
         skill_path: Path | None = None,
         verifier_path: Path | None = None,
         deadline: float | None = None,
+        project_id=None,
+        parent_action_id=None,
+        expected_run_owner=_UNSET,
     ) -> dict:
         entered = time.monotonic()
         if (
@@ -447,7 +745,34 @@ class Sandbox:
             raise SandboxError("Workspace access mode must be explicit")
         if skill_path is not None and verifier_path is not None:
             raise SandboxError("Skill and verifier mounts are mutually exclusive")
-        supervisor = _Supervisor(_evidence(), _Cleanup())
+        evidence = _evidence()
+        name = "doonex-" + uuid.uuid4().hex
+        operation = _reserve(
+            "sandbox_execute",
+            run_id=run_id,
+            deadline=deadline,
+            intent={
+                "operation": "execute",
+                "run_id": run_id,
+                "workspace": str(workspace),
+                "command": command,
+                "read_only": read_only,
+                "skill_path": str(skill_path) if skill_path is not None else None,
+                "verifier_path": str(verifier_path)
+                if verifier_path is not None
+                else None,
+                "image": self.image,
+            },
+            container_name=name,
+            project_id=project_id,
+            parent_action_id=parent_action_id,
+            expected_run_owner=expected_run_owner,
+        )
+        supervisor = _Supervisor(
+            evidence,
+            _Cleanup(business_deadline=deadline),
+            capability=_launch(operation, evidence),
+        )
         result = {
             "exit_code": None,
             "output": "",
@@ -462,7 +787,6 @@ class Sandbox:
             "cleanup_unknown": False,
             "cleanup_evidence": supervisor.evidence,
         }
-        name = "doonex-" + uuid.uuid4().hex
         attempted_create = False
         acknowledged_create = False
         pending = None
@@ -493,6 +817,7 @@ class Sandbox:
                     maximum=MAX_MOUNT_OUTPUT_BYTES,
                     should_stop=should_stop,
                     env=environment,
+                    capability=supervisor.capability,
                 )
                 if validation.reason in {"timeout", "cancelled"}:
                     result["timed_out"] = validation.reason == "timeout"
@@ -580,14 +905,17 @@ class Sandbox:
                                 "Docker create returned a malformed container identifier"
                             )
                         acknowledged_create = True
+                        supervisor.create_acknowledged = True
                         result["container_id"] = identifier
                         attached = supervisor.process(
-                            [self.docker, "start", "-a", identifier],
+                            [self.docker, "start", "-a", name],
                             deadline=deadline,
                             operation="start",
                             maximum=MAX_OUTPUT_BYTES,
                             truncate=True,
                             should_stop=should_stop,
+                            capability=supervisor.capability,
+                            target=name,
                         )
                         result["output"] = attached.stdout.decode(errors="replace")
                         result["output_truncated"] = attached.truncated
@@ -600,7 +928,7 @@ class Sandbox:
                                 "inspect",
                                 "--format",
                                 "{{.State.ExitCode}}",
-                                identifier,
+                                name,
                                 _deadline=deadline,
                                 _supervisor=supervisor,
                                 _should_stop=should_stop,
@@ -624,10 +952,7 @@ class Sandbox:
             if not result["cancelled"] and time.monotonic() >= deadline:
                 result["timed_out"] = True
             if attempted_create:
-                if not acknowledged_create and any(
-                    item["operation"] == "create"
-                    for item in supervisor.evidence["processes"]
-                ):
+                if not acknowledged_create and supervisor.create_attempted:
                     # Killing/reaping the client does not cancel a daemon's
                     # in-flight create. A current empty ps is only a snapshot;
                     # the named container may materialize after that query.
@@ -648,7 +973,13 @@ class Sandbox:
                     )
                 except SandboxError as error:
                     supervisor.evidence["errors"].append(str(error)[:1000])
+                except (RegistryError, OwnershipLost) as error:
+                    supervisor.evidence["controller_record_unknown"] = True
+                    if pending is None:
+                        pending = error
+            if not supervisor.observation_complete or attempted_create:
                 try:
+                    cleanup_deadline = supervisor.cleanup.start()
                     remaining = self._containers(run_id, cleanup_deadline, supervisor)
                     supervisor.evidence[
                         "container_snapshot_absence_confirmed"
@@ -663,6 +994,26 @@ class Sandbox:
                         )
                 except SandboxError as error:
                     supervisor.evidence["errors"].append(str(error)[:1000])
+                except (RegistryError, OwnershipLost) as error:
+                    supervisor.evidence["controller_record_unknown"] = True
+                    if pending is None:
+                        pending = error
+            reason = (
+                "operation_failed"
+                if pending is not None
+                else "cancelled"
+                if result["cancelled"]
+                else "deadline"
+                if result["timed_out"]
+                else "command_failed"
+                if result["exit_code"] != 0
+                else "success"
+            )
+            try:
+                _settle(operation, supervisor, reason=reason)
+            except BaseException as error:  # noqa: BLE001 - preserve original failure
+                if pending is None:
+                    pending = error
             result["cleanup_unknown"] = _unknown(supervisor.evidence)
             if result["cleanup_unknown"]:
                 result["cleanup_error"] = (
@@ -671,6 +1022,10 @@ class Sandbox:
                 )
             result["ended_at"] = _now()
         if pending is not None:
+            if isinstance(pending, (RegistryError, OwnershipLost)):
+                pending.cleanup_evidence = supervisor.evidence
+                pending.cleanup_unknown = result["cleanup_unknown"]
+                raise pending
             if isinstance(pending, SandboxError):
                 pending.cleanup_evidence = supervisor.evidence
                 pending.cleanup_unknown = result["cleanup_unknown"]
