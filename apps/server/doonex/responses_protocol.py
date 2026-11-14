@@ -181,6 +181,13 @@ PROVIDER_METADATA_FIELDS = frozenset(
         "prompt",
         "conversation",
         "context_management",
+        "access_programs",
+        "image",
+        "input_transformations",
+        "moderation",
+        "tool_usage",
+        "frequency_penalty",
+        "presence_penalty",
     }
 )
 
@@ -770,6 +777,45 @@ def project_provider_response(response: dict) -> dict:
             _int(response["top_logprobs"], 0, 20)
         for field in ("prompt", "conversation", "context_management"):
             _require(response.get(field) is None)
+        for field in ("frequency_penalty", "presence_penalty"):
+            if response.get(field) is not None:
+                _require(type(response[field]) in {int, float} and response[field] == 0)
+        if response.get("access_programs") is not None:
+            access = response["access_programs"]
+            _fields(access, {"cyber"})
+            _require(access["cyber"] == "standard")
+        if response.get("image") is not None:
+            image = response["image"]
+            _fields(image, {"context_compression"})
+            _require(image["context_compression"] == "disabled")
+        if response.get("input_transformations") is not None:
+            _require(type(response["input_transformations"]) is list)
+            _require(not response["input_transformations"])
+        _require(response.get("moderation") is None)
+        if response.get("tool_usage") is not None:
+            usage = response["tool_usage"]
+            _fields(usage, set(), {"image_gen", "web_search"})
+            if "web_search" in usage:
+                _fields(usage["web_search"], {"num_requests"})
+                _int(usage["web_search"]["num_requests"], 0, 0)
+            if "image_gen" in usage:
+                image_usage = usage["image_gen"]
+                _fields(
+                    image_usage,
+                    {
+                        "input_tokens",
+                        "output_tokens",
+                        "total_tokens",
+                        "input_tokens_details",
+                        "output_tokens_details",
+                    },
+                )
+                for field in ("input_tokens", "output_tokens", "total_tokens"):
+                    _int(image_usage[field], 0, 0)
+                for field in ("input_tokens_details", "output_tokens_details"):
+                    _fields(image_usage[field], {"text_tokens", "image_tokens"})
+                    for count in image_usage[field].values():
+                        _int(count, 0, 0)
     except (ProtocolError, ValueError, TypeError):
         raise ProviderResponseError("response_metadata") from None
     projected = {

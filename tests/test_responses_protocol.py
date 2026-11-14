@@ -391,10 +391,8 @@ def test_incomplete_or_duplicate_executable_calls_are_rejected():
         protocol.validate_response(response)
 
 
-def test_provider_metadata_is_validated_and_projected_before_pinned_sdk():
-    response = sample_response()
-    provider = {
-        **response,
+def default_provider_metadata():
+    return {
         "background": False,
         "completed_at": 2,
         "max_tool_calls": None,
@@ -406,7 +404,28 @@ def test_provider_metadata_is_validated_and_projected_before_pinned_sdk():
         "prompt": None,
         "conversation": None,
         "context_management": None,
+        "access_programs": {"cyber": "standard"},
+        "image": {"context_compression": "disabled"},
+        "input_transformations": [],
+        "moderation": None,
+        "frequency_penalty": 0.0,
+        "presence_penalty": 0.0,
+        "tool_usage": {
+            "image_gen": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "input_tokens_details": {"text_tokens": 0, "image_tokens": 0},
+                "output_tokens_details": {"text_tokens": 0, "image_tokens": 0},
+            },
+            "web_search": {"num_requests": 0},
+        },
     }
+
+
+def test_provider_metadata_is_validated_and_projected_before_pinned_sdk():
+    response = sample_response()
+    provider = {**response, **default_provider_metadata()}
     assert protocol.project_provider_response(provider) == response
     assert "service_tier" in provider  # The caller's response is never mutated.
     with pytest.raises(protocol.ProtocolError):
@@ -430,6 +449,17 @@ def test_provider_metadata_is_validated_and_projected_before_pinned_sdk():
         ("prompt", {"id": "private-prompt"}, "response_metadata"),
         ("conversation", {"id": "private-conversation"}, "response_metadata"),
         ("context_management", [], "response_metadata"),
+        ("access_programs", {"cyber": "advanced"}, "response_metadata"),
+        ("access_programs", {"cyber": "standard", "extra": None}, "response_metadata"),
+        ("image", {"context_compression": "auto"}, "response_metadata"),
+        ("input_transformations", [{"type": "image_crop"}], "response_metadata"),
+        ("input_transformations", {}, "response_metadata"),
+        ("moderation", {"id": "unbudgeted"}, "response_metadata"),
+        ("frequency_penalty", 1, "response_metadata"),
+        ("presence_penalty", False, "response_metadata"),
+        ("tool_usage", {"web_search": {"num_requests": 1}}, "response_metadata"),
+        ("tool_usage", {"web_search": {"num_requests": False}}, "response_metadata"),
+        ("tool_usage", {"other_tool": {}}, "response_metadata"),
         ("arbitrary_private_field", "secret-value", "response_fields"),
         ("output", [{"type": "web_search_call"}], "response_schema"),
     ],
@@ -444,6 +474,31 @@ def test_provider_projection_never_accepts_arbitrary_or_executable_extras(
     assert "private" not in str(caught.value) and "secret-value" not in str(
         caught.value
     )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "input_tokens_details",
+        "output_tokens_details",
+    ],
+)
+def test_nonzero_or_incomplete_builtin_image_usage_never_disappears(field):
+    metadata = default_provider_metadata()
+    usage = metadata["tool_usage"]["image_gen"]
+    if field.endswith("details"):
+        usage[field]["image_tokens"] = 1
+    else:
+        usage[field] = 1
+    with pytest.raises(protocol.ProviderResponseError) as caught:
+        protocol.project_provider_response({**sample_response(), **metadata})
+    assert caught.value.reason == "response_metadata"
+    usage.pop(field)
+    with pytest.raises(protocol.ProviderResponseError):
+        protocol.project_provider_response({**sample_response(), **metadata})
 
 
 def test_diagnostics_is_finite_typed_and_secret_checked():

@@ -20,6 +20,7 @@ import pytest
 from doonex import responses_process as process
 from doonex import responses_protocol as protocol
 from doonex import responses_transport as transport
+from test_responses_protocol import default_provider_metadata
 
 _SYNTHETIC_KEY = "offline-fixed-child-loopback-bearer"
 
@@ -141,12 +142,7 @@ def loopback_server():
                     else:
                         body = _response()
                         if mode == "metadata":
-                            body.update(
-                                service_tier="default",
-                                background=False,
-                                completed_at=2,
-                                prompt_cache_retention="in_memory",
-                            )
+                            body.update(default_provider_metadata())
                         self.wfile.write(json.dumps(body).encode())
                 except (BrokenPipeError, ConnectionResetError):
                     pass

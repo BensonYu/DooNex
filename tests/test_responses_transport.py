@@ -11,7 +11,12 @@ import httpx
 import pytest
 from doonex import responses_protocol as protocol
 from doonex import responses_transport as transport
-from test_responses_protocol import CLIENT_ID, sample_arm, sample_response
+from test_responses_protocol import (
+    CLIENT_ID,
+    default_provider_metadata,
+    sample_arm,
+    sample_response,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -133,10 +138,7 @@ def test_native_success_preserves_pinned_response_and_narrow_private_cost(monkey
 def test_native_provider_metadata_is_checked_then_removed_from_wire(monkeypatch):
     body = {
         **sample_response(),
-        "service_tier": "default",
-        "background": False,
-        "completed_at": 2,
-        "prompt_cache_retention": "in_memory",
+        **default_provider_metadata(),
     }
     terminal, stream, calls, hooks = execute_mock(monkeypatch, body=body)
     assert terminal["kind"] == "result"
