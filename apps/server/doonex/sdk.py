@@ -1021,6 +1021,19 @@ class GuardedLLM(LLM):
         try:
             if self._session_store is not None:
                 self._session_store.check_ok()
+                if self._session_store.deadline is not None:
+                    from doonex.deadline import remaining_time
+
+                    # Recompute after the reservation commit; construction-time
+                    # timeout must not refresh later requests' allowance.
+                    kwargs = {
+                        **kwargs,
+                        "timeout": min(
+                            self.timeout,
+                            kwargs.get("timeout", self.timeout),
+                            remaining_time(self._session_store.deadline),
+                        ),
+                    }
             if mode == "responses":
                 expected_tools = (
                     [

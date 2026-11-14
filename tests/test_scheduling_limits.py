@@ -205,8 +205,8 @@ def test_verifier_cannot_commit_intent_when_batch_stops_after_outer_check(
     actual_snapshot = evidence._verifier_snapshot
     changed = []
 
-    def stop_after_check_copy(path, context):
-        result = actual_snapshot(path, context)
+    def stop_after_check_copy(path, context, **kwargs):
+        result = actual_snapshot(path, context, **kwargs)
         if not changed and any(
             part.startswith("doonex-check-") for part in Path(path).parts
         ):

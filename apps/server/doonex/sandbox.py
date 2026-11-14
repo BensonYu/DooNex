@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .deadline import check_deadline
 from .skills import _check_name, _no_links
 from .tasksets import _overlaps, _snapshot
 
@@ -359,8 +360,13 @@ class Sandbox:
             )
         return identifiers
 
-    def containers(self, run_id: str) -> list[str]:
-        deadline = time.monotonic() + CLEANUP_SECONDS
+    def containers(self, run_id: str, *, deadline: float | None = None) -> list[str]:
+        check_deadline(deadline)
+        deadline = (
+            min(time.monotonic() + CLEANUP_SECONDS, deadline)
+            if deadline is not None
+            else time.monotonic() + CLEANUP_SECONDS
+        )
         supervisor = _Supervisor(_evidence(), _Cleanup())
         supervisor.cleanup.deadline = deadline
         return self._containers(_run_id(run_id), deadline, supervisor)

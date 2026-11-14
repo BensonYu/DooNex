@@ -3,6 +3,7 @@
 from copy import deepcopy
 
 from doonex.budget import BatchHalt, elapsed
+from doonex.deadline import check_deadline
 from doonex.store import dispatch_lock, execution_fenced, now
 
 
@@ -83,15 +84,17 @@ class Scheduler:
         with self.store.connect() as c:
             return foreground_waiting(c)
 
-    def save_yield(self, run_id, owner, receipt, workspace):
+    def save_yield(self, run_id, owner, receipt, workspace, *, deadline=None):
         from doonex.sandbox import Sandbox
         from doonex.workspace import Workspace
 
-        if Sandbox().containers(run_id):
+        check_deadline(deadline)
+        if Sandbox().containers(run_id, deadline=deadline):
             self.cleanup_blocked = True
             raise ValueError("后台仍有容器，不能保存安全让出检查点")
-        workspace_digest = Workspace.execution_digest(workspace.path)
+        workspace_digest = Workspace.execution_digest(workspace.path, deadline=deadline)
         with self.store.locked(run_id, owner) as (c, run):
+            check_deadline(deadline)
             if run["state"] not in {"running", "verifying"} or run.get(
                 "requested_action"
             ):
@@ -130,11 +133,13 @@ class Scheduler:
                 c,
             )
 
-    def validate_receipt(self, run_id, receipt, workspace):
+    def validate_receipt(self, run_id, receipt, workspace, *, deadline=None):
         from doonex.workspace import Workspace
 
-        workspace_digest = Workspace.execution_digest(workspace.path)
+        check_deadline(deadline)
+        workspace_digest = Workspace.execution_digest(workspace.path, deadline=deadline)
         with self.store.locked(run_id, dispatch=True) as (c, run):
+            check_deadline(deadline)
             # Resume authorization itself does not dispatch. A foreground task
             # arriving now is handled by the next atomic model/tool admission.
             self.preflight(c, run, yield_foreground=False)

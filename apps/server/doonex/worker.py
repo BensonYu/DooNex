@@ -239,11 +239,13 @@ class Worker:
 
             execution_fence()
             if generation_service:
-                generation_service.validate_run(self.store.get(run_id), directory)
+                generation_service.validate_run(
+                    self.store.get(run_id), directory, deadline=execution_deadline
+                )
             if not all(role_keys.values()):
                 raise ValueError("worker 缺少运行所引用的模型凭据环境变量")
             skill_context = (
-                library.skill_context(request["skill"])
+                library.skill_context(request["skill"], deadline=execution_deadline)
                 if request.get("skill")
                 else None
             )
@@ -252,7 +254,10 @@ class Worker:
             if arena:
                 binding = request["arena"]
                 task_context = library.tasksets.context(
-                    binding["taskset_id"], binding["report_sha256"], binding["task_id"]
+                    binding["taskset_id"],
+                    binding["report_sha256"],
+                    binding["task_id"],
+                    deadline=execution_deadline,
                 )
                 if (
                     task_context.metadata["source_digest"] != binding["source_digest"]
@@ -277,7 +282,7 @@ class Worker:
                 }
             if generation_service:
                 workspace = generation_service.prepare_workspace(
-                    self.store.get(run_id), directory
+                    self.store.get(run_id), directory, deadline=execution_deadline
                 )
                 with self.store.locked(run_id, self.owner) as (_, current):
                     current["baseline_digest"] = workspace.baseline_digest
@@ -490,7 +495,9 @@ class Worker:
                         remaining = remaining_execution()
                         options = {"read_only": True} if read_only else {}
                         if role == "executor" and skill_context:
-                            fresh_skill = library.skill_context(request["skill"])
+                            fresh_skill = library.skill_context(
+                                request["skill"], deadline=execution_deadline
+                            )
                             options["skill_path"] = fresh_skill.path
                         result = sandbox.run(
                             shell_path,
@@ -506,16 +513,21 @@ class Worker:
                         self.lease()
                         if read_only:
                             saved_handoff = self.store.get(run_id).get("handoff")
-                            if not Review.inspect(workspace, directory, saved_handoff)[
-                                "valid"
-                            ]:
+                            if not Review.inspect(
+                                workspace,
+                                directory,
+                                saved_handoff,
+                                deadline=execution_deadline,
+                            )["valid"]:
                                 raise RuntimeError(
                                     "审查工具结束时交接材料或代码快照发生变化"
                                 )
                         else:
                             Workspace.scan(shell_path, deadline=execution_deadline)
                             if skill_context:
-                                library.skill_context(request["skill"])
+                                library.skill_context(
+                                    request["skill"], deadline=execution_deadline
+                                )
                         checkpoint_digest = (
                             Workspace.execution_digest(
                                 workspace.path, deadline=execution_deadline
@@ -615,11 +627,17 @@ class Worker:
                         generation=generation,
                         should_yield=lambda: self.scheduler.should_yield(run_id),
                         on_yield=lambda receipt: self.scheduler.save_yield(
-                            run_id, self.owner, receipt, workspace
+                            run_id,
+                            self.owner,
+                            receipt,
+                            workspace,
+                            deadline=execution_deadline,
                         ),
                         resume_receipt=saved.get("receipt") if resume else None,
                         authorize_resume=lambda receipt: (
-                            self.scheduler.validate_receipt(run_id, receipt, workspace)
+                            self.scheduler.validate_receipt(
+                                run_id, receipt, workspace, deadline=execution_deadline
+                            )
                         ),
                     )
                 result = run_session(
@@ -734,7 +752,10 @@ class Worker:
                         self.fence()
                         completion["generation_output"] = (
                             generation_service.save_output(
-                                self.store.get(run_id), directory, finish_message
+                                self.store.get(run_id),
+                                directory,
+                                finish_message,
+                                deadline=execution_deadline,
                             )
                         )
                     # Persist output binding and completion together. The SDK
@@ -743,7 +764,7 @@ class Worker:
                 if generation_service:
                     self.fence()
                     candidate = generation_service.build_candidate(
-                        self.store.get(run_id), directory
+                        self.store.get(run_id), directory, deadline=execution_deadline
                     )
                     with self.store.locked(run_id, self.owner) as (_, current):
                         guard(current)
@@ -751,8 +772,12 @@ class Worker:
                     if not candidate["valid"]:
                         raise ValueError("生成输出未通过候选结构检查；保留原始输出")
                 if review_required:
-                    handoff = Review.prepare(workspace, directory, run_id)
-                    if not Review.inspect(workspace, directory, handoff)["valid"]:
+                    handoff = Review.prepare(
+                        workspace, directory, run_id, deadline=execution_deadline
+                    )
+                    if not Review.inspect(
+                        workspace, directory, handoff, deadline=execution_deadline
+                    )["valid"]:
                         raise RuntimeError("审查交接材料完整性检查失败")
                     with self.store.locked(run_id, self.owner) as (c, current):
                         guard(current)
@@ -775,18 +800,28 @@ class Worker:
                 handoff = run.get("handoff")
                 if (
                     not handoff
-                    or not Review.inspect(workspace, directory, handoff)["valid"]
+                    or not Review.inspect(
+                        workspace, directory, handoff, deadline=execution_deadline
+                    )["valid"]
                 ):
                     raise RuntimeError("已保存的审查交接材料完整性检查失败")
                 message = execute_role(
                     "reviewer", Path(handoff["context_path"]), read_only=True
                 )
-                if not Review.inspect(workspace, directory, handoff)["valid"]:
+                if not Review.inspect(
+                    workspace, directory, handoff, deadline=execution_deadline
+                )["valid"]:
                     raise RuntimeError("审查期间固定快照或交接材料发生变化")
                 try:
                     review = parse_review_report(message)
-                    after = read_files(Path(handoff["context_path"]) / "after")
-                    before = read_files(Path(handoff["context_path"]) / "before")
+                    after = read_files(
+                        Path(handoff["context_path"]) / "after",
+                        deadline=execution_deadline,
+                    )
+                    before = read_files(
+                        Path(handoff["context_path"]) / "before",
+                        deadline=execution_deadline,
+                    )
                     for finding in review["findings"]:
                         path = finding["path"]
                         if not path:
@@ -850,7 +885,10 @@ class Worker:
             if generation_service and run.get("evidence"):
                 saved = run["evidence"]
                 saved_inspection = Evidence.inspect(
-                    workspace, directory, expected_report_sha256=saved["report_sha256"]
+                    workspace,
+                    directory,
+                    expected_report_sha256=saved["report_sha256"],
+                    deadline=execution_deadline,
                 )
                 if not saved_inspection.get("valid"):
                     raise ValueError("已绑定的生成交付证据失效；禁止自动重新生成")
@@ -861,7 +899,7 @@ class Worker:
                 evidence_path.rename(archive)
                 event("verification_restarted", {"previous_evidence": archive.name})
             if skill_context:
-                library.skill_context(request["skill"])
+                library.skill_context(request["skill"], deadline=execution_deadline)
             if (
                 arena
                 and not arena.integrity(arena.get(request["arena"]["evaluation_id"]))[
@@ -917,7 +955,13 @@ class Worker:
                                 c,
                             )
                     except SchedulerYield:
-                        self.scheduler.save_yield(run_id, self.owner, None, workspace)
+                        self.scheduler.save_yield(
+                            run_id,
+                            self.owner,
+                            None,
+                            workspace,
+                            deadline=execution_deadline,
+                        )
                         raise Yielded() from None
                     try:
                         kwargs["deadline"] = execution_deadline
@@ -949,6 +993,7 @@ class Worker:
                 min(60, remaining),
                 run_id,
                 should_stop=verify_stop,
+                deadline=execution_deadline,
                 **(
                     {
                         "verifier_path": task_context.verifier_path,
@@ -983,6 +1028,7 @@ class Worker:
                 workspace,
                 directory,
                 expected_report_sha256=report["report_sha256"],
+                deadline=execution_deadline,
                 **(
                     {"verification_context": verification_context}
                     if task_context
@@ -995,7 +1041,10 @@ class Worker:
                     raise ValueError("生成候选的通用交付证据无效")
                 self.fence()
                 final_candidate = generation_service.finalize_candidate(
-                    self.store.get(run_id), directory, report
+                    self.store.get(run_id),
+                    directory,
+                    report,
+                    deadline=execution_deadline,
                 )
                 if not final_candidate["valid"]:
                     raise ValueError("生成候选的完整结构证据无效")
@@ -1026,7 +1075,9 @@ class Worker:
                 verified = bool(
                     verified
                     and handoff
-                    and Review.inspect(workspace, directory, handoff)["valid"]
+                    and Review.inspect(
+                        workspace, directory, handoff, deadline=execution_deadline
+                    )["valid"]
                     and review.get("valid") is True
                     and review.get("status") == "approved"
                     and reviewer.get("state") == "completed"
