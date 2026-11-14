@@ -374,15 +374,15 @@ def test_worker_rechecks_shared_deadline_after_preflight_before_action_commit(
 def test_worker_expires_delivery_before_starting_new_work(
     settings, store, request_data, tmp_path, monkeypatch, stage, wall_forward
 ):
-    from doonex import worker as worker_module
-
-    original_elapsed = worker_module.elapsed
     clock_advanced = False
-
-    def elapsed_after_forward_step(current):
-        return original_elapsed(current) + (5 if clock_advanced else 0)
-
-    monkeypatch.setattr(worker_module, "elapsed", elapsed_after_forward_step)
+    worker = Worker(settings)
+    # The Worker now retains one shared ExecutionClock across execute entries.
+    # Advance its actual wall source, rather than the former elapsed helper.
+    monkeypatch.setattr(
+        worker.execution_clock,
+        "_wall",
+        lambda: datetime.now(UTC) + timedelta(seconds=5 if clock_advanced else 0),
+    )
     if stage == "review":
         request_data["workflow"] = "execute_review"
     run, _, _ = prepare_run(store, settings, request_data, tmp_path)
@@ -417,7 +417,7 @@ def test_worker_expires_delivery_before_starting_new_work(
         "stop_run",
         lambda *_a, **_k: {"remaining": [], "errors": [], "stopped": []},
     )
-    Worker(settings).run(once=True)
+    worker.run(once=True)
     final = store.get(run["id"])
     assert final["state"] == "budget_exceeded", final["reason"]
     assert len(calls) == len(deadlines) == final["usage"]["calls"] == 1
