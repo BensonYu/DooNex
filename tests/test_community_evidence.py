@@ -12,8 +12,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
+import controller_test_support
 import pytest
 from doonex.arena import Arena
+from doonex.cleanup import operation_context
 from doonex.community import (
     COMMUNITY_SCHEMA,
     Community,
@@ -34,7 +36,7 @@ from doonex.evidence import Evidence
 from doonex.library import Library
 from doonex.store import now
 from doonex.worker import run_directory
-from doonex.workspace import Workspace
+from doonex.workspace import Workspace, read_files
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.testclient import TestClient
 from psycopg.types.json import Jsonb
@@ -43,10 +45,11 @@ from test_community import credential, enabled, published
 from test_discovery import PublicGit
 
 PRIVATE = "PRIVATE-PROJECT-PROMPT-HIDDEN-ANSWER-PATH-GATEWAY-ACCOUNT-SENTINEL"
+controller_registry = controller_test_support.controller_registry
 
 
 @pytest.fixture
-def product(settings, store, tmp_path, monkeypatch):
+def product(settings, store, tmp_path, monkeypatch, controller_registry):
     with store.connect() as c:
         c.execute(COMMUNITY_SCHEMA)
         c.execute(COMMUNITY_EVIDENCE_SCHEMA)
@@ -476,6 +479,50 @@ def test_expired_withdrawn_and_release_withdrawn_excluded(
     assert len(service.list()) == 2
 
 
+class FixtureRunner:
+    """Synthetic check results after validating real Run and workspace bindings."""
+
+    image = "synthetic-no-execution"
+
+    def __init__(self, workspace, run, output=PRIVATE):
+        self.context = operation_context(run)
+        assert workspace.operation_context == self.context
+        self.workspace_path = workspace.path
+        self.files = read_files(workspace.path)
+        self.commands = run["request"]["checks"]
+        self.output = output
+        self.calls = []
+
+    def run(
+        self,
+        path,
+        command,
+        timeout,
+        run_id,
+        should_stop=lambda: False,
+        *,
+        verifier_path=None,
+        project_id,
+        parent_action_id,
+        expected_run_owner,
+    ):
+        assert {
+            "run_id": run_id,
+            "project_id": project_id,
+            "parent_action_id": parent_action_id,
+            "expected_run_owner": expected_run_owner,
+        } == self.context
+        assert path != self.workspace_path and read_files(path) == self.files
+        assert command in self.commands
+        self.calls.append(command)
+        return {
+            "exit_code": 0,
+            "timed_out": False,
+            "cancelled": False,
+            "output": self.output,
+        }
+
+
 def real_artifact_run(
     product, request_data, tmp_path, state="completed_verified", *, checks=True
 ):
@@ -505,23 +552,19 @@ def real_artifact_run(
     run = service.store.create_run(request)
     directory = run_directory(service.settings, run["id"])
     directory.mkdir(parents=True)
-    workspace = Workspace.create(repository, "HEAD", directory / "workspace")
+    workspace = Workspace.create(
+        repository,
+        "HEAD",
+        directory / "workspace",
+        operation_context=operation_context(run),
+    )
     (workspace.path / "code.py").write_text("answer = 2\n")
 
-    class FixtureRunner:
-        image = "synthetic-no-execution"
-
-        def run(self, *args, **kwargs):
-            return {
-                "exit_code": 0,
-                "timed_out": False,
-                "cancelled": False,
-                "output": PRIVATE,
-            }
-
+    runner = FixtureRunner(workspace, run)
     report = Evidence.capture(
-        workspace, directory, request["checks"], FixtureRunner(), 1, run["id"]
+        workspace, directory, request["checks"], runner, 1, run["id"]
     )
+    assert runner.calls == request["checks"]
     with service.store.locked(run["id"]) as (_, current):
         current.update(
             state=state,
@@ -782,35 +825,26 @@ def test_actual_arena_get_attempt_and_integrity_can_freeze_exact_public_content(
     with service.store.connect() as c:
         batch = arena.create(body, connection=c)
 
-    class FixtureRunner:
-        image = "synthetic-no-execution"
-
-        def run(self, *args, **kwargs):
-            return {
-                "exit_code": 0,
-                "timed_out": False,
-                "cancelled": False,
-                "output": PRIVATE,
-            }
-
     for entry in batch["attempts"]:
         run = service.store.get(entry["run_id"])
         directory = run_directory(service.settings, run["id"])
         directory.mkdir(parents=True)
-        Workspace.create(
+        workspace = Workspace.create(
             seed["request"]["repo_path"],
             seed["request"]["base_commit"],
             directory / "workspace",
+            operation_context=operation_context(run),
         )
         binding = run["request"]["arena"]
         context = library.tasksets.context(
             binding["taskset_id"], binding["report_sha256"], binding["task_id"]
         )
+        runner = FixtureRunner(workspace, run)
         report = Evidence.capture(
             get_workspace(run, directory),
             directory,
             run["request"]["checks"],
-            FixtureRunner(),
+            runner,
             1,
             run["id"],
             verifier_path=context.verifier_path,
@@ -819,6 +853,7 @@ def test_actual_arena_get_attempt_and_integrity_can_freeze_exact_public_content(
                 for key in ("taskset_id", "task_id", "report_sha256", "verifier_digest")
             },
         )
+        assert runner.calls == run["request"]["checks"]
         with service.store.locked(run["id"]) as (_, current):
             current.update(
                 state="completed_verified",

@@ -13,9 +13,11 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from uuid import uuid4
 
+import controller_test_support
 import pytest
 import test_community_evidence as evidence_tests
 from doonex.arena import Arena, EvaluationInput
+from doonex.cleanup import operation_context
 from doonex.community import (
     COMMUNITY_SCHEMA,
     Community,
@@ -35,11 +37,12 @@ from doonex.worker import get_workspace, run_directory
 from doonex.workspace import Workspace
 from psycopg.types.json import Jsonb
 from test_community import credential, enabled, published, submitted
-from test_community_evidence import ledger, prepare, real_artifact_run
+from test_community_evidence import FixtureRunner, ledger, prepare, real_artifact_run
 from test_discovery import PublicGit
 
 PRIVATE = "PRIVATE-REVIEW-SECRET-PROMPT-HIDDEN-ANSWER-RAW-EVIDENCE-SENTINEL"
 product = evidence_tests.product
+controller_registry = controller_test_support.controller_registry
 
 
 @pytest.fixture
@@ -373,35 +376,26 @@ def _actual_batch(product, request_data, tmp_path):
             connection=c,
         )
 
-    class FixtureRunner:
-        image = "synthetic-no-execution"
-
-        def run(self, *args, **kwargs):
-            return {
-                "exit_code": 0,
-                "timed_out": False,
-                "cancelled": False,
-                "output": PRIVATE,
-            }
-
     for entry in batch["attempts"]:
         run = service.store.get(entry["run_id"])
         directory = run_directory(service.settings, run["id"])
         directory.mkdir(parents=True)
-        Workspace.create(
+        workspace = Workspace.create(
             seed["request"]["repo_path"],
             seed["request"]["base_commit"],
             directory / "workspace",
+            operation_context=operation_context(run),
         )
         binding = run["request"]["arena"]
         context = library.tasksets.context(
             binding["taskset_id"], binding["report_sha256"], binding["task_id"]
         )
+        runner = FixtureRunner(workspace, run, PRIVATE)
         report = Evidence.capture(
             get_workspace(run, directory),
             directory,
             run["request"]["checks"],
-            FixtureRunner(),
+            runner,
             1,
             run["id"],
             verifier_path=context.verifier_path,
@@ -410,6 +404,7 @@ def _actual_batch(product, request_data, tmp_path):
                 for key in ("taskset_id", "task_id", "report_sha256", "verifier_digest")
             },
         )
+        assert runner.calls == run["request"]["checks"]
         with service.store.locked(run["id"]) as (_, current):
             current.update(
                 state="completed_verified",
