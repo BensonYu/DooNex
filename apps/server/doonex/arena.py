@@ -1,7 +1,6 @@
 """Manual private comparisons with immutable plans and explicit recommendations."""
 
 import hashlib
-import json
 import re
 from contextlib import contextmanager, nullcontext
 from datetime import datetime
@@ -14,11 +13,14 @@ from pydantic import Field, model_validator
 
 from doonex.arena_metrics import summarize
 from doonex.budget import elapsed
+from doonex.deadline import check_deadline
+from doonex.evidence import _raise_execution_control
 from doonex.library import Library
 from doonex.model_registry import ModelRegistry
 from doonex.models import Budget, StrictModel
 from doonex.sandbox import TASK_IMAGE
 from doonex.store import dispatch_lock, now
+from doonex.workspace import _json_digest
 
 TERMINAL_RUNS = {
     "completed_verified",
@@ -29,21 +31,37 @@ TERMINAL_RUNS = {
 }
 ACTIVE_BATCHES = {"queued", "running", "cancelling"}
 MAX_PLANNED_ATTEMPTS = 400  # 10 tasks, baseline + 3 Skills, 10 repeats.
+MAX_CONTROLLER_BYTES = 4 * 1024 * 1024
 
 
-def digest(value):
-    return hashlib.sha256(
-        json.dumps(
-            value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-        ).encode()
-    ).hexdigest()
+def digest(value, *, deadline: float | None = None):
+    return _json_digest(value, deadline=deadline)
 
 
-def environment():
+def _controller_digest(path, *, deadline: float | None = None):
+    check_deadline(deadline)
+    result = hashlib.sha256()
+    size = 0
+    with path.open("rb") as source:
+        while True:
+            check_deadline(deadline)
+            chunk = source.read(min(64 * 1024, MAX_CONTROLLER_BYTES + 1 - size))
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_CONTROLLER_BYTES:
+                raise ValueError("控制器源码超过允许大小")
+            result.update(chunk)
+    check_deadline(deadline)
+    return result.hexdigest()
+
+
+def environment(*, deadline: float | None = None):
     from importlib.metadata import version
 
+    check_deadline(deadline)
     root = Path(__file__).parent
-    return {
+    value = {
         "sdk": version("openhands-sdk"),
         "image": TASK_IMAGE,
         "protocol": "private-arena-v1",
@@ -51,7 +69,7 @@ def environment():
         "cpu": 1,
         "memory_mb": 512,
         "controller": {
-            name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+            name: _controller_digest(root / name, deadline=deadline)
             for name in (
                 "sdk.py",
                 "sandbox.py",
@@ -75,6 +93,8 @@ def environment():
         "provider_cache_control": "unsupported",
         "provider_seed": "unsupported",
     }
+    check_deadline(deadline)
+    return value
 
 
 class BatchBudget(StrictModel):
@@ -122,18 +142,22 @@ def seconds(start, end):
 
 
 class Arena:
-    def __init__(self, settings, store):
+    def __init__(self, settings, store, *, deadline: float | None = None):
+        check_deadline(deadline)
         self.settings, self.store = settings, store
-        self.library = Library(settings, store)
+        self.library = Library(settings, store, deadline=deadline)
+        check_deadline(deadline)
 
-    def get(self, identifier, connection=None):
+    def get(self, identifier, connection=None, *, deadline: float | None = None):
+        check_deadline(deadline)
         identifier = _uuid(identifier)
         if connection is None:
             with self.store.connect() as c:
-                return self.get(identifier, c)
+                return self.get(identifier, c, deadline=deadline)
         row = connection.execute(
             "SELECT data FROM arena_evaluations WHERE id=%s", (identifier,)
         ).fetchone()
+        check_deadline(deadline)
         if not row:
             raise KeyError("找不到评测")
         return row["data"]
@@ -188,18 +212,21 @@ class Arena:
                 (value["state"], Jsonb(value), value["id"]),
             )
 
-    def prepare(self, body):
-        taskset = self.library.get("taskset", body.taskset_id)
-        if not self.library.taskset(taskset)["valid"]:
+    def prepare(self, body, *, deadline: float | None = None):
+        check_deadline(deadline)
+        taskset = self.library.get("taskset", body.taskset_id, deadline=deadline)
+        if not self.library.taskset(taskset, deadline=deadline)["valid"]:
             raise ValueError("任务集完整性检查失败")
         skills = {
-            identifier: self.library.freeze_skill(identifier)
+            identifier: self.library.freeze_skill(identifier, deadline=deadline)
             for identifier in body.skill_version_ids
         }
         profile = ModelRegistry(self.settings).get(body.model_profile_id)
+        check_deadline(deadline)
         model = profile.model.model_dump()
         if not self.settings.credential(model):
             raise ValueError("所选模型凭据不可用")
+        check_deadline(deadline)
         run_budget, batch_budget = (
             body.run_budget.model_dump(),
             body.batch_budget.model_dump(),
@@ -229,13 +256,23 @@ class Arena:
                 for b in (run_budget, batch_budget)
             ):
                 raise ValueError("运行或批次费用预算不足以预留模型请求")
+        check_deadline(deadline)
         return taskset, skills, profile, model, run_budget, batch_budget
 
-    def create(self, body, connection=None, *, background=None, prepared=None):
+    def create(
+        self,
+        body,
+        connection=None,
+        *,
+        background=None,
+        prepared=None,
+        deadline: float | None = None,
+    ):
+        check_deadline(deadline)
         # File validation is completed before taking the short dispatch lock.
         # Background.claim independently rechecks the frozen database binding.
         taskset, skills, profile, model, run_budget, batch_budget = (
-            self.prepare(body) if prepared is None else prepared
+            self.prepare(body, deadline=deadline) if prepared is None else prepared
         )
         subscription = model["billing_mode"] == "subscription"
         identifier = str(uuid4())
@@ -247,7 +284,7 @@ class Arena:
         conditions = {
             "taskset_id": body.taskset_id,
             "model": model,
-            "environment": environment(),
+            "environment": environment(deadline=deadline),
             "run_budget": run_budget,
             "batch_budget": batch_budget,
         }
@@ -276,7 +313,7 @@ class Arena:
             ],
             "arms": [{"id": "baseline", "label": "无额外 Skill"}]
             + [{"id": k, "label": k[:12]} for k in skills],
-            "fingerprint": digest(conditions),
+            "fingerprint": digest(conditions, deadline=deadline),
             "attempts": [],
             "usage": {
                 "calls": 0,
@@ -295,21 +332,28 @@ class Arena:
             value["background"] = background
         # All planned children and their parent are committed together. The
         # worker only claims committed rows. Interleave arms across repeats.
+        check_deadline(deadline)
         with (
             self.store.connect() if connection is None else nullcontext(connection)
         ) as c:
+            check_deadline(deadline)
             dispatch_lock(c)
+            check_deadline(deadline)
             c.execute(
                 "INSERT INTO arena_evaluations VALUES(%s,%s,%s)",
                 (identifier, "queued", Jsonb(value)),
             )
             for repeat in range(body.repeats):
+                check_deadline(deadline)
                 for task_index, task in enumerate(taskset["tasks"]):
+                    check_deadline(deadline)
                     arms = value["arms"]
                     offset = (repeat + task_index) % len(arms)
                     for arm in arms[offset:] + arms[:offset]:
+                        check_deadline(deadline)
                         project_id = taskset["project_ids"][task["id"]]
                         registered = self.store.project(project_id)
+                        check_deadline(deadline)
                         binding = {
                             "evaluation_id": identifier,
                             "taskset_id": body.taskset_id,
@@ -348,6 +392,7 @@ class Arena:
                         if background:
                             request["background"] = background
                         run = self.store.create_run(request, connection=c)
+                        check_deadline(deadline)
                         value["attempts"].append(
                             {
                                 "run_id": run["id"],
@@ -361,38 +406,50 @@ class Arena:
                 "UPDATE arena_evaluations SET data=%s WHERE id=%s",
                 (Jsonb(value), identifier),
             )
-        return self.detail(identifier) if connection is None else value
+            check_deadline(deadline)
+        check_deadline(deadline)
+        result = self.detail(identifier) if connection is None else value
+        check_deadline(deadline)
+        return result
 
-    def integrity(self, value, *, approval=False):
+    def integrity(self, value, *, approval=False, deadline: float | None = None):
+        check_deadline(deadline)
         errors = []
-        if value["environment"] != environment():
+        if value["environment"] != environment(deadline=deadline):
             errors.append("执行环境或控制器版本已变化，不能混合比较")
         status = self.library.tasksets.inspect(
-            value["taskset_id"], value["taskset_report_sha256"]
+            value["taskset_id"], value["taskset_report_sha256"], deadline=deadline
         )
         if not status["valid"]:
             errors.extend(status["errors"])
         for binding in value["skills"].values():
+            check_deadline(deadline)
             try:
-                self.library.skill_context(binding)
+                self.library.skill_context(binding, deadline=deadline)
                 if approval:
-                    self.library.freeze_skill(binding["version_id"])
+                    self.library.freeze_skill(binding["version_id"], deadline=deadline)
             except (ValueError, OSError, KeyError) as error:
+                _raise_execution_control(error)
                 errors.append(str(error))
+        check_deadline(deadline)
         return {"valid": not errors, "errors": errors}
 
-    def start(self, identifier):
-        value = self.get(identifier)
-        integrity = self.integrity(value)
+    def start(self, identifier, *, deadline: float | None = None):
+        check_deadline(deadline)
+        value = self.get(identifier, deadline=deadline)
+        integrity = self.integrity(value, deadline=deadline)
         if not integrity["valid"]:
             self.stop(identifier, "interrupted", "; ".join(integrity["errors"]))
             return False
+        check_deadline(deadline)
         with self.locked(identifier) as (_, value):
+            check_deadline(deadline)
             if value["state"] not in {"queued", "running"}:
                 return False
             value["state"] = "running"
             value["first_started_at"] = value["first_started_at"] or now()
             value["reason"] = "按固定计划执行基线与候选"
+        check_deadline(deadline)
         return True
 
     def stopped(self, identifier):

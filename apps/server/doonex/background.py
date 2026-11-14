@@ -15,6 +15,8 @@ from psycopg.types.json import Jsonb
 from pydantic import Field, model_validator
 
 from doonex.arena import BatchBudget, EvaluationInput, digest, environment
+from doonex.deadline import check_deadline
+from doonex.evidence import _raise_execution_control
 from doonex.library import Library
 from doonex.model_registry import ModelRegistry
 from doonex.models import Budget, StrictModel
@@ -139,8 +141,12 @@ def _empty_usage():
     }
 
 
-def _revision(value):
-    return digest({key: item for key, item in value.items() if key != "revision"})
+def _revision(value, *, deadline: float | None = None):
+    check_deadline(deadline)
+    return digest(
+        {key: item for key, item in value.items() if key != "revision"},
+        deadline=deadline,
+    )
 
 
 def _sum_usage(values):
@@ -155,23 +161,29 @@ def _sum_usage(values):
 
 
 class Background:
-    def __init__(self, settings, store, *, clock=None):
+    def __init__(self, settings, store, *, clock=None, deadline: float | None = None):
+        check_deadline(deadline)
         self.settings, self.store = settings, store
-        self.library = Library(settings, store)
+        self.library = Library(settings, store, deadline=deadline)
         self.clock = clock or (lambda: datetime.now(UTC))
+        check_deadline(deadline)
 
     def _now(self):
         return _utc(self.clock())
 
-    def get(self, identifier, connection=None, *, lock=False):
+    def get(
+        self, identifier, connection=None, *, lock=False, deadline: float | None = None
+    ):
+        check_deadline(deadline)
         if connection is None:
             with self.store.connect() as c:
-                return self.get(identifier, c, lock=lock)
+                return self.get(identifier, c, lock=lock, deadline=deadline)
         row = connection.execute(
             "SELECT data FROM background_authorizations WHERE id=%s"
             + (" FOR UPDATE" if lock else ""),
             (_identifier(identifier),),
         ).fetchone()
+        check_deadline(deadline)
         if not row:
             raise KeyError("找不到后台授权")
         return row["data"]
@@ -313,21 +325,26 @@ class Background:
         )
         return value
 
-    def _snapshot(self, body, c, *, inspect_contents=True):
+    def _snapshot(
+        self, body, c, *, inspect_contents=True, deadline: float | None = None
+    ):
+        check_deadline(deadline)
         # Gate on metadata before opening any task-set report or task material.
         marker = c.execute(
             "SELECT data->>'split' AS split,data->>'report_sha256' AS report_sha256 FROM library_versions WHERE kind='taskset' AND id=%s FOR SHARE",
             (body.taskset_id,),
         ).fetchone()
+        check_deadline(deadline)
         if not marker or marker["split"] != "tuning":
             raise BackgroundStopped("后台仅允许 tuning 任务集")
         if inspect_contents:
-            taskset = self.library.get("taskset", body.taskset_id, c)
-            if not self.library.taskset(taskset)["valid"]:
+            taskset = self.library.get("taskset", body.taskset_id, c, deadline=deadline)
+            if not self.library.taskset(taskset, deadline=deadline)["valid"]:
                 raise BackgroundStopped("任务集完整性已变化")
         skills = {}
         # Stable order avoids deadlocks between grants sharing candidates.
         for identifier in sorted(body.skill_version_ids):
+            check_deadline(deadline)
             record = c.execute(
                 "SELECT data FROM library_versions WHERE kind='skill' AND id=%s FOR SHARE",
                 (identifier,),
@@ -337,7 +354,9 @@ class Background:
             record = record["data"]
             if (
                 inspect_contents
-                and not self.library.skill(record)["integrity"]["valid"]
+                and not self.library.skill(record, deadline=deadline)["integrity"][
+                    "valid"
+                ]
             ):
                 raise BackgroundStopped("后台候选内容或保存凭据已变化")
             skills[identifier] = {
@@ -354,14 +373,18 @@ class Background:
                     {
                         "status": record["review_status"],
                         "history": record["review_history"],
-                    }
+                    },
+                    deadline=deadline,
                 ),
             }
         try:
             profile = ModelRegistry(self.settings).get(body.model_profile_id)
+            check_deadline(deadline)
             model = profile.model.model_dump()
             credential = self.settings.credential(model)
-        except (KeyError, ValueError, OSError):
+            check_deadline(deadline)
+        except (KeyError, ValueError, OSError) as error:
+            _raise_execution_control(error)
             raise BackgroundStopped("后台冻结模型配置或凭据引用不可用") from None
         if not credential:
             raise BackgroundStopped("所选后台模型凭据不可用")
@@ -401,21 +424,27 @@ class Background:
                 "name": profile.name,
                 "revision": profile.revision,
             },
-            "environment": environment(),
+            "environment": environment(deadline=deadline),
         }
 
-    def _unchanged(self, value, c, *, inspect_contents=True):
+    def _unchanged(
+        self, value, c, *, inspect_contents=True, deadline: float | None = None
+    ):
+        check_deadline(deadline)
         body = BackgroundInput.model_validate(value["input"])
         if (
-            self._snapshot(body, c, inspect_contents=inspect_contents)
+            self._snapshot(
+                body, c, inspect_contents=inspect_contents, deadline=deadline
+            )
             != value["snapshot"]
         ):
             raise BackgroundStopped("授权冻结的审核、版本、模型或执行环境已变化")
-        if _revision(value) != value["revision"]:
+        if _revision(value, deadline=deadline) != value["revision"]:
             raise BackgroundStopped("后台授权记录完整性无效")
+        check_deadline(deadline)
         return body
 
-    def prepare(self, identifier):
+    def prepare(self, identifier, *, deadline: float | None = None):
         """Scan frozen contents before the short dispatch transaction.
 
         A caller may pass this immediate receipt to claim. Claim still rechecks
@@ -423,10 +452,12 @@ class Background:
         Later dispatch preflight is metadata-only: the Arena/worker must verify
         exact task-set and Skill bytes on their existing use-before paths.
         """
+        check_deadline(deadline)
         with self.store.connect() as c:
-            value = self.get(identifier, c)
+            value = self.get(identifier, c, deadline=deadline)
             self._window(value, waiting=True)
-            self._unchanged(value, c)
+            self._unchanged(value, c, deadline=deadline)
+        check_deadline(deadline)
         return {
             "authorization_id": value["id"],
             "revision": value["revision"],

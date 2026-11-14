@@ -30,7 +30,7 @@ def m3_client(settings, monkeypatch):
     from doonex import arena
 
     frozen = arena.environment()
-    monkeypatch.setattr(arena, "environment", lambda: copy.deepcopy(frozen))
+    monkeypatch.setattr(arena, "environment", lambda **kwargs: copy.deepcopy(frozen))
     with TestClient(create_app(settings)) as client:
         client.headers["Authorization"] = "Bearer " + settings.token
         yield client
@@ -374,7 +374,7 @@ def test_environment_drift_interrupts_before_dispatch_and_blocks_resume(
 
     value = create_evaluation(m3_client, m3_library)
     changed = {**value["environment"], "synthetic_controller_change": True}
-    monkeypatch.setattr(arena_module, "environment", lambda: changed)
+    monkeypatch.setattr(arena_module, "environment", lambda **kwargs: changed)
     arena = Arena(settings, store)
     assert not arena.start(value["id"])
     detail = m3_client.get(f"/api/arena/evaluations/{value['id']}").json()

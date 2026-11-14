@@ -419,7 +419,9 @@ def test_preflight_rechecks_each_dispatch_without_refunding(
             background.settings.model.model_copy(update={"model_id": "changed"}),
         )
     elif change == "environment":
-        monkeypatch.setattr("doonex.background.environment", lambda: {"changed": True})
+        monkeypatch.setattr(
+            "doonex.background.environment", lambda **kwargs: {"changed": True}
+        )
     elif change == "expired":
         clock[0] += timedelta(hours=1)
     else:
