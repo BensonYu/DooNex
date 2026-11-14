@@ -2,17 +2,20 @@ import os
 import stat
 import subprocess
 import tarfile
-from uuid import uuid4
 
+import controller_test_support
 import pytest
+from doonex.cleanup import operation_context
 from doonex.evidence import Evidence, EvidenceError
 from doonex.sandbox import Sandbox, SandboxError
 from doonex.tasksets import _snapshot
 from doonex.workspace import Workspace
 
+controller_registry = controller_test_support.controller_registry
+
 
 @pytest.fixture
-def workspace(tmp_path):
+def workspace(tmp_path, controller_registry, store, request_data):
     repository = tmp_path / "repository"
     repository.mkdir()
     for arguments in (
@@ -24,9 +27,35 @@ def workspace(tmp_path):
     (repository / "main.py").write_text("answer = 1\n")
     subprocess.check_call(["git", "-C", str(repository), "add", "."])
     subprocess.check_call(["git", "-C", str(repository), "commit", "-qm", "baseline"])
-    result = Workspace.create(repository, "HEAD", tmp_path / "workspace")
+    commit = subprocess.check_output(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"], text=True
+    ).strip()
+    project = store.set_project(
+        {"id": request_data["project_id"], "path": str(repository)}
+    )
+    run = store.create_run(
+        {
+            **request_data,
+            "project_id": project["id"],
+            "repo_path": str(repository),
+            "base_commit": commit,
+        }
+    )
+    with store.locked(run["id"]) as (_connection, current):
+        current["owner"] = "m3-isolation-test-owner"
+    action_id = store.action(run["id"], "verification", {"commands": ["check"]})
+    context = operation_context(store.get(run["id"]), parent_action_id=action_id)
+    result = Workspace.create(
+        repository, commit, tmp_path / "workspace", operation_context=context
+    )
     (result.path / "main.py").write_text("answer = 2\n")
     return result
+
+
+def sandbox_binding(workspace):
+    context = dict(workspace.operation_context)
+    context.pop("run_id")
+    return context
 
 
 @pytest.fixture
@@ -56,8 +85,9 @@ def verification_context(verifier):
 class RecordingSandbox:
     image = "offline-recording-fixture"
 
-    def __init__(self, action=None):
+    def __init__(self, context, action=None):
         self.paths = []
+        self.context = dict(context)
         self.action = action
 
     def run(
@@ -69,7 +99,16 @@ class RecordingSandbox:
         should_stop=lambda: False,
         *,
         verifier_path=None,
+        project_id,
+        parent_action_id,
+        expected_run_owner,
     ):
+        assert {
+            "run_id": run_id,
+            "project_id": project_id,
+            "parent_action_id": parent_action_id,
+            "expected_run_owner": expected_run_owner,
+        } == self.context
         assert verifier_path is not None
         self.paths.append((workspace, verifier_path))
         assert (workspace / "main.py").read_text() == "answer = 2\n"
@@ -94,9 +133,10 @@ def test_each_check_uses_independent_frozen_verifier_and_source_copies(
 ):
     context = verification_context(verifier)
     sandbox = RecordingSandbox(
+        workspace.operation_context,
         lambda source, checker: (source / "main.py").write_text(
             "polluted by a previous check"
-        )
+        ),
     )
     run_dir = tmp_path / "run"
     report = Evidence.capture(
@@ -105,7 +145,7 @@ def test_each_check_uses_independent_frozen_verifier_and_source_copies(
         ["first", "second"],
         sandbox,
         10,
-        uuid4().hex,
+        workspace.operation_context["run_id"],
         verifier_path=verifier,
         verification_context=context,
     )
@@ -153,7 +193,7 @@ def test_verifier_tampering_before_capture_cannot_run_checks(
     else:
         (verifier / "check.py").unlink()
         (verifier / "check.py").symlink_to(workspace.path / "main.py")
-    sandbox = RecordingSandbox()
+    sandbox = RecordingSandbox(workspace.operation_context)
     with pytest.raises(EvidenceError):
         Evidence.capture(
             workspace,
@@ -161,7 +201,7 @@ def test_verifier_tampering_before_capture_cannot_run_checks(
             ["check"],
             sandbox,
             10,
-            uuid4().hex,
+            workspace.operation_context["run_id"],
             verifier_path=verifier,
             verification_context=context,
         )
@@ -183,9 +223,9 @@ def test_verifier_changes_during_checks_are_recorded_and_cannot_verify(
         workspace,
         tmp_path / "run",
         ["check"],
-        RecordingSandbox(mutate),
+        RecordingSandbox(workspace.operation_context, mutate),
         10,
-        uuid4().hex,
+        workspace.operation_context["run_id"],
         verifier_path=verifier,
         verification_context=context,
     )
@@ -234,9 +274,9 @@ def test_verifier_requires_complete_trusted_context(
             workspace,
             tmp_path / "run",
             ["check"],
-            RecordingSandbox(),
+            RecordingSandbox(workspace.operation_context),
             10,
-            uuid4().hex,
+            workspace.operation_context["run_id"],
             verifier_path=path,
             verification_context=context,
         )
@@ -250,9 +290,9 @@ def test_verification_report_cannot_be_reused_for_another_context(
         workspace,
         tmp_path / "run",
         ["check"],
-        RecordingSandbox(),
+        RecordingSandbox(workspace.operation_context),
         10,
-        uuid4().hex,
+        workspace.operation_context["run_id"],
         verifier_path=verifier,
         verification_context=context,
     )
@@ -278,15 +318,29 @@ def test_verification_report_cannot_be_reused_for_another_context(
         "mount_injection",
     ],
 )
-def test_invalid_extra_mounts_are_rejected_before_docker(
+@pytest.mark.docker
+def test_invalid_extra_mounts_are_rejected_before_container_creation(
     workspace, tmp_path, monkeypatch, case
 ):
     sandbox = Sandbox()
-    monkeypatch.setattr(
-        sandbox,
-        "_docker",
-        lambda *args, **kwargs: pytest.fail("Unsafe mount reached Docker"),
+    docker = sandbox._docker
+    docker_calls = []
+    expected_probe = (
+        "ps",
+        "-aq",
+        "--no-trunc",
+        "--filter",
+        "label=doonex.run_id=" + workspace.operation_context["run_id"],
     )
+
+    def observe_only(*arguments, **options):
+        # Rejected mounts still need a real absence observation before settling.
+        # Any create/start/rm call fails rather than reaching the Docker daemon.
+        assert arguments == expected_probe, "Unsafe mount reached Docker execution"
+        docker_calls.append(arguments)
+        return docker(*arguments, **options)
+
+    monkeypatch.setattr(sandbox, "_docker", observe_only)
     extra = tmp_path / "skill"
     extra.mkdir()
     (extra / "SKILL.md").write_text("Use the workspace.")
@@ -319,8 +373,25 @@ def test_invalid_extra_mounts_are_rejected_before_docker(
         injected = tmp_path / "skill,dst=/outside"
         injected.mkdir(parents=True)
         arguments["skill_path"] = injected
-    with pytest.raises(SandboxError):
-        sandbox.run(workspace.path, "true", 10, uuid4().hex, **arguments)
+    message = "mutually exclusive" if case == "both" else "Mount validation failed"
+    with pytest.raises(SandboxError, match=message) as rejected:
+        sandbox.run(
+            workspace.path,
+            "true",
+            10,
+            workspace.operation_context["run_id"],
+            **sandbox_binding(workspace),
+            **arguments,
+        )
+    assert docker_calls == ([] if case == "both" else [expected_probe])
+    if case != "both":
+        assert not rejected.value.cleanup_unknown
+        assert rejected.value.cleanup_evidence["container_absence_confirmed"]
+        assert rejected.value.cleanup_evidence["container_snapshot_absence_confirmed"]
+        assert [
+            process["operation"]
+            for process in rejected.value.cleanup_evidence["processes"]
+        ] == ["mount_validation", "ps"]
 
 
 @pytest.mark.docker
@@ -350,21 +421,27 @@ for action in [lambda: Path('/skills/SKILL.md').write_text('bad'), lambda: Path(
 print('model boundary passed')
 """
     sandbox = Sandbox()
-    run_id = uuid4().hex
+    run_id = workspace.operation_context["run_id"]
     result = sandbox.run(
         workspace.path,
         "python - <<'PY'\n" + script + "\nPY",
         10,
         run_id,
         skill_path=skill,
+        **sandbox_binding(workspace),
     )
     assert (
         result["exit_code"] == 0 and result["output"].strip() == "model boundary passed"
     ), result
-    assert sandbox.containers(run_id) == []
+    assert sandbox.containers(run_id, **sandbox_binding(workspace)) == []
     # Explicit container execution can read a Skill script; import did not run it.
     result = sandbox.run(
-        workspace.path, "python /skills/scripts/check.py", 10, run_id, skill_path=skill
+        workspace.path,
+        "python /skills/scripts/check.py",
+        10,
+        run_id,
+        skill_path=skill,
+        **sandbox_binding(workspace),
     )
     assert (
         result["exit_code"] == 0 and result["output"].strip() == "explicit skill asset"
@@ -395,7 +472,7 @@ print('private verifier passed')
 """
     (verifier / "check.py").write_text(checker)
     context = verification_context(verifier)
-    run_id = uuid4().hex
+    run_id = workspace.operation_context["run_id"]
     report = Evidence.capture(
         workspace,
         tmp_path / "run",
@@ -416,4 +493,4 @@ print('private verifier passed')
     )["verified"]
     with tarfile.open(tmp_path / "run/evidence/snapshot.tar.gz") as archive:
         assert archive.getnames() == ["main.py"]
-    assert Sandbox().containers(run_id) == []
+    assert Sandbox().containers(run_id, **sandbox_binding(workspace)) == []
