@@ -149,6 +149,77 @@ def run_failure(request, hooks):
     return caught.value
 
 
+def observe_failure_lifecycle(request, monkeypatch):
+    """Observe the existing deadline/pipe; never supply another execution window."""
+    observed = {"deadlines": [], "reads": [], "eof": [], "closed": []}
+    original_deadline = process._deadline
+    original_frame, original_read = process._read_frame, os.read
+    original_close = process._Resources.close_all
+    output_fd = None
+
+    def deadline(value):
+        observed["deadlines"].append(value)
+        return original_deadline(value)
+
+    def frame(resources, fd, *args):
+        nonlocal output_fd
+        output_fd = fd
+        return original_frame(resources, fd, *args)
+
+    def read(fd, maximum):
+        value = original_read(fd, maximum)
+        if fd == output_fd:
+            observed["reads"].append(value)
+        return value
+
+    def close(resources):
+        try:
+            if resources.reap is not None and output_fd in resources.fds:
+                # Independent observation after actual waitpid, before the real
+                # close. Drain only this fixture's bounded output, without a wait
+                # or any replacement product deadline. The Run already failed.
+                for _ in range(65):
+                    try:
+                        tail = original_read(output_fd, 65536)
+                    except BlockingIOError:
+                        break
+                    if not tail:
+                        observed["eof"].append(dict(resources.reap))
+                        break
+        finally:
+            original_close(resources)
+            observed["closed"].append(not resources.fds and resources.selector is None)
+
+    monkeypatch.setattr(process, "_deadline", deadline)
+    monkeypatch.setattr(process, "_read_frame", frame)
+    monkeypatch.setattr(os, "read", read)
+    monkeypatch.setattr(process._Resources, "close_all", close)
+    return observed
+
+
+def assert_failed_lifecycle(request, hooks, error, observed):
+    assert observed["deadlines"]
+    assert set(observed["deadlines"]) == {request.deadline_monotonic_ns}
+    assert error.evidence["spawn_attempted"] and error.evidence["reaped"]
+    assert hooks.calls[-1][0] == "reaped"
+    completion = hooks.calls[-1][1]
+    assert completion["reap"]["pid"] == error.evidence["child_pid"]
+    assert completion["terminal_summary"]["outcome"] == "failed"
+    assert observed["eof"] and all(
+        receipt == completion["reap"] for receipt in observed["eof"]
+    )
+    assert observed["closed"] and all(observed["closed"])
+    assert all(
+        data["deadline_monotonic_ns"] == request.deadline_monotonic_ns
+        for state, data in hooks.calls
+        if state in {"prepared", "armed"}
+    )
+    with pytest.raises(ChildProcessError):
+        os.waitpid(error.evidence["child_pid"], os.WNOHANG)
+    assert not process.inspect_lease(process.LeaseSpec(request.lease.path)).locked
+
+
+
 def test_success_requires_reap_and_persistent_completion(setup, monkeypatch):
     request, hooks, _ = setup
     monkeypatch.setenv("DOONEX_DATABASE_URL", "must-not-inherit")
@@ -205,19 +276,60 @@ def test_hook_that_outlasts_deadline_does_not_authorize_next_phase(setup, state)
     "mode",
     ["extra", "nonzero", "mutate_alarm", "subprocess", "result_hang", "gil"],
 )
-def test_invalid_or_unfinished_terminal_is_reaped_and_unknown(setup, mode):
-    request, hooks, _ = setup
+def test_invalid_or_unfinished_terminal_is_reaped_and_unknown(setup, monkeypatch, mode):
+    request, hooks, runtime = setup
+    marker = request.lease.path.parent / "terminal-mode-entered.json"
+    transport = runtime / "responses_transport.py"
+    source = transport.read_text().replace("import ctypes\n", "import ctypes\nimport json\n")
+    branch = {
+        "extra": '    if mode in {"extra", "nonzero"}:\n',
+        "nonzero": '    if mode in {"extra", "nonzero"}:\n',
+        "mutate_alarm": '    if mode == "mutate_alarm":\n',
+        "subprocess": '    if mode == "subprocess":\n',
+        "result_hang": '        if mode == "result_hang":\n',
+        "gil": '        if mode == "gil":\n',
+    }[mode]
+    indent = " " * (len(branch) - len(branch.lstrip()) + 4)
+    assert source.count(branch) == 1
+    source = source.replace(
+        branch,
+        branch
+        + indent
+        + f"Path({str(marker)!r}).write_text(json.dumps(dict(mode=mode, pid=os.getpid(), "
+        + "deadline=arm['deadline_monotonic_ns'], entered=time.monotonic_ns())))\n",
+    )
+    transport.write_text(source)
+    # Old .35s included interpreter startup and could pass before this branch.
+    # One 2s absolute entry window now requires the named terminal fault itself;
+    # it is shared by bootstrap/ARM/read/reap and never refreshed at the marker.
     request = replace(
         request,
         call={"mode": mode},
-        deadline_monotonic_ns=time.monotonic_ns() + 350_000_000,
+        deadline_monotonic_ns=time.monotonic_ns() + 2_000_000_000,
     )
-    start = time.monotonic()
+    observed = observe_failure_lifecycle(request, monkeypatch)
     error = run_failure(request, hooks)
-    assert time.monotonic() - start < 1.6
-    assert error.evidence["reaped"]
-    assert hooks.calls[-1][0] == "reaped"
-    assert hooks.calls[-1][1]["terminal_summary"]["outcome"] == "failed"
+    assert marker.exists(), "The named terminal fault did not run"
+    entered = json.loads(marker.read_text())
+    assert entered["mode"] == mode and entered["pid"] == error.evidence["child_pid"]
+    assert entered["deadline"] == request.deadline_monotonic_ns
+    assert entered["entered"] < request.deadline_monotonic_ns
+    assert time.monotonic_ns() < request.deadline_monotonic_ns + 1_500_000_000
+    assert [state for state, _ in hooks.calls] == ["prepared", "armed", "reaped"]
+    reasons = {
+        "extra": {"extra_frame"},
+        "nonzero": {"child_exit"},
+        "mutate_alarm": {"early_eof"},
+        "subprocess": {"early_eof"},
+        "result_hang": {"deadline"},
+        "gil": {"deadline", "early_eof"},
+    }
+    assert error.reason in reasons[mode]
+    if mode in {"extra", "nonzero", "result_hang"}:
+        assert hooks.calls[-1][1]["terminal_summary"]["kind"] == "result"
+    if mode == "nonzero":
+        assert hooks.calls[-1][1]["reap"]["exit_code"] == 23
+    assert_failed_lifecycle(request, hooks, error, observed)
 
 
 @pytest.mark.parametrize("at", [1, 2, 3])
@@ -446,8 +558,9 @@ def test_corrupt_terminal_never_returns_response(setup, mode):
 
 
 @pytest.mark.parametrize("mode", ["pid", "nonce", "partial"])
-def test_bad_ready_never_authorizes_arm(setup, mode):
+def test_bad_ready_never_authorizes_arm(setup, monkeypatch, mode):
     request, hooks, runtime = setup
+    marker = request.lease.path.parent / "mutated-ready.json"
     additions = {
         "pid": "envelope = dict(envelope, pid=envelope['pid'] + 1)",
         "nonce": "envelope = dict(envelope, nonce='0' * 64)",
@@ -455,16 +568,39 @@ def test_bad_ready_never_authorizes_arm(setup, mode):
     }
     with (runtime / "responses_protocol.py").open("a") as output:
         output.write(
-            "\n_original_encode = encode_frame\ndef encode_frame(envelope, kind):\n    if kind == 'ready':\n        "
+            "\nimport os, sys, time\n_original_encode = encode_frame\ndef encode_frame(envelope, kind):\n    if kind == 'ready':\n"
+            + f"        with open({str(marker)!r}, 'w') as receipt:\n"
+            + "            receipt.write(json.dumps(dict(pid=os.getpid(), deadline=int(sys.argv[4]), entered=time.monotonic_ns())))\n"
+            + "        "
             + additions[mode]
             + "\n    return _original_encode(envelope, kind)\n"
         )
-    error = run_failure(
-        replace(request, deadline_monotonic_ns=time.monotonic_ns() + 200_000_000), hooks
-    )
-    assert error.evidence["reaped"]
-    assert all(state != "armed" for state, _ in hooks.calls)
+    # Old .2s could expire before child READY. This single 1s startup window
+    # requires both the mutation marker and its actual bytes in the parent pipe.
+    request = replace(request, deadline_monotonic_ns=time.monotonic_ns() + 1_000_000_000)
+    observed = observe_failure_lifecycle(request, monkeypatch)
+    error = run_failure(request, hooks)
+    assert marker.exists(), "Child never constructed the mutated READY"
+    entered = json.loads(marker.read_text())
+    assert entered["pid"] == error.evidence["child_pid"]
+    assert entered["deadline"] == request.deadline_monotonic_ns
+    assert entered["entered"] < request.deadline_monotonic_ns
+    received = b"".join(observed["reads"])
+    if mode == "partial":
+        assert received == b"\x00\x00\x00\x20{"
+        assert error.reason in {"deadline", "early_eof"}
+    else:
+        ready = json.loads(received[4:])
+        assert int.from_bytes(received[:4], "big") == len(received) - 4
+        if mode == "pid":
+            assert ready["pid"] == entered["pid"] + 1
+            assert error.reason == "child_identity"
+        else:
+            assert ready["nonce"] == "0" * 64
+            assert error.reason == "ready"
+    assert [state for state, _ in hooks.calls] == ["prepared", "reaped"]
     assert not Path(request.call["marker"]).exists()
+    assert_failed_lifecycle(request, hooks, error, observed)
 
 
 def test_extra_arm_is_rejected_before_transport_import(setup, monkeypatch):
@@ -522,19 +658,35 @@ def test_cleanup_operation_failure_does_not_skip_later_cleanup(
     setup, monkeypatch, operation
 ):
     request, hooks, _ = setup
+    marker = request.lease.path.parent / "dispatch-cleanup"
+    # Old .18s could stop before ARM and never inject the intended cleanup fault.
+    # One 1s absolute window must reach the real hanging transport; the fault
+    # below is admitted only inside the existing finite cleanup, never startup.
     request = replace(
         request,
-        call={"mode": "hang"},
-        deadline_monotonic_ns=time.monotonic_ns() + 180_000_000,
+        call={"mode": "hang", "marker": str(marker)},
+        deadline_monotonic_ns=time.monotonic_ns() + 1_000_000_000,
     )
-    real_wait, real_kill, real_sleep = os.waitpid, os.kill, time.sleep
-    count = 0
+    observed = observe_failure_lifecycle(request, monkeypatch)
+    real_cleanup = process._Resources.cleanup
+    cleanup, injected = [], []
+    active = False
+
+    def cleaning(resources):
+        nonlocal active
+        cleanup.append((resources.pid, marker.exists()))
+        active = True
+        try:
+            return real_cleanup(resources)
+        finally:
+            active = False
+
+    monkeypatch.setattr(process._Resources, "cleanup", cleaning)
 
     def once(real):
         def invoke(*args, **kwargs):
-            nonlocal count
-            count += 1
-            if count == 1:
+            if active and not injected:
+                injected.append(operation)
                 raise OSError(errno.EIO, "synthetic cleanup failure")
             return real(*args, **kwargs)
 
@@ -546,18 +698,19 @@ def test_cleanup_operation_failure_does_not_skip_later_cleanup(
 
         def skip_initial_poll(self):
             nonlocal skipped
-            skipped += 1
-            if skipped <= (2 if operation == "pause" else 1):
-                return
+            if active:
+                skipped += 1
+                if skipped <= (2 if operation == "pause" else 1):
+                    return
             return original_poll(self)
 
         monkeypatch.setattr(process._Resources, "poll_reap", skip_initial_poll)
     if operation == "wait":
-        monkeypatch.setattr(os, "waitpid", once(real_wait))
+        monkeypatch.setattr(os, "waitpid", once(os.waitpid))
     elif operation == "signal":
-        monkeypatch.setattr(os, "kill", once(real_kill))
+        monkeypatch.setattr(os, "kill", once(os.kill))
     elif operation == "pause":
-        monkeypatch.setattr(time, "sleep", once(real_sleep))
+        monkeypatch.setattr(time, "sleep", once(time.sleep))
     elif operation == "selector_close":
         selector_type = (
             selectors.KqueueSelector
@@ -568,17 +721,18 @@ def test_cleanup_operation_failure_does_not_skip_later_cleanup(
 
         def close_selector(self):
             real_close(self)
-            raise OSError(errno.EIO, "synthetic after close")
+            if active and not injected:
+                injected.append(operation)
+                raise OSError(errno.EIO, "synthetic after close")
 
         monkeypatch.setattr(selector_type, "close", close_selector)
     elif operation == "close":
         real_close = os.close
 
         def close_fd(fd):
-            nonlocal count
             real_close(fd)
-            count += 1
-            if count == 1:
+            if active and not injected:
+                injected.append(operation)
                 raise InterruptedError()
 
         monkeypatch.setattr(os, "close", close_fd)
@@ -586,25 +740,22 @@ def test_cleanup_operation_failure_does_not_skip_later_cleanup(
         real_mask = signal.pthread_sigmask
 
         def mask(how, values):
-            # Fail only when outer finite cleanup begins, after ARM dispatch.
-            if Path(request.lease.path.parent / "dispatch-cleanup").exists():
+            # The outer cleanup's mask precedes _Resources.cleanup itself.
+            if marker.exists() and how == signal.SIG_BLOCK and not injected:
+                injected.append(operation)
                 raise OSError(errno.EIO, "synthetic mask failure")
             return real_mask(how, values)
 
-        request = replace(
-            request,
-            call={
-                "mode": "hang",
-                "marker": str(request.lease.path.parent / "dispatch-cleanup"),
-            },
-        )
         monkeypatch.setattr(signal, "pthread_sigmask", mask)
-    start = time.monotonic()
     error = run_failure(request, hooks)
-    assert time.monotonic() - start < 1.6
-    assert error.evidence["reaped"]
-    assert error.evidence["errors"]
-    assert hooks.calls[-1][0] == "reaped"
+    assert marker.read_text() == "dispatched"
+    assert cleanup == [(error.evidence["child_pid"], True)]
+    assert injected == [operation], "The named cleanup operation was never reached"
+    assert time.monotonic_ns() < request.deadline_monotonic_ns + 1_500_000_000
+    code = {"pause": "cleanup_pause", "mask": "signal_mask"}.get(operation, operation)
+    assert code in error.evidence["errors"]
+    assert [state for state, _ in hooks.calls] == ["prepared", "armed", "reaped"]
+    assert_failed_lifecycle(request, hooks, error, observed)
 
 
 def test_unresolved_reap_stays_blocked_with_finite_cleanup(setup, monkeypatch):
@@ -710,20 +861,50 @@ def test_cleanup_control_exception_is_not_swallowed(setup, monkeypatch):
     assert hooks.calls[-1][0] == "reaped"
 
 
-def test_valid_error_with_late_completion_is_rejected(setup):
+def test_valid_error_with_late_completion_is_rejected(setup, monkeypatch):
     request, hooks, _ = setup
-    hooks.delay = "reaped"
-    hooks.delay_deadline_ns = time.monotonic_ns() + 1_000_000_000
-    error = run_failure(
-        replace(
-            request,
-            call={"mode": "error"},
-            deadline_monotonic_ns=time.monotonic_ns() + 1_000_000_000,
-        ),
-        hooks,
+    # Keep the existing 1s execution contract; use one exact absolute value for
+    # the helper and delayed completion so no second clock grants extra time.
+    request = replace(
+        request,
+        call={"mode": "error"},
+        deadline_monotonic_ns=time.monotonic_ns() + 1_000_000_000,
     )
+    hooks.delay = "reaped"
+    hooks.delay_deadline_ns = request.deadline_monotonic_ns
+    original_callback = hooks.callback
+    completion = []
+
+    def callback(state):
+        original = original_callback(state)
+        if state != "reaped":
+            return original
+
+        def delayed(data):
+            record = {"entered": time.monotonic_ns(), "data": data}
+            completion.append(record)
+            try:
+                return original(data)
+            finally:
+                record["returned"] = time.monotonic_ns()
+
+        return delayed
+
+    hooks.callback = callback
+    observed = observe_failure_lifecycle(request, monkeypatch)
+    error = run_failure(request, hooks)
+    assert len(completion) == 1
+    entered = completion[0]
+    assert entered["entered"] < request.deadline_monotonic_ns < entered["returned"]
+    assert entered["data"]["terminal_summary"] == {
+        "kind": "error",
+        "outcome": "failed",
+        "reason": "helper_error",
+    }
+    assert entered["data"]["reap"]["exit_code"] == 0
+    assert [state for state, _ in hooks.calls] == ["prepared", "armed", "reaped"]
     assert error.reason == "deadline"
-    assert error.evidence["reaped"]
+    assert_failed_lifecycle(request, hooks, error, observed)
 
 
 def test_bootstrap_closes_ambient_inheritable_descriptors(setup):
