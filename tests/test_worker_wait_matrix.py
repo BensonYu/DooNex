@@ -132,6 +132,11 @@ def test_actual_worker_wait_timeline(
             + MIT_BODY
             + "\n"
         )
+        # The private evidence runner intentionally uses umask 0077. The
+        # derivative import contract accepts 0644/0755 assets, so construct
+        # this known synthetic parent explicitly without changing that guard.
+        for name in ("SKILL.md", "LICENSE"):
+            (parent_path / name).chmod(0o644)
         parent = library.import_skill(
             parent_path,
             {
@@ -140,6 +145,11 @@ def test_actual_worker_wait_timeline(
                 "license_text": "MIT",
             },
         )
+        _, frozen_parent_files = library.skills._load(
+            parent["version_id"], parent["report_sha256"]
+        )
+        assert set(frozen_parent_files) == {"SKILL.md", "LICENSE"}
+        assert all(content.mode == 0o644 for content in frozen_parent_files.values())
         library.review(parent["version_id"], "approved", "Synthetic test fixture")
         project = store.set_project(
             {
