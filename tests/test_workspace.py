@@ -5,9 +5,12 @@ import subprocess
 import sys
 import time
 
+import controller_test_support
 import pytest
 from doonex.deadline import ExecutionDeadlineExceeded
 from doonex.workspace import Workspace, WorkspaceError, read_files
+
+controller_registry = controller_test_support.controller_registry
 
 
 def git(path, *args):
@@ -17,7 +20,7 @@ def git(path, *args):
 
 
 @pytest.fixture
-def repository(tmp_path):
+def repository(tmp_path, controller_registry):
     root = tmp_path / "project"
     root.mkdir()
     git(root, "init", "-q")
@@ -393,7 +396,9 @@ def test_export_deadline_includes_copy_and_preserves_local_limit(
 
 
 @pytest.mark.parametrize("stream", ["stdout", "stderr"])
-def test_git_pipe_overflow_terminates_and_reaps_child(monkeypatch, stream):
+def test_git_pipe_overflow_terminates_and_reaps_child(
+    monkeypatch, stream, tmp_path, controller_registry
+):
     import doonex.workspace as module
 
     processes = []
@@ -408,12 +413,19 @@ def test_git_pipe_overflow_terminates_and_reaps_child(monkeypatch, stream):
     monkeypatch.setattr(module, "MAX_GIT_STDERR_BYTES", 32)
     output_fd = 1 if stream == "stdout" else 2
     code = f"import os,time; os.write({output_fd}, b'x'*65536); time.sleep(30)"
-    with pytest.raises(WorkspaceError, match=stream + " limit"):
+    deadline = time.monotonic() + 3
+    with (
+        pytest.raises(WorkspaceError, match=stream + " limit"),
+        module._controller_group(
+            tmp_path, "git_api_read", deadline, intent=("controlled-pipe-overflow",)
+        ) as controller,
+    ):
         module._run_git_command(
             [sys.executable, "-c", code],
             os.environ.copy(),
-            deadline=time.monotonic() + 3,
+            deadline=deadline,
             stdout_limit=32,
+            controller=controller,
         )
     assert len(processes) == 1
     assert processes[0].returncode is not None
@@ -421,7 +433,9 @@ def test_git_pipe_overflow_terminates_and_reaps_child(monkeypatch, stream):
 
 
 @pytest.mark.parametrize("outer", [False, True])
-def test_git_timeout_reaps_child_and_preserves_outer_marker(monkeypatch, outer):
+def test_git_timeout_reaps_child_and_preserves_outer_marker(
+    monkeypatch, outer, tmp_path, controller_registry
+):
     import doonex.workspace as module
 
     processes = []
@@ -435,13 +449,19 @@ def test_git_timeout_reaps_child_and_preserves_outer_marker(monkeypatch, outer):
     monkeypatch.setattr(module.subprocess, "Popen", observe)
     deadline = time.monotonic() + 0.1
     expected = ExecutionDeadlineExceeded if outer else WorkspaceError
-    with pytest.raises(expected):
+    with (
+        pytest.raises(expected),
+        module._controller_group(
+            tmp_path, "git_api_read", deadline, intent=("controlled-timeout",)
+        ) as controller,
+    ):
         module._run_git_command(
             [sys.executable, "-c", "import time; time.sleep(30)"],
             os.environ.copy(),
             deadline=deadline,
             stdout_limit=32,
             outer_deadline=deadline if outer else None,
+            controller=controller,
         )
     assert processes[0].returncode is not None
     assert processes[0].stdout.closed and processes[0].stderr.closed
@@ -466,11 +486,12 @@ def test_reaped_git_leader_is_not_signaled_again(monkeypatch):
     assert process.stdout.closed and process.stderr.closed
 
 
-def test_pipe_eof_unknown_records_reaped_child(monkeypatch):
+def test_pipe_eof_unknown_records_reaped_child(
+    monkeypatch, tmp_path, controller_registry
+):
     import doonex.workspace as module
 
     child_ids = []
-    monkeypatch.setattr(module, "GIT_CLEANUP_TIMEOUT", 0.1)
     code = (
         "import subprocess,sys; "
         "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']); "
@@ -481,13 +502,26 @@ def test_pipe_eof_unknown_records_reaped_child(monkeypatch):
         child_ids.extend(int(value) for value in chunk.split())
 
     try:
-        with pytest.raises(module.WorkspaceProcessUnknown) as captured:
+        deadline = time.monotonic() + 0.2
+        with (
+            pytest.raises(module.WorkspaceProcessUnknown) as captured,
+            module._controller_group(
+                tmp_path,
+                "git_api_read",
+                deadline,
+                intent=("controlled-inherited-pipe",),
+            ) as controller,
+        ):
+            # Keep the persisted allowance's integer contract; only the actual
+            # test cleanup is shortened to expose the inherited-pipe boundary.
+            monkeypatch.setattr(module, "GIT_CLEANUP_TIMEOUT", 0.1)
             module._run_git_command(
                 [sys.executable, "-c", code],
                 os.environ.copy(),
-                deadline=time.monotonic() + 0.2,
+                deadline=deadline,
                 stdout_limit=128,
                 consume=consume,
+                controller=controller,
             )
         evidence = captured.value.cleanup_evidence
         assert evidence["local_process_unknown"] is True
