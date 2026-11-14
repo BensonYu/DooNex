@@ -202,6 +202,7 @@ def build_real_checkpoints(tuning, store, request_data, tmp_path, monkeypatch, c
     observations, selected, queued = [], [], []
     stage = {"cancel_after_census": False, "remaining": set(), "active": None}
     original_execute = Worker.execute
+    original_reserve = Ledger.reserve
     original_resume = Scheduler.resume_yielded
     original_containers = Sandbox.containers
 
@@ -217,6 +218,15 @@ def build_real_checkpoints(tuning, store, request_data, tmp_path, monkeypatch, c
         finally:
             observe("actual_execute_returned", run_id=run_id)
             stage["active"] = None
+
+    def reserve(ledger, *args, **kwargs):
+        result = original_reserve(ledger, *args, **kwargs)
+        observe(
+            "actual_model_admission_commit_returned",
+            run_id=ledger.run_id,
+            action_id=result["id"],
+        )
+        return result
 
     def containers(sandbox, run_id, *args, **kwargs):
         result = original_containers(sandbox, run_id, *args, **kwargs)
@@ -247,10 +257,16 @@ def build_real_checkpoints(tuning, store, request_data, tmp_path, monkeypatch, c
         if not run["request"].get("background"):
             return response("finish", {"message": "Synthetic capacity foreground"}, 0)
         assert not queued
+        before = time.monotonic()
         foreground = store.create_run(foreground_request)
+        after = time.monotonic()
         register_owned(run_ids=[foreground["id"]])
         queued.append(foreground["id"])
-        observe("synthetic_user_enqueue_commit_returned", run_id=foreground["id"])
+        observe(
+            "synthetic_user_enqueue_commit_returned",
+            run_id=foreground["id"],
+            enqueue_commit_bracket_monotonic=[before, after],
+        )
         answer = response("doonex_shell", {"command": "touch forbidden-replay"}, 0)
         answer.choices[0].message.tool_calls.extend(
             response("finish", {"message": "Synthetic yielded capacity"}, 1)
@@ -260,6 +276,7 @@ def build_real_checkpoints(tuning, store, request_data, tmp_path, monkeypatch, c
         return answer
 
     monkeypatch.setattr(Worker, "execute", execute)
+    monkeypatch.setattr(Ledger, "reserve", reserve)
     monkeypatch.setattr(Scheduler, "resume_yielded", resume)
     monkeypatch.setattr(Sandbox, "containers", containers)
     monkeypatch.setattr(sdk.GuardedLLM, "_transport_call", transport)
@@ -414,8 +431,14 @@ def test_actual_worker_complete_yielded_census(
             if event["kind"] == "actual_resume_yielded_returned"
         ]
         selected = checkpoints.selected[selected_offset:]
+        admissions = [
+            event
+            for event in events
+            if event["kind"] == "actual_model_admission_commit_returned"
+        ]
+        waiting = None
         if scenario == "overflow":
-            assert not probes and not resumed and not selected
+            assert not probes and not resumed and not selected and not admissions
         else:
             assert [event["run_id"] for event in resumed] == [
                 run["id"] for run in checkpoints.yielded
@@ -425,12 +448,30 @@ def test_actual_worker_complete_yielded_census(
                 run["id"] for run in checkpoints.yielded
             ]
             if scenario == "tail_container":
-                assert not selected
+                assert not selected and not admissions
                 assert container_id in probes[count - 1]["containers"]
             else:
                 assert selected == [checkpoints.foreground["id"]]
                 final = store.get(checkpoints.foreground["id"])
                 assert final["state"] == "completed_verified", final["reason"]
+                assert [event["run_id"] for event in admissions] == [final["id"]]
+                enqueue = next(
+                    event
+                    for event in checkpoints.observations
+                    if event["kind"] == "synthetic_user_enqueue_commit_returned"
+                    and event["run_id"] == final["id"]
+                )["enqueue_commit_bracket_monotonic"]
+                admitted = admissions[0]["monotonic"]
+                assert enqueue[0] <= enqueue[1] <= started <= admitted <= finished
+                waiting = {
+                    "enqueue_commit_bracket_monotonic": enqueue,
+                    "first_model_admission_commit_returned_monotonic": admitted,
+                    "worker_entry_to_admission_seconds": admitted - started,
+                    "submit_to_first_admission_seconds": {
+                        "lower": admitted - enqueue[1],
+                        "upper": admitted - enqueue[0],
+                    },
+                }
         after = [
             checkpoint_binding(store.get(run["id"])) for run in checkpoints.yielded
         ]
@@ -460,6 +501,7 @@ def test_actual_worker_complete_yielded_census(
                     "worker_returned_monotonic": finished,
                     "events": events,
                     "selected": selected,
+                    "foreground_wait": waiting,
                     "checkpoint_bindings": before,
                     "fixture_setup": fixture_setup,
                     "background_accounting_preserved": True,
