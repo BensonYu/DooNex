@@ -233,15 +233,15 @@ class Arena:
             )
         with self.store.connect() as c:
             check_deadline(deadline)
-            query = (
-                "SELECT id,state,data FROM arena_evaluations"
-                + condition
-                + " ORDER BY data->>'created_at' DESC,id"
-            )
+            query = "SELECT id,state,data FROM arena_evaluations" + condition
             parameters = ()
             if capacity is not None:
-                query += " LIMIT %s"
+                # Match arena_state_order_v1 so a bounded startup census does
+                # not sort every matching row before returning cap + 1.
+                query += " ORDER BY state,data->>'created_at' DESC,id LIMIT %s"
                 parameters = (capacity + 1,)
+            else:
+                query += " ORDER BY data->>'created_at' DESC,id"
             cursor = c.execute(query, parameters)
             check_deadline(deadline)
             values = []

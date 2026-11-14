@@ -1,5 +1,6 @@
 """Finite Arena maintenance on actual PostgreSQL, without model dispatch."""
 
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -168,6 +169,67 @@ def test_cap_plus_one_census_never_silently_hides_active_batches(
     with pytest.raises(ValueError, match="超过维护容量"):
         arena.list(states=ACTIVE_BATCHES, capacity=64, deadline=101.0)
     assert rows(store) == before
+
+
+def test_capped_census_uses_existing_index_without_historical_sort(
+    settings, store, monkeypatch
+):
+    arena = Arena(settings, store)
+    created = now()
+    records = []
+    for index in range(10_065):
+        identifier = str(uuid4())
+        state = "complete" if index < 10_000 else sorted(ACTIVE_BATCHES)[index % 3]
+        records.append(
+            (
+                identifier,
+                state,
+                Jsonb({"id": identifier, "state": state, "created_at": created}),
+            )
+        )
+    with store.connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                "INSERT INTO arena_evaluations(id,state,data) VALUES(%s,%s,%s)",
+                records,
+            )
+        connection.execute("ANALYZE arena_evaluations")
+        index = connection.execute(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname=current_schema() "
+            "AND indexname='arena_state_order_v1'"
+        ).fetchone()["indexdef"]
+    clock_at(monkeypatch)
+    statements = observe_connections(monkeypatch, store)
+    with pytest.raises(ValueError, match="超过维护容量"):
+        arena.list(states=ACTIVE_BATCHES, capacity=64, deadline=101.0)
+    query, parameters = statements[-1]
+    assert "ORDER BY state,data->>'created_at' DESC,id LIMIT %s" in query
+    assert parameters == (65,)
+    plans = {}
+    with store.connect() as connection:
+        for mode in ("natural", "seqscan_off_index_applicability_only"):
+            if mode != "natural":
+                connection.execute("SET LOCAL enable_seqscan=off")
+            plans[mode] = connection.execute(
+                "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + query, parameters
+            ).fetchone()["QUERY PLAN"][0]
+
+    def nodes(value):
+        yield value
+        for child in value.get("Plans", []):
+            yield from nodes(child)
+
+    for plan in plans.values():
+        actual = list(nodes(plan["Plan"]))
+        assert not {"Sort", "Incremental Sort", "Seq Scan"} & {
+            node["Node Type"] for node in actual
+        }
+        assert any(node.get("Index Name") == "arena_state_order_v1" for node in actual)
+        assert plan["Plan"]["Actual Rows"] == 65
+    # The natural plan is the measured 10k-history sample. Disabling seqscan
+    # separately demonstrates index applicability, never a general planner or
+    # end-to-end wait guarantee. Preserve both actual plans in the test receipt.
+    print(json.dumps({"index_definition": index, "plans": plans}, indent=2))
 
 
 @pytest.mark.parametrize("binding", ["id", "state", "unknown_state"])
