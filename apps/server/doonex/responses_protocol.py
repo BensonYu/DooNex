@@ -735,6 +735,107 @@ def validate_response(response: dict) -> dict:
     return response
 
 
+def _project_provider_core(response):
+    """Validate added provider detail before rebuilding the pinned core shape."""
+    projected = {
+        key: value for key, value in response.items() if key in RESPONSE_FIELDS
+    }
+    if response.get("tools") is not None:
+        tools = response["tools"]
+        _require(type(tools) is list and len(tools) <= 2)
+        projected["tools"] = []
+        for tool in tools:
+            _fields(
+                tool,
+                {"type", "name", "description", "parameters"},
+                {"strict", "allowed_callers", "defer_loading", "output_schema"},
+            )
+            for name in ("allowed_callers", "defer_loading", "output_schema"):
+                _require(tool.get(name) is None)
+            projected["tools"].append(
+                {
+                    key: value
+                    for key, value in tool.items()
+                    if key not in {"allowed_callers", "defer_loading", "output_schema"}
+                }
+            )
+    if response.get("reasoning") is not None:
+        value = response["reasoning"]
+        _fields(value, set(), {"effort", "summary", "context", "mode"})
+        _require(value.get("context") in {None, "all_turns"})
+        _require(value.get("mode") in {None, "standard"})
+        projected["reasoning"] = {
+            key: item for key, item in value.items() if key not in {"context", "mode"}
+        }
+    if response.get("usage") is not None:
+        usage = response["usage"]
+        _fields(
+            usage,
+            {"input_tokens", "output_tokens", "total_tokens"},
+            {"input_tokens_details", "output_tokens_details", "cost", "attribution"},
+        )
+        projected["usage"] = {
+            key: item for key, item in usage.items() if key != "attribution"
+        }
+        details = usage.get("input_tokens_details")
+        if details is not None:
+            _require(type(details) is dict)
+            if details.get("cache_write_tokens") is not None:
+                _int(details["cache_write_tokens"], 0, 0)
+            projected["usage"]["input_tokens_details"] = {
+                key: item
+                for key, item in details.items()
+                if key != "cache_write_tokens"
+            }
+        # First prove the unchanged aggregate and existing detail counters.
+        _usage(projected["usage"])
+        if usage.get("attribution") is not None:
+            attribution = usage["attribution"]
+            _fields(attribution, set(), {"items", "request_fields"})
+
+            def counters(value, *, content=False):
+                fields = {
+                    "input_tokens",
+                    "output_tokens",
+                    "cached_tokens",
+                    "cache_write_tokens",
+                }
+                _fields(value, fields, {"content"} if content else set())
+                for key in fields:
+                    _int(
+                        value[key],
+                        0,
+                        usage["output_tokens"]
+                        if key == "output_tokens"
+                        else usage["input_tokens"],
+                    )
+                _require(
+                    value["cached_tokens"] + value["cache_write_tokens"]
+                    <= value["input_tokens"]
+                )
+                if "content" in value:
+                    _require(
+                        type(value["content"]) is list and len(value["content"]) <= 4096
+                    )
+                    for item in value["content"]:
+                        counters(item)
+
+            if "items" in attribution:
+                _require(
+                    type(attribution["items"]) is dict
+                    and len(attribution["items"]) <= 4096
+                )
+                for key, value in attribution["items"].items():
+                    _identifier(key)
+                    counters(value, content=True)
+            if "request_fields" in attribution:
+                values = attribution["request_fields"]
+                _fields(values, set(), {"instructions", "tools"})
+                for value in values.values():
+                    counters(value)
+    return projected
+
+
 def project_provider_response(response: dict) -> dict:
     """Validate known API metadata and the strict executable core separately.
 
@@ -820,10 +921,8 @@ def project_provider_response(response: dict) -> dict:
                         _int(count, 0, 0)
     except (ProtocolError, ValueError, TypeError):
         raise ProviderResponseError("response_metadata") from None
-    projected = {
-        key: value for key, value in response.items() if key in RESPONSE_FIELDS
-    }
     try:
+        projected = _project_provider_core(response)
         return validate_response(projected)
     except ProtocolError:
         raise ProviderResponseError("response_schema") from None

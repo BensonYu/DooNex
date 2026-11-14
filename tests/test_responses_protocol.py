@@ -423,6 +423,107 @@ def default_provider_metadata():
     }
 
 
+def provider_response(core=None):
+    response = copy.deepcopy(core if core is not None else sample_response())
+    response.update(default_provider_metadata())
+    response["tools"] = [
+        {
+            "type": "function",
+            "name": "finish",
+            "description": "Finish the synthetic task",
+            "parameters": {
+                "type": "object",
+                "properties": {"message": {"type": "string"}},
+            },
+            "strict": False,
+            "output_schema": None,
+            "allowed_callers": None,
+            "defer_loading": None,
+        }
+    ]
+    response["reasoning"] = {
+        "effort": "high",
+        "summary": None,
+        "context": "all_turns",
+        "mode": "standard",
+    }
+    response["usage"]["input_tokens_details"]["cache_write_tokens"] = 0
+    response["usage"]["attribution"] = {
+        "items": {
+            "msg_synthetic": {
+                "input_tokens": 20,
+                "output_tokens": 0,
+                "cached_tokens": 2,
+                "cache_write_tokens": 0,
+                "content": [
+                    {
+                        "input_tokens": 20,
+                        "output_tokens": 0,
+                        "cached_tokens": 2,
+                        "cache_write_tokens": 0,
+                    }
+                ],
+            }
+        },
+        "request_fields": {
+            "tools": {
+                "input_tokens": 30,
+                "output_tokens": 0,
+                "cached_tokens": 0,
+                "cache_write_tokens": 0,
+            }
+        },
+    }
+    return response
+
+
+def test_provider_core_detail_is_validated_without_changing_aggregate_usage():
+    response = provider_response()
+    before = copy.deepcopy(response)
+    projected = protocol.project_provider_response(response)
+    assert response == before
+    assert projected["usage"] == sample_response()["usage"]
+    assert projected["reasoning"] == {"effort": "high", "summary": None}
+    assert all(
+        tool.keys() <= {"type", "name", "description", "parameters", "strict"}
+        for tool in projected["tools"]
+    )
+    assert protocol.validate_response(projected) == projected
+
+
+@pytest.mark.parametrize(
+    "path,value",
+    [
+        (("tools", 0, "output_schema"), {}),
+        (("tools", 0, "allowed_callers"), []),
+        (("tools", 0, "defer_loading"), False),
+        (("tools", 0, "name"), "web_search"),
+        (("reasoning", "context"), "last_turn"),
+        (("reasoning", "mode"), "fast"),
+        (("reasoning", "unverified"), None),
+        (("usage", "input_tokens_details", "cache_write_tokens"), 1),
+        (("usage", "attribution", "items", "msg_synthetic", "input_tokens"), 101),
+        (("usage", "attribution", "items", "msg_synthetic", "output_tokens"), 21),
+        (("usage", "attribution", "items", "msg_synthetic", "cached_tokens"), True),
+        (("usage", "attribution", "items", "msg_synthetic", "cached_tokens"), 21),
+        (("usage", "attribution", "items", "msg_synthetic", "content"), [{}]),
+        (("usage", "attribution", "request_fields", "unverified"), {}),
+        (("usage", "attribution", "unverified"), None),
+    ],
+)
+def test_provider_detail_projection_rejects_behavior_changes_and_invalid_counts(
+    path, value
+):
+    response = provider_response()
+    target = response
+    for part in path[:-1]:
+        target = target[part]
+    target[path[-1]] = value
+    with pytest.raises(protocol.ProviderResponseError) as error:
+        protocol.project_provider_response(response)
+    assert error.value.reason == "response_schema"
+
+
 def test_provider_metadata_is_validated_and_projected_before_pinned_sdk():
     response = sample_response()
     provider = {**response, **default_provider_metadata()}

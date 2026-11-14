@@ -13,7 +13,7 @@ from doonex import responses_protocol as protocol
 from doonex import responses_transport as transport
 from test_responses_protocol import (
     CLIENT_ID,
-    default_provider_metadata,
+    provider_response,
     sample_arm,
     sample_response,
 )
@@ -136,10 +136,7 @@ def test_native_success_preserves_pinned_response_and_narrow_private_cost(monkey
 
 
 def test_native_provider_metadata_is_checked_then_removed_from_wire(monkeypatch):
-    body = {
-        **sample_response(),
-        **default_provider_metadata(),
-    }
+    body = provider_response()
     terminal, stream, calls, hooks = execute_mock(monkeypatch, body=body)
     assert terminal["kind"] == "result"
     assert not (terminal["response"].keys() & protocol.PROVIDER_METADATA_FIELDS)
