@@ -172,10 +172,29 @@ class _GitControllerGroup:
                     "docker": None,
                 }
             )
+            return False
         else:
             self.operation.mark_unknown(
                 "supervision_unknown" if not self.terminal else "interrupted"
             )
+            return True
+
+
+def _controller_error(error, operation, *, record_unknown):
+    """Keep one returned operation's identity alongside original observations."""
+    observed = getattr(error, "cleanup_evidence", None)
+    evidence = dict(observed) if isinstance(observed, dict) else {}
+    evidence.update(
+        controller_operation_id=operation.operation_id,
+        controller_record_unknown=record_unknown,
+    )
+    error.cleanup_evidence = evidence
+    error.cleanup_unknown = bool(
+        getattr(error, "cleanup_unknown", False)
+        or record_unknown
+        or evidence.get("local_process_unknown")
+        or evidence.get("daemon_request_unknown")
+    )
 
 
 def _git_intent(repository, kind, intent):
@@ -230,18 +249,31 @@ def _controller_group(repository, kind, deadline, *, intent=(), operation_contex
         cleanup_allowance_seconds=GIT_CLEANUP_TIMEOUT,
         **context,
     )
-    capability = operation.launch()
-    group = _GitControllerGroup(registry, operation, capability)
+    group = None
     try:
+        capability = operation.launch()
+        group = _GitControllerGroup(registry, operation, capability)
         yield group
     except BaseException as error:
+        if group is None:
+            # Launch may have committed before its acknowledgement was lost.
+            # Preserve the real returned ID, without guessing or replaying it.
+            _controller_error(error, operation, record_unknown=True)
+            raise
         try:
-            group.finish(error)
+            record_unknown = group.finish(error)
         except BaseException as registry_error:
+            _controller_error(error, operation, record_unknown=True)
+            _controller_error(registry_error, operation, record_unknown=True)
             raise registry_error from error
+        _controller_error(error, operation, record_unknown=record_unknown)
         raise
     else:
-        group.finish()
+        try:
+            group.finish()
+        except BaseException as error:
+            _controller_error(error, operation, record_unknown=True)
+            raise
 
 
 def _check_git_deadline(deadline: float, outer_deadline: float | None) -> None:
@@ -1069,12 +1101,15 @@ class Workspace:
                     controller=controller,
                     operation_context=operation_context,
                 )
-        except ExecutionDeadlineExceeded:
-            _check_deadline(deadline)
+        except ExecutionDeadlineExceeded as error:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise
             # A larger outer allowance never widens the export's local limit.
-            raise _GitLocalDeadlineExceeded(
-                "Project export deadline exceeded"
-            ) from None
+            local_error = _GitLocalDeadlineExceeded("Project export deadline exceeded")
+            if isinstance(getattr(error, "cleanup_evidence", None), dict):
+                local_error.cleanup_evidence = dict(error.cleanup_evidence)
+                local_error.cleanup_unknown = error.cleanup_unknown
+            raise local_error from error
 
     @classmethod
     def _create(

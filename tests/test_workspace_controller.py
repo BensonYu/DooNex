@@ -233,9 +233,16 @@ def test_group_deadline_preserves_absolute_outer_cutoff(repository, fake_registr
 def test_command_failure_is_safe_failed_terminal_and_can_be_followed(
     repository, fake_registry
 ):
-    with pytest.raises(ws.WorkspaceError, match="Git project operation failed"):
+    with pytest.raises(
+        ws.WorkspaceError, match="Git project operation failed"
+    ) as error:
         ws._git(repository, "rev-parse", "refs/heads/nonexistent-fixture")
     operation = fake_registry.operations[0]
+    assert error.value.cleanup_evidence == {
+        "controller_operation_id": operation.operation_id,
+        "controller_record_unknown": False,
+    }
+    assert error.value.cleanup_unknown is False
     assert (
         operation.state == "terminal"
         and operation.evidence["reason"] == "command_failed"
@@ -252,9 +259,15 @@ def test_result_copy_failure_does_not_erase_reaped_git_receipts(
         raise ws.WorkspaceError("controlled write failed")
 
     monkeypatch.setattr(ws, "write_files", fail)
-    with pytest.raises(ws.WorkspaceError, match="controlled write failed"):
+    with pytest.raises(ws.WorkspaceError, match="controlled write failed") as error:
         ws.Workspace.create(repository, "HEAD", tmp_path / "export")
     operation = fake_registry.operations[0]
+    assert (
+        error.value.cleanup_evidence["controller_operation_id"]
+        == operation.operation_id
+    )
+    assert error.value.cleanup_evidence["controller_record_unknown"] is False
+    assert error.value.cleanup_unknown is False
     assert (
         operation.state == "terminal"
         and operation.evidence["reason"] == "operation_failed"
@@ -269,9 +282,14 @@ def test_popen_start_failure_leaves_unknown_without_fabricated_pid(
         raise OSError("controlled spawn error")
 
     monkeypatch.setattr(ws.subprocess, "Popen", fail)
-    with pytest.raises(OSError, match="controlled spawn error"):
+    with pytest.raises(OSError, match="controlled spawn error") as error:
         ws.validate_repository(repository)
     operation = fake_registry.operations[0]
+    assert error.value.cleanup_evidence == {
+        "controller_operation_id": operation.operation_id,
+        "controller_record_unknown": True,
+    }
+    assert error.value.cleanup_unknown is True
     assert operation.state == "unknown"
     assert operation.capability.processes == [{"phase": "git"}]
     with pytest.raises(co.RegistryError, match="fixture_fenced"):
@@ -338,6 +356,101 @@ def test_registry_failure_preserves_original_cleanup_unknown_in_cause(
     with pytest.raises(co.RegistryError) as captured:
         ws.validate_repository(repository)
     assert captured.value.__cause__ is unknown
+    operation = fake_registry.operations[0]
+    for error in (captured.value, unknown):
+        assert (
+            error.cleanup_evidence["controller_operation_id"] == operation.operation_id
+        )
+        assert error.cleanup_evidence["controller_record_unknown"] is True
+        assert error.cleanup_unknown is True
+    assert unknown.cleanup_evidence["processes"][0]["pipe_eof"] is False
+
+
+def test_launch_failure_is_associated_before_group_or_process_exists(
+    repository, fake_registry, monkeypatch
+):
+    error = co.RegistryError("controlled_launch_unknown")
+
+    def fail(self):
+        raise error
+
+    monkeypatch.setattr(FakeOperation, "launch", fail)
+    calls = []
+    monkeypatch.setattr(ws.subprocess, "Popen", lambda *a, **k: calls.append(a))
+    with pytest.raises(co.RegistryError) as captured:
+        ws.validate_repository(repository)
+    operation = fake_registry.operations[0]
+    assert captured.value is error and calls == [] and operation.state == "reserved"
+    assert error.cleanup_evidence == {
+        "controller_operation_id": operation.operation_id,
+        "controller_record_unknown": True,
+    }
+    assert error.cleanup_unknown is True
+
+
+def test_reserve_failure_does_not_fabricate_operation_identity(
+    repository, fake_registry, monkeypatch
+):
+    error = co.RegistryError("controlled_reserve_refusal")
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(fake_registry, "reserve", fail)
+    with pytest.raises(co.RegistryError) as captured:
+        ws.validate_repository(repository)
+    assert captured.value is error and fake_registry.operations == []
+    assert error.operation_id is None
+    assert not hasattr(error, "cleanup_evidence")
+
+
+def test_successful_processes_with_terminal_ack_unknown_keep_real_group_id(
+    repository, fake_registry
+):
+    error = co.RegistryError("controlled_terminal_ack_unknown")
+    fake_registry.finish_error = error
+    with pytest.raises(co.RegistryError) as captured:
+        ws.validate_repository(repository)
+    operation = fake_registry.operations[0]
+    assert captured.value is error
+    assert error.cleanup_evidence == {
+        "controller_operation_id": operation.operation_id,
+        "controller_record_unknown": True,
+    }
+    assert error.cleanup_unknown is True
+    assert len(operation.capability.processes) == 3
+    assert all(
+        item["reaped"] and item["pipe_eof"] for item in operation.capability.processes
+    )
+
+
+@pytest.mark.parametrize("outer_expired", [True, False])
+def test_create_deadline_translation_preserves_operation_reference(
+    repository, tmp_path, fake_registry, monkeypatch, outer_expired
+):
+    clock = [time.monotonic()]
+    deadline = clock[0] + 10
+    monkeypatch.setattr(ws.time, "monotonic", lambda: clock[0])
+    original = ExecutionDeadlineExceeded("controlled copy deadline")
+
+    def fail(*args, **kwargs):
+        if outer_expired:
+            clock[0] = deadline
+        raise original
+
+    monkeypatch.setattr(ws.Workspace, "_create", fail)
+    expected = ExecutionDeadlineExceeded if outer_expired else ws.WorkspaceError
+    with pytest.raises(expected) as captured:
+        ws.Workspace.create(repository, "HEAD", tmp_path / "export", deadline=deadline)
+    assert captured.value.cleanup_evidence == {
+        "controller_operation_id": fake_registry.operations[0].operation_id,
+        "controller_record_unknown": True,
+    }
+    assert captured.value.cleanup_unknown is True
+    if outer_expired:
+        assert captured.value is original
+    else:
+        assert captured.value.__cause__ is original
 
 
 def test_legacy_base_files_fallback_creates_one_export_group(
@@ -602,12 +715,78 @@ def test_pg_reserve_or_gate_ack_loss_starts_zero_git_processes(
     monkeypatch.setattr(ws.subprocess, "Popen", lambda *a, **k: calls.append(a))
     with (
         co.bind_registry(registry),
-        pytest.raises(co.RegistryError, match="commit_unknown"),
+        pytest.raises(co.RegistryError, match="commit_unknown") as captured,
     ):
         ws.validate_repository(repository)
     assert calls == [] and len(pg_rows(store)) == 1
+    operation_id = str(pg_rows(store)[0]["id"])
+    assert captured.value.operation_id == operation_id
+    if lose_at == 2:
+        assert captured.value.cleanup_evidence == {
+            "controller_operation_id": operation_id,
+            "controller_record_unknown": True,
+        }
+        assert captured.value.cleanup_unknown is True
+    else:
+        # reserve itself supplied the known ACK-uncertain ID; Workspace cannot
+        # fabricate a returned Operation or claim an observed launch from it.
+        assert not hasattr(captured.value, "cleanup_evidence")
     with store.connect() as connection:
         assert co.fenced(connection)
+
+
+@pytest.mark.parametrize("transition", ["terminal", "unknown"])
+def test_pg_terminal_or_unknown_ack_loss_keeps_returned_operation_and_cause(
+    repository, store, monkeypatch, transition
+):
+    wrapped = LostCommitStore(store, lose_at=None)
+    registry = co.ControllerRegistry(
+        wrapped,
+        actor=co.fresh_actor("cli"),
+        check_owner=lambda: None,
+        check_other_fences=lambda connection: False,
+    )
+    original_finish = co.Operation.finish
+    process_calls = []
+    original_popen = ws.subprocess.Popen
+
+    def finish(self, evidence):
+        wrapped.lose_at = wrapped.calls + 1
+        return original_finish(self, evidence)
+
+    def popen(*args, **kwargs):
+        process_calls.append(True)
+        if transition == "unknown":
+            wrapped.lose_at = wrapped.calls + 1
+            raise OSError("controlled spawn uncertainty")
+        return original_popen(*args, **kwargs)
+
+    monkeypatch.setattr(co.Operation, "finish", finish)
+    monkeypatch.setattr(ws.subprocess, "Popen", popen)
+    with (
+        co.bind_registry(registry),
+        pytest.raises(co.RegistryError, match="transition_commit_unknown") as captured,
+    ):
+        ws.validate_repository(repository)
+    record = pg_rows(store)[0]["data"]
+    operation_id = record["operation_id"]
+    assert captured.value.cleanup_evidence == {
+        "controller_operation_id": operation_id,
+        "controller_record_unknown": True,
+    }
+    assert captured.value.cleanup_unknown is True
+    if transition == "unknown":
+        assert len(process_calls) == 1 and record["state"] == "unknown"
+        original = captured.value.__cause__
+        assert isinstance(original, OSError)
+        assert original.cleanup_evidence["controller_operation_id"] == operation_id
+        assert original.cleanup_evidence["controller_record_unknown"] is True
+        assert record["processes"][0]["pid"] is None
+    else:
+        assert len(process_calls) == 3 and record["state"] == "terminal"
+        assert all(item["reaped"] and item["pipe_eof"] for item in record["processes"])
+    with store.connect() as connection:
+        assert co.fenced(connection) is (transition == "unknown")
 
 
 def test_pg_spawn_failure_fences_following_git_without_replay(
