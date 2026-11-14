@@ -553,18 +553,51 @@ def create_app(settings=None):
 
     @app.get("/api/runs/{run_id}/recovery", dependencies=auth)
     def recovery(run_id: str):
-        from doonex.workspace import Workspace
-
-        run = load_run(run_id)
-        directory = run_directory(settings, run["id"])
+        # load_run may inspect Review/Git. An existing global fence must be
+        # reportable without starting that inspection or a new Docker probe.
+        run = store.get(identifier(run_id))
         from doonex.cleanup import (
             controller_cleanup_unknown,
             controller_process_unknown,
         )
+        from doonex.responses_registry import helper_fenced
+        from doonex.store import execution_fenced
 
         controller_blocked = controller_cleanup_unknown(
             run.get("recovery")
         ) or cleanup_intent_unresolved(run)
+        with store.connect() as connection:
+            transport_blocked = helper_fenced(connection)
+            dispatch_blocked = execution_fenced(connection)
+        inspection_blocked = (
+            transport_blocked or dispatch_blocked or controller_blocked
+        )
+        if inspection_blocked:
+            notes = [
+                "存在未核查的执行记录；工作区和容器尚未核查，普通续接不能解除阻止。"
+            ]
+            if transport_blocked:
+                notes.append(
+                    "存在未核查的模型传输进程；请先在模型设置中打开模型传输恢复核查。"
+                )
+            return {
+                "containers": None,
+                "pending_actions": store.pending(run["id"]),
+                "workspace_ok": None,
+                "notes": notes,
+                "inspection_blocked": True,
+                "transport_blocked": transport_blocked,
+                "controller_process_blocked": controller_process_unknown(
+                    run.get("recovery")
+                ),
+                "controller_cleanup_blocked": controller_blocked,
+                "cleanup_intent_blocked": cleanup_intent_unresolved(run),
+            }
+
+        from doonex.workspace import Workspace
+
+        run = load_run(run_id)
+        directory = run_directory(settings, run["id"])
         workspace_ok = not run["first_started_at"]
         notes = []
         try:
@@ -605,7 +638,6 @@ def create_app(settings=None):
             record_probe_failure(store, run["id"], error)
             raise ValueError("无法核查 Docker 状态，禁止恢复") from error
         pending = store.pending(run["id"])
-        from doonex.responses_registry import helper_fenced
 
         with store.connect() as connection:
             transport_blocked = helper_fenced(connection)
@@ -624,6 +656,7 @@ def create_app(settings=None):
             "pending_actions": pending,
             "workspace_ok": workspace_ok,
             "notes": notes,
+            "inspection_blocked": False,
             "transport_blocked": transport_blocked,
             "controller_process_blocked": controller_process_unknown(
                 run.get("recovery")
@@ -660,11 +693,19 @@ def create_app(settings=None):
                     "控制进程、Docker 请求或模型传输进程尚未完成独立核查；普通续接不能解除阻止"
                 )
         report = recovery(run_id)
+        if report["inspection_blocked"]:
+            raise ValueError(
+                "控制进程、Docker 请求或模型传输进程尚未完成独立核查；普通续接不能解除阻止"
+            )
         if report["controller_cleanup_blocked"]:
             raise ValueError(
                 "控制进程或 Docker 请求尚未完成独立核查；普通续接不能解除阻止"
             )
-        if report["containers"] or not report["workspace_ok"]:
+        if (
+            report["containers"] is None
+            or report["containers"]
+            or report["workspace_ok"] is not True
+        ):
             raise ValueError("工作区或在途容器尚未完成核查")
         uncertain = bool(report["pending_actions"]) or run["state"] == "interrupted"
         if uncertain and not body.acknowledge_unknown:

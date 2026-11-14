@@ -293,7 +293,7 @@ function App() {
         if (actionName === 'resume' && isCurrent()) {
           try {
             const nextRecovery = await api.get<Recovery>(runPath(projectId, run.id, 'recovery'), signal);
-            if (isCurrent()) setRecovery(nextRecovery);
+            if (isCurrent()) { setRecovery(nextRecovery); setAcknowledge(false); }
           } catch { /* Keep the original actionable error. */ }
         }
         throw err;
@@ -349,6 +349,8 @@ function App() {
   const selectedSubscription = selectedModels.length > 0 && selectedModels.every((model) => model.billing_mode === 'subscription');
   const selectedMixedBilling = selectedModels.some((model) => model.billing_mode === 'subscription') && selectedModels.some((model) => model.billing_mode === 'metered');
   const isActive = !!selected && activeStates.has(selected.state);
+  const recoveryReady = !!recovery && !recovery.inspection_blocked && !recovery.transport_blocked
+    && recovery.workspace_ok === true && recovery.containers !== null && recovery.containers.length === 0;
 
   return <div className="app-shell">
     <header className="app-header">
@@ -448,7 +450,7 @@ function App() {
             <div className="button-row">
               {(selected.state === 'running' || selected.state === 'queued') && <button disabled={busy} onClick={() => control('pause')}>暂停</button>}
               {(isActive || selected.state === 'paused' || selected.state === 'interrupted') && <button className="danger" disabled={busy || selected.state === 'cancelling'} onClick={() => control('cancel')}>取消运行</button>}
-              {selected.state === 'paused' && <button className="primary" disabled={busy} onClick={() => control('resume')}>继续执行</button>}
+              {selected.state === 'paused' && <button className="primary" disabled={busy || (recovery !== null && !recoveryReady)} onClick={() => control('resume')}>继续执行</button>}
               {selected.state === 'interrupted' && <button disabled={busy} onClick={() => { void perform(async ({ signal, isCurrent }) => {
                 const nextRecovery = await api.get<Recovery>(runPath(projectId, selected.id, 'recovery'), signal);
                 if (isCurrent()) { setRecovery(nextRecovery); setAcknowledge(false); }
@@ -459,12 +461,12 @@ function App() {
           {(selected.state === 'pausing' || selected.state === 'cancelling') && <p className="notice">停止请求已记录。正在等待在途动作结束或超时，尚未确认全部动作终止。</p>}
           {recovery && <section className="recovery-panel">
             <h2>恢复前核查</h2>
-            <p>工作区：{recovery.workspace_ok ? '可用' : '需要处理'}；容器记录：{recovery.containers.length}；待核对动作：{recovery.pending_actions.length}</p>
+            <p>工作区：{recovery.workspace_ok === null ? '未核查' : recovery.workspace_ok ? '可用' : '需要处理'}；容器记录：{recovery.containers === null ? '未核查' : recovery.containers.length}；待核对动作：{recovery.pending_actions.length}</p>
             {recovery.notes.length > 0 && <ul>{recovery.notes.map((note, index) => <li key={index}>{note}</li>)}</ul>}
             <details><summary>查看容器与动作记录</summary><pre>{json({ containers: recovery.containers, pending_actions: recovery.pending_actions })}</pre></details>
-            <label className="checkbox-label"><input type="checkbox" checked={acknowledge} onChange={(event) => setAcknowledge(event.target.checked)} />我已核对工作区、容器和结果未知的外部动作，确认可以继续。</label>
+            <label className="checkbox-label"><input type="checkbox" disabled={busy || !recoveryReady} checked={acknowledge} onChange={(event) => setAcknowledge(event.target.checked)} />我已核对工作区、容器和结果未知的外部动作，确认可以继续。</label>
             {recovery.transport_blocked && <button onClick={() => setView('models')}>打开模型传输恢复核查</button>}
-            <button className="primary" disabled={busy || !acknowledge || !recovery.workspace_ok || recovery.transport_blocked} onClick={() => control('resume')}>确认核查并恢复</button>
+            <button className="primary" disabled={busy || !acknowledge || !recoveryReady} onClick={() => control('resume')}>确认核查并恢复</button>
           </section>}
           {isGeneration ? <section className="workflow-panel" aria-label="生成流程与共享预算"><h2>生成 → 候选结构检查 → 人工审核</h2><p className="field-help">仅一个执行角色，通过 finish 返回文本。原 Run 的调用、token、未知预留和首次启动时钟持续保留。</p></section> : <WorkflowProgress run={selected} />}
           <section className="usage-panel" aria-label="共享预算与累计用量">

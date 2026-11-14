@@ -361,10 +361,11 @@ export type RunEvent = {
 };
 
 export type Recovery = {
-  containers: unknown[];
+  containers: unknown[] | null;
   pending_actions: unknown[];
-  workspace_ok: boolean;
+  workspace_ok: boolean | null;
   notes: string[];
+  inspection_blocked: boolean;
   transport_blocked?: boolean;
 };
 
