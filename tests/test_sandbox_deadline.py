@@ -93,10 +93,13 @@ def fake_docker(tmp_path, monkeypatch, sandbox_context):
     control = tmp_path / "control"
     control.mkdir()
     executable = control / "docker"
-    executable.write_text(f"#!{sys.executable}\n" + FAKE_DOCKER)
+    # The synthetic CLI uses only stdlib; exclude unrelated venv site hooks.
+    executable.write_text(f"#!{sys.executable} -S\n" + FAKE_DOCKER)
     executable.chmod(0o700)
     (control / "scenario.json").write_text("{}")
-    monkeypatch.setattr(implementation, "CLEANUP_SECONDS", 0.35)
+    # Ordinary output/cleanup contracts include real DB grants and process startup.
+    # Tests of a short window select that window explicitly below.
+    monkeypatch.setattr(implementation, "CLEANUP_SECONDS", 3)
 
     def configure(**settings):
         (control / "scenario.json").write_text(json.dumps(settings))
@@ -133,16 +136,34 @@ def assert_reaped_and_eof(evidence):
     json.dumps(evidence)
 
 
-def observe_process_deadlines(monkeypatch):
+def observe_process_deadlines(monkeypatch, *, results=None):
     original = implementation._Supervisor.process
     calls = []
 
     def observed(self, arguments, **options):
         calls.append((options["operation"], options["deadline"]))
-        return original(self, arguments, **options)
+        result = original(self, arguments, **options)
+        if results is not None:
+            results.append((result, self.evidence))
+        return result
 
     monkeypatch.setattr(implementation._Supervisor, "process", observed)
     return calls
+
+
+def assert_list_process(observed, output):
+    result, evidence = observed
+    encoded = output.encode()
+    maximum = MAX_CONTAINER_IDS * 65
+    oversized = len(encoded) > maximum
+    assert result.stdout == encoded[:maximum]
+    assert result.reason == ("output_limit" if oversized else None)
+    assert result.truncated is oversized
+    if not oversized:
+        assert result.returncode == 0
+    assert len(evidence["processes"]) == 1
+    assert evidence["processes"][0]["operation"] == "ps"
+    assert_reaped_and_eof(evidence)
 
 
 def observe_cleanup_window(monkeypatch):
@@ -176,6 +197,7 @@ def assert_shared_cleanup_window(windows, deadlines, returned):
 @pytest.mark.postgres
 def test_common_deadline_covers_create_and_attach(fake_docker, tmp_path, monkeypatch):
     control, configure, context = fake_docker
+    monkeypatch.setattr(implementation, "CLEANUP_SECONDS", 0.35)
     deadlines = observe_process_deadlines(monkeypatch)
     sandbox = configure(create_delay=1, start_delay=30)
     entered = time.monotonic()
@@ -208,6 +230,7 @@ def test_caller_deadline_does_not_refresh_at_sandbox_entry(
     fake_docker, tmp_path, monkeypatch
 ):
     control, configure, context = fake_docker
+    monkeypatch.setattr(implementation, "CLEANUP_SECONDS", 0.35)
     deadlines = observe_process_deadlines(monkeypatch)
     sandbox = configure(create_delay=30)
     deadline = time.monotonic() + 3
@@ -347,8 +370,12 @@ def test_invalid_or_excess_create_ack_never_bypasses_cleanup(
     ],
 )
 @pytest.mark.postgres
-def test_incomplete_or_malformed_container_lists_are_never_empty(fake_docker, output):
+def test_incomplete_or_malformed_container_lists_are_never_empty(
+    fake_docker, output, monkeypatch
+):
     control, configure, context = fake_docker
+    results = []
+    deadlines = observe_process_deadlines(monkeypatch, results=results)
     sandbox = configure(ps_output=output)
     expected = (
         "output_limit"
@@ -357,47 +384,126 @@ def test_incomplete_or_malformed_container_lists_are_never_empty(fake_docker, ou
         if not output.isascii()
         else "incomplete or malformed"
     )
-    with pytest.raises(SandboxError, match=expected):
+    entered = time.monotonic()
+    with pytest.raises(SandboxError, match=expected) as error:
         sandbox.containers(context.run_id, **context.binding)
+    returned = time.monotonic()
     assert [item["operation"] for item in operations(control)] == ["ps"]
+    assert len(deadlines) == len(results) == 1
+    assert deadlines[0][0] == "ps"
+    deadline = deadlines[0][1]
+    assert entered + 3 <= deadline <= returned + 3
+    assert returned < deadline + 0.3
+    assert_list_process(results[0], output)
+    assert error.value.cleanup_evidence is results[0][1]
     original = context.records()[0]
+    assert original["state"] == "unknown" and context.fenced()
+    assert original["business_deadline_monotonic_ns"] == int(deadline * 1e9)
+    assert [item["phase"] for item in original["processes"]] == ["docker_ps"]
     with pytest.raises(co.RegistryError, match="fenced"):
         sandbox.stop_run(context.run_id, **context.binding)
+    assert len(results) == 1
+    repair_entered = time.monotonic()
     stopped = sandbox.stop_run(
         context.run_id,
         repair_of=original["operation_id"],
         **context.cleanup_binding,
     )
+    repair_returned = time.monotonic()
     assert stopped["remaining"] == ["unknown"]
     assert stopped["errors"] and stopped["cleanup_unknown"]
+    assert any(expected in message for message in stopped["errors"])
+    assert [item["operation"] for item in operations(control)] == ["ps", "ps"]
+    assert len(deadlines) == len(results) == 2
+    assert deadlines[1][0] == "ps"
+    repair_deadline = deadlines[1][1]
+    assert repair_entered + 3 <= repair_deadline <= repair_returned + 3
+    assert repair_returned < repair_deadline + 0.3
+    assert_list_process(results[1], output)
+    assert stopped["cleanup_evidence"] is results[1][1]
+    repair = next(
+        record
+        for record in context.records()
+        if record["repair_of"] == original["operation_id"]
+    )
+    assert repair["state"] == "unknown"
+    assert repair["business_deadline_monotonic_ns"] == int(repair_deadline * 1e9)
+    assert [item["phase"] for item in repair["processes"]] == ["docker_ps"]
     assert original in context.records() and context.fenced()
 
 
 @pytest.mark.postgres
-def test_container_count_limit_is_strict(fake_docker):
-    _, configure, context = fake_docker
+def test_container_count_limit_is_strict(fake_docker, monkeypatch):
+    control, configure, context = fake_docker
+    results = []
+    deadlines = observe_process_deadlines(monkeypatch, results=results)
     output = "".join(f"{index:064x}\n" for index in range(MAX_CONTAINER_IDS + 1))
-    with pytest.raises(SandboxError, match="output_limit"):
+    entered = time.monotonic()
+    with pytest.raises(SandboxError, match="output_limit") as error:
         configure(ps_output=output).containers(context.run_id, **context.binding)
+    returned = time.monotonic()
+    assert [item["operation"] for item in operations(control)] == ["ps"]
+    assert len(deadlines) == len(results) == 1
+    assert deadlines[0][0] == "ps"
+    deadline = deadlines[0][1]
+    assert entered + 3 <= deadline <= returned + 3
+    assert returned < deadline + 0.3
+    assert_list_process(results[0], output)
+    assert error.value.cleanup_evidence is results[0][1]
+    (record,) = context.records()
+    assert record["state"] == "unknown" and context.fenced()
+    assert record["business_deadline_monotonic_ns"] == int(deadline * 1e9)
+    assert [item["phase"] for item in record["processes"]] == ["docker_ps"]
 
 
 @pytest.mark.postgres
-def test_complete_bounded_container_list_is_preserved(fake_docker):
-    _, configure, context = fake_docker
+def test_complete_bounded_container_list_is_preserved(fake_docker, monkeypatch):
+    control, configure, context = fake_docker
+    results = []
+    deadlines = observe_process_deadlines(monkeypatch, results=results)
     identifiers = [f"{index:064x}" for index in range(MAX_CONTAINER_IDS)]
+    output = "\n".join(identifiers) + "\n"
+    entered = time.monotonic()
     assert (
-        configure(ps_output="\n".join(identifiers) + "\n").containers(
-            context.run_id, **context.binding
-        )
+        configure(ps_output=output).containers(context.run_id, **context.binding)
         == identifiers
     )
+    returned = time.monotonic()
+    (call,) = operations(control)
+    assert call["operation"] == "ps"
+    assert call["arguments"] == [
+        "-aq",
+        "--no-trunc",
+        "--filter",
+        "label=doonex.run_id=" + context.run_id,
+    ]
+    assert len(deadlines) == len(results) == 1
+    assert deadlines[0][0] == "ps"
+    deadline = deadlines[0][1]
+    assert entered + 3 <= deadline <= returned + 3
+    assert call["at"] < deadline and returned < deadline + 0.3
+    assert_list_process(results[0], output)
+    (record,) = context.records()
+    assert record["state"] == "terminal" and not context.fenced()
+    assert record["business_deadline_monotonic_ns"] == int(deadline * 1e9)
+    assert [item["phase"] for item in record["processes"]] == ["docker_ps"]
+    receipt = record["processes"][0]
+    process = results[0][1]["processes"][0]
+    assert receipt["pid"] == process["pid"]
+    assert receipt["exit_code"] == 0 and receipt["reaped"] and receipt["pipe_eof"]
+    terminal = record["terminal_evidence"]
+    assert terminal["outcome"] == "success"
+    assert terminal["docker"]["observation_complete"]
+    assert terminal["docker"]["remaining_containers"] == MAX_CONTAINER_IDS
 
 
 @pytest.mark.postgres
 def test_final_absence_check_covers_every_container_with_run_label(
-    fake_docker, tmp_path
+    fake_docker, tmp_path, monkeypatch
 ):
     control, configure, context = fake_docker
+    processes = []
+    observe_process_deadlines(monkeypatch, results=processes)
     result = configure(ps_output="b" * 64 + "\n").run(
         tmp_path, "true", 3, context.run_id, **context.binding
     )
@@ -411,6 +517,10 @@ def test_final_absence_check_covers_every_container_with_run_label(
         "ps",
     ]
     assert not result["timed_out"]
+    listed_result, _ = processes[-1]
+    assert listed_result.reason is None and listed_result.returncode == 0
+    assert listed_result.stdout == ("b" * 64 + "\n").encode()
+    assert "Container absence unconfirmed" in result["cleanup_evidence"]["errors"]
     listed = next(item for item in operations(control) if item["operation"] == "ps")
     assert listed["arguments"] == [
         "-aq",
@@ -489,6 +599,7 @@ def test_escaped_pipe_stays_unknown_despite_empty_container_list(
     fake_docker, tmp_path, monkeypatch
 ):
     control, configure, context = fake_docker
+    monkeypatch.setattr(implementation, "CLEANUP_SECONDS", 0.35)
     sandbox = configure(pipe_child=True, escaped_child=True)
     entered = time.monotonic()
     result = sandbox.run(tmp_path, "true", 3, context.run_id, **context.binding)
@@ -590,8 +701,10 @@ def test_cancel_during_create_preserves_cleanup_proof(fake_docker, tmp_path):
     )
     assert result["cancelled"] and not result["timed_out"]
     assert any(item["operation"] == "create" for item in operations(control))
+    assert [item["operation"] for item in operations(control)] == ["create", "rm", "ps"]
     assert result["cleanup_unknown"]
     assert result["cleanup_evidence"]["daemon_request_unknown"]
+    assert result["cleanup_evidence"]["container_snapshot_absence_confirmed"] is True
     assert_reaped_and_eof(result["cleanup_evidence"])
 
 
@@ -600,6 +713,7 @@ def test_mount_scan_uses_same_deadline_and_is_reaped(
     fake_docker, tmp_path, monkeypatch
 ):
     control, configure, context = fake_docker
+    monkeypatch.setattr(implementation, "CLEANUP_SECONDS", 0.35)
     original = subprocess.Popen
 
     def delayed_mount(arguments, **kwargs):

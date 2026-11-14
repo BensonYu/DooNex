@@ -153,11 +153,14 @@ def fake(tmp_path, monkeypatch, controller):
     control = tmp_path / "control"
     control.mkdir()
     executable = control / "docker"
-    executable.write_text(f"#!{sys.executable}\n" + FAKE_DOCKER)
+    # The synthetic CLI uses only stdlib; exclude unrelated venv site hooks.
+    executable.write_text(f"#!{sys.executable} -S\n" + FAKE_DOCKER)
     executable.chmod(0o700)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    monkeypatch.setattr(implementation, "CLEANUP_SECONDS", 0.5)
+    # Normal completion includes real child startup. Short-window contracts set
+    # their original allowance locally instead of inheriting it here.
+    monkeypatch.setattr(implementation, "CLEANUP_SECONDS", 3)
 
     def configure(**scenario):
         (control / "scenario.json").write_text(json.dumps(scenario))
@@ -569,6 +572,7 @@ def test_process_cannot_spoof_receipt_target_or_docker_phase(
 def test_create_ack_timeout_retains_daemon_unknown_after_complete_empty_ps(
     fake, monkeypatch
 ):
+    monkeypatch.setattr(implementation, "CLEANUP_SECONDS", 0.5)
     # The original entry deadline includes mount/create startup. Require the
     # actual create side effect before treating this as a lost-ACK scenario.
     deadlines = observe_process_deadlines(monkeypatch)
@@ -842,11 +846,13 @@ def pg_sandbox(controller_store, request_data, tmp_path, monkeypatch):
     control = tmp_path / "control"
     control.mkdir()
     executable = control / "docker"
-    executable.write_text(f"#!{sys.executable}\n" + FAKE_DOCKER)
+    # The synthetic CLI uses only stdlib; exclude unrelated venv site hooks.
+    executable.write_text(f"#!{sys.executable} -S\n" + FAKE_DOCKER)
     executable.chmod(0o700)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    monkeypatch.setattr(implementation, "CLEANUP_SECONDS", 0.5)
+    # Real PostgreSQL admission and ordinary cleanup share this finite allowance.
+    monkeypatch.setattr(implementation, "CLEANUP_SECONDS", 3)
     registry = co.ControllerRegistry(
         store,
         actor=co.fresh_actor("api"),
