@@ -790,6 +790,12 @@ class ControllerRegistry:
             ).fetchone()
             if run is None or run["data"].get("owner") != record["expected_run_owner"]:
                 raise OwnershipLost("控制操作对应的执行权已变化")
+            request = run["data"].get("request")
+            if (
+                type(request) is not dict
+                or request.get("project_id") != record["project_id"]
+            ):
+                raise RegistryError("project_binding")
         if record["parent_action_id"] is not None:
             action = connection.execute(
                 "SELECT run_id FROM actions WHERE id=%s", (record["parent_action_id"],)

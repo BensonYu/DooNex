@@ -196,11 +196,18 @@ def termination_unknown(connection):
     )
 
 
-def execution_fenced(connection):
-    """Unresolved process records survive Run state and action acknowledgement."""
+def external_execution_fenced(connection):
+    """Fences outside the controller registry, also checked by live groups."""
     from doonex.responses_registry import helper_fenced
 
     return termination_unknown(connection) or helper_fenced(connection)
+
+
+def execution_fenced(connection):
+    """Every unresolved execution record blocks public admission globally."""
+    from doonex.controller_operations import fenced
+
+    return external_execution_fenced(connection) or fenced(connection)
 
 
 class Store:
@@ -233,6 +240,9 @@ class Store:
         with self.connect() as connection:
             connection.execute("SELECT pg_advisory_xact_lock(%s)", (4142061107,))
             connection.execute(SCHEMA)
+            from doonex import controller_operations
+
+            controller_operations.initialize(connection)
             from doonex.background import BACKGROUND_SCHEMA
 
             connection.execute(BACKGROUND_SCHEMA)

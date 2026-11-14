@@ -12,7 +12,7 @@ from uuid import uuid4
 
 import pytest
 from doonex import controller_operations as co
-from doonex.store import OwnershipLost
+from doonex.store import OwnershipLost, external_execution_fenced
 from psycopg.types.json import Jsonb
 
 
@@ -355,7 +355,7 @@ def controller_store(store):
 
 
 def registry(
-    store, *, kind="api", check_owner=lambda: None, other=lambda connection: False
+    store, *, kind="api", check_owner=lambda: None, other=external_execution_fenced
 ):
     return co.ControllerRegistry(
         store,
@@ -544,6 +544,7 @@ def test_pg_unknown_is_independent_of_run_and_action_acknowledgement(
     operation = reserve(
         controller_store,
         run_id=run["id"],
+        project_id=request_data["project_id"],
         parent_action_id=action_id,
         expected_run_owner="owner-fixture",
     )
@@ -569,7 +570,10 @@ def test_pg_new_run_owner_cannot_finish_old_group(controller_store, request_data
     with controller_store.locked(run["id"]) as (_, current):
         current["owner"] = "owner-before"
     operation = reserve(
-        controller_store, run_id=run["id"], expected_run_owner="owner-before"
+        controller_store,
+        run_id=run["id"],
+        project_id=request_data["project_id"],
+        expected_run_owner="owner-before",
     )
     capability = operation.launch()
     complete(capability, capability.before_process("git"))
@@ -707,7 +711,12 @@ def test_pg_parent_action_must_belong_to_exact_run(controller_store, request_dat
     second = controller_store.create_run(request_data)
     action_id = controller_store.action(first["id"], "shell", {"command": "fixture"})
     with pytest.raises(co.RegistryError, match="action_binding"):
-        reserve(controller_store, run_id=second["id"], parent_action_id=action_id)
+        reserve(
+            controller_store,
+            run_id=second["id"],
+            project_id=request_data["project_id"],
+            parent_action_id=action_id,
+        )
 
 
 def test_pg_new_actor_cannot_inherit_existing_group(controller_store):
