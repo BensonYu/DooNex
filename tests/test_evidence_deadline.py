@@ -13,10 +13,13 @@ import pytest
 from doonex import evidence, review
 from doonex.deadline import ExecutionDeadlineExceeded
 from doonex.workspace import FileContent, Workspace, WorkspaceProcessUnknown
+from sandbox_test_support import sandbox_context as sandbox_context_fixture
+
+sandbox_context = sandbox_context_fixture
 
 
 @pytest.fixture
-def delivery(tmp_path):
+def delivery(tmp_path, sandbox_context):
     repository = tmp_path / "repository"
     repository.mkdir()
 
@@ -31,7 +34,11 @@ def delivery(tmp_path):
     git("commit", "-qm", "synthetic baseline")
     run_dir = tmp_path / "run"
     workspace = Workspace.create(
-        repository, "HEAD", run_dir / "workspace", baseline_path=run_dir / "baseline"
+        repository,
+        "HEAD",
+        run_dir / "workspace",
+        baseline_path=run_dir / "baseline",
+        operation_context={"run_id": sandbox_context.run_id, **sandbox_context.binding},
     )
     (workspace.path / "main.py").write_text("answer = 2\n")
     return workspace, run_dir
@@ -42,10 +49,12 @@ class RecordingSandbox:
 
     def __init__(self, action=None):
         self.calls = []
+        self.run_ids = []
         self.action = action
 
     def run(self, workspace, command, timeout, run_id, should_stop, **kwargs):
         self.calls.append(kwargs)
+        self.run_ids.append(run_id)
         result = {
             "exit_code": 0,
             "output": "synthetic pass\n",
@@ -175,6 +184,7 @@ def test_artifact_read_preserves_size_and_mutation_checks(tmp_path, monkeypatch)
         evidence._read_artifact(tmp_path, "artifact")
 
 
+@pytest.mark.postgres
 def test_capture_and_review_forward_exact_deadline(delivery, monkeypatch):
     workspace, run_dir = delivery
     deadline = time.monotonic() + 30
@@ -198,7 +208,7 @@ def test_capture_and_review_forward_exact_deadline(delivery, monkeypatch):
 
         monkeypatch.setattr(module, name, observe)
     handoff = review.Review.prepare(
-        workspace, run_dir, "synthetic-run", deadline=deadline
+        workspace, run_dir, workspace.operation_context["run_id"], deadline=deadline
     )
     assert review.Review.inspect(workspace, run_dir, handoff, deadline=deadline)[
         "valid"
@@ -210,17 +220,24 @@ def test_capture_and_review_forward_exact_deadline(delivery, monkeypatch):
         ["synthetic check"],
         sandbox,
         10,
-        "synthetic-run",
+        workspace.operation_context["run_id"],
         deadline=deadline,
     )
-    assert sandbox.calls == [{"deadline": deadline}]
+    binding = dict(workspace.operation_context)
+    run_id = binding.pop("run_id")
+    assert binding["expected_run_owner"] is None
+    assert sandbox.run_ids == [run_id]
+    assert sandbox.calls == [{**binding, "deadline": deadline}]
     assert evidence.Evidence.inspect(
         workspace, run_dir, report["report_sha256"], deadline=deadline
     )["verified"]
     assert recorded and all(value == deadline for _, value in recorded)
 
 
-def test_build_patch_forwards_deadline_and_enforces_finite_output(monkeypatch):
+@pytest.mark.postgres
+def test_build_patch_forwards_deadline_and_enforces_finite_output(
+    monkeypatch, sandbox_context
+):
     deadline = time.monotonic() + 10
     calls = []
     original = evidence._git
@@ -234,12 +251,18 @@ def test_build_patch_forwards_deadline_and_enforces_finite_output(monkeypatch):
         {"a": FileContent(b"old", 0o644)},
         {"a": FileContent(b"new", 0o644)},
         deadline=deadline,
+        operation_context={"run_id": sandbox_context.run_id, **sandbox_context.binding},
     )
     assert b"-old" in patch and b"+new" in patch
     assert calls[0]["deadline"] == deadline
     assert calls[0]["stdout_limit"] == 200 * 1024 * 1024
+    assert calls[0]["operation_context"] == {
+        "run_id": sandbox_context.run_id,
+        **sandbox_context.binding,
+    }
 
 
+@pytest.mark.postgres
 def test_frozen_verifier_keeps_same_deadline_through_every_copy(
     delivery, tmp_path, monkeypatch
 ):
@@ -272,7 +295,7 @@ def test_frozen_verifier_keeps_same_deadline_through_every_copy(
         ["first", "second"],
         sandbox,
         10,
-        "synthetic-run",
+        workspace.operation_context["run_id"],
         verifier_path=verifier,
         verification_context=context,
         deadline=deadline,
@@ -283,6 +306,7 @@ def test_frozen_verifier_keeps_same_deadline_through_every_copy(
         options == {"private": True, "deadline": deadline} for _, options in calls
     )
     assert len(sandbox.calls) == 2
+    assert sandbox.run_ids == [workspace.operation_context["run_id"]] * 2
     assert all(options["deadline"] == deadline for options in sandbox.calls)
     assert sandbox.calls[0]["verifier_path"] != sandbox.calls[1]["verifier_path"]
 
@@ -301,8 +325,9 @@ def test_verifier_snapshot_does_not_wrap_expiry_or_cleanup_unknown(
 @pytest.mark.parametrize(
     "step", ["capture", "prepare", "inspect-evidence", "inspect-review"]
 )
-def test_expired_entry_cannot_publish_or_convert_to_invalid(delivery, step):
-    workspace, run_dir = delivery
+def test_expired_entry_cannot_publish_or_convert_to_invalid(tmp_path, step):
+    # The expired entry must refuse before a registry, Run or workspace is needed.
+    workspace, run_dir = Workspace(tmp_path / "workspace"), tmp_path / "run"
     expired = time.monotonic() - 1
     with pytest.raises(ExecutionDeadlineExceeded):
         if step == "capture":
@@ -312,11 +337,13 @@ def test_expired_entry_cannot_publish_or_convert_to_invalid(delivery, step):
                 [],
                 RecordingSandbox(),
                 10,
-                "synthetic-run",
+                "never-dispatched",
                 deadline=expired,
             )
         elif step == "prepare":
-            review.Review.prepare(workspace, run_dir, "synthetic-run", deadline=expired)
+            review.Review.prepare(
+                workspace, run_dir, "never-dispatched", deadline=expired
+            )
         elif step == "inspect-evidence":
             evidence.Evidence.inspect(workspace, run_dir, deadline=expired)
         else:
@@ -330,9 +357,10 @@ def test_expired_entry_cannot_publish_or_convert_to_invalid(delivery, step):
 )
 @pytest.mark.parametrize("inspector", ["evidence", "review"])
 def test_inspection_preserves_control_exceptions(
-    delivery, monkeypatch, kind, inspector
+    tmp_path, monkeypatch, kind, inspector
 ):
-    workspace, run_dir = delivery
+    # The first artifact read raises; no subprocess or database work is involved.
+    workspace, run_dir = Workspace(tmp_path / "workspace"), tmp_path / "run"
     if kind in {"deadline", "wrapped-deadline"}:
         failure = ExecutionDeadlineExceeded("synthetic expiry")
     else:
@@ -368,6 +396,7 @@ def test_inspection_preserves_control_exceptions(
     assert result.value is failure
 
 
+@pytest.mark.postgres
 def test_capture_cleanup_unknown_survives_later_expiry(delivery, monkeypatch):
     workspace, run_dir = delivery
     expired = False
@@ -392,13 +421,14 @@ def test_capture_cleanup_unknown_survives_later_expiry(delivery, monkeypatch):
             ["first", "never"],
             RecordingSandbox(action),
             10,
-            "synthetic-run",
+            workspace.operation_context["run_id"],
         )
     assert captured.value.cleanup_unknown is True
     assert captured.value.cleanup_evidence == cleanup
     assert not (run_dir / "evidence/report.json").exists()
 
 
+@pytest.mark.postgres
 def test_capture_expiry_after_first_check_cannot_dispatch_second(delivery, monkeypatch):
     workspace, run_dir = delivery
     expired = False
@@ -422,13 +452,14 @@ def test_capture_expiry_after_first_check_cannot_dispatch_second(delivery, monke
             ["first", "never"],
             sandbox,
             10,
-            "synthetic-run",
+            workspace.operation_context["run_id"],
             deadline=time.monotonic() + 10,
         )
     assert len(sandbox.calls) == 1
     assert not (run_dir / "evidence/report.json").exists()
 
 
+@pytest.mark.postgres
 def test_review_expiry_before_publish_preserves_existing_workspace(
     delivery, monkeypatch
 ):
@@ -444,7 +475,10 @@ def test_review_expiry_before_publish_preserves_existing_workspace(
     monkeypatch.setattr(review, "_write_artifact", stop_before_publish)
     with pytest.raises(ExecutionDeadlineExceeded):
         review.Review.prepare(
-            workspace, run_dir, "synthetic-run", deadline=time.monotonic() + 10
+            workspace,
+            run_dir,
+            workspace.operation_context["run_id"],
+            deadline=time.monotonic() + 10,
         )
     assert not (run_dir / "review").exists()
     assert (workspace.baseline_path / "main.py").read_bytes() == baseline

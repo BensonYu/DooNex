@@ -1,11 +1,15 @@
 import subprocess
 import tarfile
-import uuid
 
 import pytest
 from doonex.evidence import Evidence
 from doonex.sandbox import Sandbox
 from doonex.workspace import Workspace
+from sandbox_test_support import sandbox_context as sandbox_context_fixture
+
+sandbox_context = sandbox_context_fixture
+
+pytestmark = pytest.mark.postgres
 
 
 def git(path, *args):
@@ -15,7 +19,7 @@ def git(path, *args):
 
 
 @pytest.fixture
-def workspace(tmp_path):
+def workspace(tmp_path, sandbox_context):
     repository = tmp_path / "repository"
     repository.mkdir()
     git(repository, "init", "-q")
@@ -24,7 +28,12 @@ def workspace(tmp_path):
     (repository / "main.py").write_text('print("old")\n')
     git(repository, "add", "main.py")
     git(repository, "commit", "-qm", "baseline")
-    task = Workspace.create(repository, "HEAD", tmp_path / "workspace")
+    task = Workspace.create(
+        repository,
+        "HEAD",
+        tmp_path / "workspace",
+        operation_context={"run_id": sandbox_context.run_id, **sandbox_context.binding},
+    )
     (task.path / "main.py").write_text('print("new")\n')
     (task.path / "added.py").write_text("answer = 42\n")
     return task
@@ -42,7 +51,7 @@ def test_fixed_snapshot_fresh_checks_and_delivery_integrity(workspace, tmp_path)
         ],
         Sandbox(),
         10,
-        uuid.uuid4().hex,
+        workspace.operation_context["run_id"],
     )
     assert report["verified"], report
     status = Evidence.inspect(workspace, run_dir, report["report_sha256"])
@@ -63,15 +72,30 @@ def test_fixed_snapshot_fresh_checks_and_delivery_integrity(workspace, tmp_path)
 @pytest.mark.docker
 def test_failed_timeout_and_missing_checks_cannot_verify(workspace, tmp_path):
     failure = Evidence.capture(
-        workspace, tmp_path / "failed", ["exit 7"], Sandbox(), 10, uuid.uuid4().hex
+        workspace,
+        tmp_path / "failed",
+        ["exit 7"],
+        Sandbox(),
+        10,
+        workspace.operation_context["run_id"],
     )
     assert not failure["verified"] and failure["checks"][0]["exit_code"] == 7
     timeout = Evidence.capture(
-        workspace, tmp_path / "timeout", ["sleep 30"], Sandbox(), 0.4, uuid.uuid4().hex
+        workspace,
+        tmp_path / "timeout",
+        ["sleep 30"],
+        Sandbox(),
+        0.4,
+        workspace.operation_context["run_id"],
     )
     assert not timeout["verified"] and timeout["checks"][0]["timed_out"]
     unchecked = Evidence.capture(
-        workspace, tmp_path / "unchecked", [], Sandbox(), 10, uuid.uuid4().hex
+        workspace,
+        tmp_path / "unchecked",
+        [],
+        Sandbox(),
+        10,
+        workspace.operation_context["run_id"],
     )
     assert not unchecked["verified"]
 
@@ -83,7 +107,9 @@ def test_missing_or_changed_artifact_invalidates_evidence(
     workspace, tmp_path, artifact
 ):
     run_dir = tmp_path / "run"
-    report = Evidence.capture(workspace, run_dir, [], Sandbox(), 10, uuid.uuid4().hex)
+    report = Evidence.capture(
+        workspace, run_dir, [], Sandbox(), 10, workspace.operation_context["run_id"]
+    )
     path = run_dir / "evidence" / artifact
     path.write_bytes(path.read_bytes() + b"tampered")
     assert not Evidence.inspect(workspace, run_dir, report["report_sha256"])["valid"]
@@ -93,7 +119,9 @@ def test_missing_or_changed_artifact_invalidates_evidence(
 
 def test_fixed_snapshot_and_log_symlinks_are_rejected(workspace, tmp_path):
     run_dir = tmp_path / "run"
-    Evidence.capture(workspace, run_dir, [], Sandbox(), 10, uuid.uuid4().hex)
+    Evidence.capture(
+        workspace, run_dir, [], Sandbox(), 10, workspace.operation_context["run_id"]
+    )
     snapshot = run_dir / "evidence" / "snapshot"
     (snapshot / "main.py").unlink()
     (snapshot / "main.py").symlink_to(workspace.path / "main.py")
@@ -105,7 +133,12 @@ def test_fixed_snapshot_and_log_symlinks_are_rejected(workspace, tmp_path):
 def test_missing_or_replaced_check_log_invalidates_evidence(workspace, tmp_path):
     run_dir = tmp_path / "run"
     Evidence.capture(
-        workspace, run_dir, ["printf verified"], Sandbox(), 10, uuid.uuid4().hex
+        workspace,
+        run_dir,
+        ["printf verified"],
+        Sandbox(),
+        10,
+        workspace.operation_context["run_id"],
     )
     log = run_dir / "evidence" / "check-1.log"
     log.write_text("replaced")

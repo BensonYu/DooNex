@@ -2,17 +2,21 @@ import errno
 import json
 import subprocess
 from pathlib import Path
-from uuid import uuid4
 
 import pytest
 from doonex.evidence import Evidence
 from doonex.review import Review, ReviewError
 from doonex.sandbox import Sandbox
 from doonex.workspace import Workspace, read_files
+from sandbox_test_support import sandbox_context as sandbox_context_fixture
+
+sandbox_context = sandbox_context_fixture
+
+pytestmark = pytest.mark.postgres
 
 
 @pytest.fixture
-def review_workspace(tmp_path):
+def review_workspace(tmp_path, sandbox_context):
     repository = tmp_path / "source"
     repository.mkdir()
 
@@ -32,6 +36,7 @@ def review_workspace(tmp_path):
         "HEAD",
         run_dir / "workspace",
         baseline_path=run_dir / "baseline",
+        operation_context={"run_id": sandbox_context.run_id, **sandbox_context.binding},
     )
     (workspace.path / "main.py").write_text("answer = 2\n")
     (workspace.path / "deleted.txt").unlink()
@@ -41,7 +46,7 @@ def review_workspace(tmp_path):
 
 def test_handoff_is_complete_database_bound_and_idempotent(review_workspace):
     workspace, run_dir = review_workspace
-    run_id = str(uuid4())
+    run_id = workspace.operation_context["run_id"]
     handoff = Review.prepare(workspace, run_dir, run_id)
     assert isinstance(handoff["context_path"], str)
     context = Path(handoff["context_path"])
@@ -91,7 +96,7 @@ def test_handoff_is_complete_database_bound_and_idempotent(review_workspace):
 )
 def test_context_changes_are_rejected(review_workspace, tmp_path, case):
     workspace, run_dir = review_workspace
-    handoff = Review.prepare(workspace, run_dir, str(uuid4()))
+    handoff = Review.prepare(workspace, run_dir, workspace.operation_context["run_id"])
     context = Path(handoff["context_path"])
     if case in {"before", "after"}:
         (context / case / "main.py").write_text("tampered\n")
@@ -130,7 +135,7 @@ def test_context_changes_are_rejected(review_workspace, tmp_path, case):
 @pytest.mark.parametrize("target", ["workspace", "baseline"])
 def test_executor_or_initial_copy_changes_invalidate_handoff(review_workspace, target):
     workspace, run_dir = review_workspace
-    handoff = Review.prepare(workspace, run_dir, str(uuid4()))
+    handoff = Review.prepare(workspace, run_dir, workspace.operation_context["run_id"])
     original_report = (run_dir / "review/report.json").read_bytes()
     root = workspace.path if target == "workspace" else workspace.baseline_path
     (root / "main.py").write_text("changed after handoff\n")
@@ -144,7 +149,7 @@ def test_executor_or_initial_copy_changes_invalidate_handoff(review_workspace, t
 @pytest.mark.docker
 def test_review_container_cannot_write_delete_or_rename_context(review_workspace):
     workspace, run_dir = review_workspace
-    run_id = str(uuid4())
+    run_id = workspace.operation_context["run_id"]
     handoff = Review.prepare(workspace, run_dir, run_id)
     context = Path(handoff["context_path"])
     before = read_files(context, exclude_generated=False)
@@ -169,14 +174,21 @@ Path('/tmp/review-scratch').write_text('scratch is isolated')
 print(json.dumps(results))
 """
     sandbox = Sandbox()
+    binding = dict(workspace.operation_context)
+    binding.pop("run_id")
     result = sandbox.run(
-        context, "python - <<'PY'\n" + script + "\nPY", 10, run_id, read_only=True
+        context,
+        "python - <<'PY'\n" + script + "\nPY",
+        10,
+        run_id,
+        read_only=True,
+        **binding,
     )
     assert result["exit_code"] == 0, result
     assert json.loads(result["output"]) == [errno.EROFS] * 14
     assert read_files(context, exclude_generated=False) == before
     assert Review.inspect(workspace, run_dir, handoff)["valid"]
-    assert sandbox.containers(run_id) == []
+    assert sandbox.containers(run_id, **binding) == []
 
 
 @pytest.mark.docker
@@ -192,8 +204,9 @@ def test_review_and_final_delivery_survive_original_repository_move(
         workspace.base_commit,
         workspace.baseline_path,
         workspace.baseline_digest,
+        workspace.operation_context,
     )
-    run_id = str(uuid4())
+    run_id = workspace.operation_context["run_id"]
     handoff = Review.prepare(workspace, run_dir, run_id)
     assert Review.inspect(workspace, run_dir, handoff)["valid"]
     report = Evidence.capture(
@@ -222,4 +235,5 @@ def test_baseline_requires_its_saved_hash_and_is_not_writable_task_content(
             workspace.base_commit,
             workspace.path / "nested-task",
             baseline_path=workspace.path,
+            operation_context=workspace.operation_context,
         )
