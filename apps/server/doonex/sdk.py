@@ -1380,6 +1380,7 @@ def run_session(
     frozen_prompt: str | None = None,
     responses_transport: Callable | None = None,
     persistence_deadline: float | None = None,
+    deadline_provider: Callable[[], float] | None = None,
 ) -> str:
     """Run/resume one SDK conversation with server-owned model credentials.
 
@@ -1437,7 +1438,20 @@ def run_session(
         raise ValueError("Scheduling resume cannot append a new prompt")
     from doonex.deadline import check_deadline
 
-    check = lambda: check_deadline(persistence_deadline)
+    def check():
+        nonlocal persistence_deadline
+        if deadline_provider is not None:
+            candidate = deadline_provider()
+            if candidate is None:
+                raise ValueError("Execution deadline provider returned no bound")
+            check_deadline(candidate)
+            persistence_deadline = (
+                candidate
+                if persistence_deadline is None
+                else min(persistence_deadline, candidate)
+            )
+        check_deadline(persistence_deadline)
+
     check_source(prompt, check=check)
     check_source(skill, check=check)
     selected_skill = _runtime_skill(_redact(skill, api_key))
@@ -1485,7 +1499,10 @@ def run_session(
     )
     saved_path = Path(LocalConversation.get_persistence_dir(state_dir, conversation_id))
     with SessionFileStore(
-        saved_path, limits=SESSION_LIMITS, deadline=persistence_deadline
+        saved_path,
+        limits=SESSION_LIMITS,
+        deadline=persistence_deadline,
+        deadline_provider=deadline_provider,
     ) as session_store:
         scheduling_runtime = (
             _SchedulingRuntime(

@@ -224,10 +224,12 @@ def test_arena_prepare_integrity_and_start_share_deadline(context, monkeypatch):
     locks = []
 
     @contextmanager
-    def locked(identifier):
+    def locked(identifier, *, deadline):
+        assert deadline == expected_deadline
         locks.append(identifier)
         yield None, store.batch
 
+    expected_deadline = deadline
     monkeypatch.setattr(service, "locked", locked)
     assert service.start(store.batch["id"], deadline=deadline)
     assert store.batch["state"] == "running" and store.batch["first_started_at"]

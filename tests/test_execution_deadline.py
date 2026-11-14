@@ -87,8 +87,9 @@ def test_resume_policy_reads_cannot_bypass_session_deadline(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize("mode", ["chat", "responses"])
+@pytest.mark.parametrize("tightening", ["store", "provider"])
 def test_each_actual_sdk_request_clamps_timeout_after_reservation(
-    tmp_path, monkeypatch, mode
+    tmp_path, monkeypatch, mode, tightening
 ):
     timeouts = []
     replies = iter(
@@ -114,16 +115,21 @@ def test_each_actual_sdk_request_clamps_timeout_after_reservation(
         kwargs, reservations, settlements, commands, _ = harness(tmp_path)
         monkeypatch.setattr(sdk.GuardedLLM, "_transport_call", transport)
     before = kwargs["before_model"]
+    bounds = [time.monotonic() + 30]
 
     def reserve(*args, **options):
         result = before(*args, **options)
         if len(reservations) == 2:
             # Simulate preparation/DB time consuming the original allowance.
             # This happens after admission and before the actual SDK call.
-            sdk._SESSION_STORES[kwargs["run_id"]].deadline = time.monotonic() + 2
+            bounds[0] = time.monotonic() + 2
+            if tightening == "store":
+                sdk._SESSION_STORES[kwargs["run_id"]].deadline = bounds[0]
         return result
 
     kwargs.update(before_model=reserve, persistence_deadline=time.monotonic() + 30)
+    if tightening == "provider":
+        kwargs["deadline_provider"] = lambda: bounds[0]
     assert sdk.run_session(**kwargs) == "finished"
     assert len(timeouts) == len(reservations) == len(settlements) == 2
     assert timeouts[0] == kwargs["model"]["timeout_seconds"]
@@ -223,32 +229,52 @@ def test_worker_passes_original_remaining_clock_and_records_deadline_stop(
 
 
 @pytest.mark.postgres
-def test_worker_commits_first_clock_before_expiring_content_initialization(
-    settings, store, request_data, tmp_path, monkeypatch
+@pytest.mark.parametrize("stage", ["startup", "run"])
+def test_worker_initialization_expiry_respects_first_clock_boundary(
+    settings, store, request_data, tmp_path, monkeypatch, stage
 ):
     run, _, _ = prepare_run(store, settings, request_data, tmp_path)
     calls = scripted_model(monkeypatch, [])
     original = Library.__init__
+    execute = Worker._execute
+    in_execute = False
     observed = []
 
+    def executing(worker, *args, **kwargs):
+        nonlocal in_execute
+        in_execute = True
+        return execute(worker, *args, **kwargs)
+
     def expires(service, *args, **kwargs):
-        if kwargs.get("deadline") is not None:
+        if kwargs.get("deadline") is not None and in_execute == (stage == "run"):
             current = store.get(run["id"])
-            assert current["state"] == "running" and current["first_started_at"]
+            if stage == "run":
+                assert current["state"] == "running" and current["first_started_at"]
+            else:
+                assert current["state"] == "queued"
+                assert current["first_started_at"] is None
             observed.append(kwargs["deadline"])
             kwargs["deadline"] = time.monotonic() - 1
         return original(service, *args, **kwargs)
 
     monkeypatch.setattr(Library, "__init__", expires)
+    monkeypatch.setattr(Worker, "_execute", executing)
     monkeypatch.setattr(
         Sandbox,
         "stop_run",
         lambda *_a, **_k: {"remaining": [], "errors": [], "stopped": []},
     )
-    Worker(settings).run(once=True)
+    if stage == "startup":
+        with pytest.raises(ExecutionDeadlineExceeded):
+            Worker(settings).run(once=True)
+    else:
+        Worker(settings).run(once=True)
     final = store.get(run["id"])
-    assert len(observed) == 1 and final["state"] == "budget_exceeded"
-    assert final["first_started_at"] and not calls
+    assert len(observed) == 1 and not calls
+    if stage == "run":
+        assert final["state"] == "budget_exceeded" and final["first_started_at"]
+    else:
+        assert final == store.get(run["id"]) == run
     assert final["usage"]["calls"] == final["usage"]["reserved_tokens"] == 0
     assert not store.pending(run["id"])
     assert not (settings.home / "runs" / run["id"]).exists()

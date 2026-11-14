@@ -3,10 +3,10 @@
 import time
 from copy import deepcopy
 
-from doonex.budget import BatchHalt, elapsed
+from doonex.budget import BatchHalt, Halt, elapsed
 from doonex.cleanup import cleanup_intent_unresolved, sandbox_context
 from doonex.deadline import check_deadline
-from doonex.store import dispatch_lock, execution_fenced, now
+from doonex.store import OwnershipLost, dispatch_lock, execution_fenced, now
 
 PREPARATION_SECONDS = 30.0
 
@@ -51,14 +51,105 @@ def foreground_waiting(connection):
 
 
 class Scheduler:
-    def __init__(self, settings, store):
+    def __init__(self, settings, store, *, execution_clock=None):
         from doonex.background import Background
 
         self.settings, self.store = settings, store
-        self.background = Background(settings, store)
+        self.execution_clock = execution_clock
+        self.background = Background(settings, store, execution_clock=execution_clock)
         self.cleanup_blocked = False
         self._authorization_cursor = None
         self._maintenance_cursor = None
+
+    def execution_bound(self, connection, run, *, deadline=None, starting=False):
+        """Called with dispatch/Run locks; original scopes never renew on resume."""
+        from doonex.arena import _planned_run_ids, digest
+        from doonex.background import BackgroundStopped
+        from doonex.budget import _locked_batch
+        from doonex.execution_clock import ClockError
+
+        check_deadline(deadline)
+        clock = self.execution_clock
+        if clock is None:
+            return None
+        evaluation_id = run["request"].get("arena", {}).get("evaluation_id")
+        try:
+            bounds = [
+                clock.duration(
+                    "run",
+                    run["id"],
+                    started_at=run["first_started_at"],
+                    seconds=run["request"]["budget"]["max_seconds"],
+                    binding=digest(run["request"], deadline=deadline),
+                )
+            ]
+            batch = _locked_batch(connection, run, dispatch=not starting)
+            check_deadline(deadline)
+            if batch is not None:
+                identifier, value = batch
+                if starting and value.get("state") not in {"queued", "running"}:
+                    raise BatchHalt("批次已停止，禁止初始化新工作", identifier)
+                try:
+                    planned = _planned_run_ids(value, deadline=deadline)
+                except ValueError as error:
+                    raise BatchHalt(str(error), identifier) from error
+                if (
+                    value.get("id") != identifier
+                    or value.get("background") != run["request"].get("background")
+                    or run["id"] not in planned
+                ):
+                    raise BatchHalt("批次时钟与子运行冻结归属不一致", identifier)
+                if value.get("first_started_at") is not None:
+                    bounds.append(
+                        clock.duration(
+                            "batch",
+                            identifier,
+                            started_at=value["first_started_at"],
+                            seconds=value["batch_budget"]["max_seconds"],
+                            binding=digest(
+                                {
+                                    key: value.get(key)
+                                    for key in (
+                                        "batch_budget",
+                                        "fingerprint",
+                                        "attempts",
+                                        "background",
+                                    )
+                                },
+                                deadline=deadline,
+                            ),
+                        )
+                    )
+                elif not starting or value["state"] != "queued":
+                    raise BatchHalt("批次原首次时钟缺失", identifier)
+                if value.get("background"):
+                    bound = self.background.deadline(
+                        connection,
+                        value["background"]["authorization_id"],
+                        identifier,
+                        deadline=deadline,
+                    )
+                    if bound is not None:
+                        bounds.append(bound)
+            bound = clock.minimum(*bounds, deadline=deadline)
+            self.check_execution_bound(bound, evaluation_id)
+            return bound
+        except BackgroundStopped as error:
+            raise BatchHalt(str(error), evaluation_id) from error
+        except ClockError as error:
+            if error.scope.kind in {"batch", "allocation", "window", "day"}:
+                raise BatchHalt(str(error), evaluation_id) from error
+            raise Halt(str(error)) from error
+
+    def check_execution_bound(self, bound, evaluation_id=None):
+        from doonex.execution_clock import ClockError
+
+        try:
+            self.execution_clock.check(bound)
+        except ClockError as error:
+            if error.scope.kind in {"batch", "allocation", "window", "day"}:
+                raise BatchHalt(str(error), evaluation_id) from error
+            raise Halt(str(error)) from error
 
     def preflight(
         self, connection, run, *, yield_foreground=True, deadline: float | None = None
@@ -73,6 +164,9 @@ class Scheduler:
         from doonex.sdk import SchedulerYield
 
         check_deadline(deadline)
+        bound = self.execution_bound(connection, run, deadline=deadline)
+        if bound is not None:
+            deadline = bound.at
         if cleanup_intent_unresolved(run):
             raise BatchHalt(
                 "原清理意图尚未核实；禁止派发",
@@ -80,7 +174,7 @@ class Scheduler:
             )
         binding = run["request"].get("background")
         if not binding:
-            return
+            return bound
         evaluation_id = run["request"]["arena"]["evaluation_id"]
         fenced = execution_fenced(connection)
         check_deadline(deadline)
@@ -102,6 +196,9 @@ class Scheduler:
         check_deadline(deadline)
         if waiting:
             raise SchedulerYield("前台任务等待；已停止新后台派发")
+        if bound is not None:
+            self.check_execution_bound(bound, evaluation_id)
+        return bound
 
     def should_yield(self, run_id, *, deadline: float | None = None):
         # This is an advisory early yield. Actual admission uses the same
@@ -205,6 +302,23 @@ class Scheduler:
         # Unknown containers block resume; no cleanup or side effects are
         # assumed merely because the durable state says yielded.
         try:
+            with self.store.connect() as c:
+                dispatch_lock(c)
+                current = c.execute(
+                    "SELECT data FROM runs WHERE id=%s FOR UPDATE", (run["id"],)
+                ).fetchone()["data"]
+                check_deadline(deadline)
+                if current.get("owner") != run.get("owner") or current.get(
+                    "request"
+                ) != run.get("request"):
+                    self.cleanup_blocked = True
+                    raise OwnershipLost("后台核查的执行归属或冻结请求已变化")
+                if execution_fenced(c) or cleanup_intent_unresolved(current):
+                    self.cleanup_blocked = True
+                    return False
+                if current["state"] != "yielded":
+                    return False
+                check_deadline(deadline)
             if Sandbox().containers(
                 run["id"], deadline=deadline, **sandbox_context(run)
             ):
@@ -242,6 +356,16 @@ class Scheduler:
                 from doonex.budget import _locked_batch
 
                 check_deadline(deadline)
+                if current.get("owner") != run.get("owner") or current.get(
+                    "request"
+                ) != run.get("request"):
+                    self.cleanup_blocked = True
+                    raise OwnershipLost("后台核查的执行归属或冻结请求已变化")
+                if current["state"] != "yielded" or current.get("scheduling") != saved:
+                    return False
+                if cleanup_intent_unresolved(current):
+                    self.cleanup_blocked = True
+                    return False
                 _locked_batch(c, current, dispatch=True)
                 check_deadline(deadline)
                 self.preflight(c, current, deadline=deadline)
@@ -359,7 +483,7 @@ class Scheduler:
                     deadline=deadline,
                 )
                 check_deadline(deadline)
-                self.background.attach(c, claim, result)
+                self.background.attach(c, claim, result, deadline=deadline)
                 check_deadline(deadline)
             return result
         except BackgroundWaiting as error:
@@ -423,7 +547,7 @@ class Scheduler:
                     check_deadline(deadline)
             except BackgroundStopped as error:
                 check_deadline(deadline)
-                arena.stop(batch["id"], "cancelling", str(error))
+                arena.stop(batch["id"], "cancelling", str(error), deadline=deadline)
                 check_deadline(deadline)
         # A stop can have just made this parent terminal. Recheck its binding
         # under the parent lock before the original day/allocation settlement.
@@ -434,7 +558,7 @@ class Scheduler:
             )
             check_deadline(deadline)
             if current is not None and current["state"] in TERMINAL_BATCHES:
-                self.background.settle(c, current["id"], current)
+                self.background.settle(c, current["id"], current, deadline=deadline)
                 # An expired settlement is rolled back by this original transaction.
                 check_deadline(deadline)
 

@@ -231,9 +231,9 @@ def test_hash_return_expiry_never_enters_admission_transaction(
     digests = observe_digest(
         monkeypatch,
         deadline,
-        after=lambda count: clock.__setitem__(0, deadline + 1)
-        if count == expired_digest
-        else None,
+        after=lambda count: (
+            clock.__setitem__(0, deadline + 1) if count == expired_digest else None
+        ),
     )
     original = yielded.store.locked
     dispatches = []
@@ -350,11 +350,15 @@ def test_foreground_committed_during_hash_stops_next_optional_stage(
 
 @pytest.mark.parametrize(
     "stage",
-    ["validate_preflight", "final_lock", "batch_guard", "final_preflight", "queue_event"],
+    [
+        "validate_preflight",
+        "final_lock",
+        "batch_guard",
+        "final_preflight",
+        "queue_event",
+    ],
 )
-def test_final_admission_expiry_rolls_back_queue_and_event(
-    yielded, monkeypatch, stage
-):
+def test_final_admission_expiry_rolls_back_queue_and_event(yielded, monkeypatch, stage):
     clock, deadline = common_clock(monkeypatch)
     observe_probe(monkeypatch, yielded, deadline)
     observe_digest(monkeypatch, deadline)
@@ -495,14 +499,17 @@ def test_prior_unknown_refuses_new_probe_without_changing_evidence(
         assert yielded.scheduler.cleanup_blocked
     with yielded.store.connect() as connection:
         assert execution_fenced(connection)
-        assert connection.execute(
-            "SELECT data->>'state' AS state FROM controller_operations WHERE id=%s",
-            (operation.operation_id,),
-        ).fetchone()["state"] == "unknown"
+        assert (
+            connection.execute(
+                "SELECT data->>'state' AS state FROM controller_operations WHERE id=%s",
+                (operation.operation_id,),
+            ).fetchone()["state"]
+            == "unknown"
+        )
 
 
 @pytest.mark.parametrize("cancelled", [False, True])
-def test_admitted_probe_unknown_keeps_real_operation_and_prior_inventory(
+def test_admitted_probe_unknown_keeps_real_operation_and_terminal_history(
     yielded, monkeypatch, cancelled
 ):
     run = yielded.store.get(yielded.run_id)
@@ -522,7 +529,6 @@ def test_admitted_probe_unknown_keeps_real_operation_and_prior_inventory(
         current["recovery"] = {
             "cleanup_evidence": prior_receipt,
             "cleanup_attempt_evidence": prior_attempt,
-            "controller_process_evidence": [prior_receipt],
         }
     with yielded.store.connect() as connection:
         assert not execution_fenced(connection)
@@ -579,13 +585,14 @@ def test_admitted_probe_unknown_keeps_real_operation_and_prior_inventory(
     recovery = after["run"]["recovery"]
     assert recovery[RECORD_UNKNOWN] and recovery[DAEMON_UNKNOWN]
     assert recovery["cleanup_attempt_evidence"] == prior_attempt
-    assert recovery["controller_process_evidence"] == [
-        prior_receipt,
-        faults[0][1],
-    ]
+    # The unresolved inventory contains only unknown operations. The safe
+    # terminal history remains in its original durable controller row.
+    assert recovery["controller_process_evidence"] == [faults[0][1]]
     assert recovery["cleanup_evidence"] == faults[0][1]
     assert yielded.scheduler.cleanup_blocked
     operations_after = controller_rows(yielded)
+    assert all(row in operations_after for row in operations_before)
+    assert prior in operations_after
     added = [row for row in operations_after if row not in operations_before]
     assert len(added) == 1 and str(added[0]["id"]) == faults[0][0]
     record = added[0]["data"]

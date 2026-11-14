@@ -400,6 +400,42 @@ class Store:
             ).fetchone()
         return row["data"] if row else None
 
+    def scheduling_runs(self, *, states, capacity, deadline):
+        """Read the complete bounded safety census, never a truncated prefix.
+
+        The state-first ordering uses runs_state_order_v1. Column/payload
+        disagreement cannot turn a damaged row into execution authority.
+        """
+        from doonex.deadline import check_deadline
+
+        check_deadline(deadline)
+        if type(capacity) is not int or capacity < 1:
+            raise ValueError("调度核查容量无效")
+        if not isinstance(states, (set, frozenset)) or not states <= RUN_STATES:
+            raise ValueError("调度核查状态无效")
+        if not states:
+            return []
+        with self.connect() as c:
+            check_deadline(deadline)
+            rows = c.execute(
+                "SELECT id,state,data FROM runs WHERE state IN ("
+                + ",".join("'" + state + "'" for state in sorted(states))
+                + ") ORDER BY state,data->>'created_at' DESC,id DESC LIMIT %s",
+                (capacity + 1,),
+            ).fetchall()
+            check_deadline(deadline)
+        if len(rows) > capacity:
+            raise ValueError("调度核查容量超限；保留全部运行并停止新派发")
+        for row in rows:
+            if (
+                not isinstance(row["data"], dict)
+                or row["data"].get("id") != str(row["id"])
+                or row["data"].get("state") != row["state"]
+            ):
+                raise ValueError("调度运行标识或状态绑定无效；停止新派发")
+        check_deadline(deadline)
+        return [row["data"] for row in rows]
+
     def list_runs(self, limit=100, project_id=None, *, states=None):
         if limit is not None and (type(limit) is not int or limit < 0):
             raise ValueError("运行数量上限必须为非负整数或 None")

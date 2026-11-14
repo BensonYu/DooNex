@@ -157,9 +157,12 @@ def _identity(value):
 
 
 class SessionFileStore(FileStore):
-    def __init__(self, root: Path, *, limits=LIMITS, deadline=None):
+    def __init__(
+        self, root: Path, *, limits=LIMITS, deadline=None, deadline_provider=None
+    ):
         self.root = str(root)
         self.limits, self.deadline = limits, deadline
+        self.deadline_provider = deadline_provider
         self._failure = None
         self._failure_cause = None
         self._fd = None
@@ -186,9 +189,21 @@ class SessionFileStore(FileStore):
         from doonex.deadline import ExecutionDeadlineExceeded, check_deadline
 
         try:
+            if self.deadline_provider is not None:
+                candidate = self.deadline_provider()
+                if candidate is None:
+                    raise ValueError("Execution deadline provider returned no bound")
+                check_deadline(candidate)
+                self.deadline = (
+                    candidate
+                    if self.deadline is None
+                    else min(self.deadline, candidate)
+                )
             check_deadline(self.deadline)
         except ExecutionDeadlineExceeded as error:
             self._fail("Session persistence deadline exceeded", cause=error)
+        except (TypeError, ValueError) as error:
+            self._fail("Session persistence deadline invalid", cause=error)
 
     def validate_source(self, value, *, max_bytes=16 * MIB):
         with self._operation():

@@ -24,6 +24,9 @@ from doonex.store import OwnershipLost, Store, now
 
 WORKER_LOCK = 4142061106
 ACTIVE = {"running", "verifying", "pausing"}
+MAX_YIELDED_RUNS = 16
+MAX_RECOVERY_RUNS = 64
+MAX_STARTUP_BATCHES = 64
 
 
 class PermissionViolation(RuntimeError):
@@ -111,10 +114,14 @@ def get_workspace(run, directory):
 
 class Worker:
     def __init__(self, settings: Settings):
+        from doonex.execution_clock import ExecutionClock
         from doonex.scheduling import Scheduler
 
         self.settings, self.store = settings, Store(settings.database_url)
-        self.scheduler = Scheduler(settings, self.store)
+        self.execution_clock = ExecutionClock()
+        self.scheduler = Scheduler(
+            settings, self.store, execution_clock=self.execution_clock
+        )
         self.lock_connection = None
         self.stopping = False
         self.cleanup_blocked = False
@@ -184,18 +191,31 @@ class Worker:
         with bind_registry(registry):
             yield registry
 
-    def reconcile(self):
+    def reconcile(self, *, deadline=None):
         from doonex.controller_operations import current_registry
         from doonex.sandbox import Sandbox
+        from doonex.scheduling import PREPARATION_SECONDS
         from doonex.store import execution_fenced
 
+        limit = time.monotonic() + PREPARATION_SECONDS
+        deadline = limit if deadline is None else min(deadline, limit)
         with self.controller_actor():
             sandbox = Sandbox()
-            for run in self.store.list_runs(
-                limit=None, states=ACTIVE | {"interrupted"}
+            for run in self.store.scheduling_runs(
+                capacity=MAX_RECOVERY_RUNS,
+                states=ACTIVE | {"interrupted"},
+                deadline=deadline,
             ):
+                check_deadline(deadline)
                 with self.store.locked(run["id"], dispatch=True) as (c, current):
+                    check_deadline(deadline)
                     self.lease()
+                    if (
+                        current.get("owner") != run.get("owner")
+                        or current.get("request") != run.get("request")
+                        or current.get("state") != run.get("state")
+                    ):
+                        raise OwnershipLost("恢复核查期间运行归属或状态已变化")
                     blocked = execution_fenced(c)
                     pending_intent = cleanup_intent_unresolved(current)
                     self.store.mark_pending_unknown(run["id"], c, current)
@@ -234,6 +254,9 @@ class Worker:
                     )
                 if intent is None:
                     continue
+                # A committed intent remains unresolved if preparation expired.
+                # Do not begin a fresh external cleanup after that boundary.
+                check_deadline(deadline)
                 result = stop_containers(
                     sandbox,
                     run["id"],
@@ -275,6 +298,7 @@ class Worker:
                     if assignment and assignment["state"] != "completed":
                         assignment["state"] = latest["state"]
                     self.store.event(run["id"], "cleanup", result, c)
+                check_deadline(deadline)
 
     def execute(self, run_id):
         with self.controller_actor():
@@ -305,6 +329,8 @@ class Worker:
 
         generation_service = None
         arena = None
+        execution_bound = None
+        settlement_deadline = None
         role_keys = {}
         secrets = (self.settings.token, self.settings.database_url)
 
@@ -317,6 +343,8 @@ class Worker:
             with self.store.locked(run_id, dispatch=True) as (c, current):
                 if current["state"] != "queued":
                     return
+                if current["request"] != request:
+                    raise OwnershipLost("领取期间冻结请求已变化")
                 if cleanup_intent_unresolved(current):
                     current.update(
                         state="interrupted", reason="原清理意图尚未核实；禁止领取"
@@ -334,26 +362,46 @@ class Worker:
                 current.update(state="running", owner=self.owner, reason="Agent 执行中")
                 if current["first_started_at"] is None:
                     current["first_started_at"] = now()
-                execution_deadline = time.monotonic() + max(
-                    0, request["budget"]["max_seconds"] - elapsed(current)
-                )
                 self.store.event(run_id, "running", {}, c)
+
+            # Map only the committed original start, under the established
+            # dispatch -> Run -> batch -> grant/day order. The clock belongs
+            # to this Worker, including later execute calls after a yield.
+            with self.store.locked(run_id, self.owner, dispatch=True) as (c, current):
+                execution_bound = self.scheduler.execution_bound(
+                    c, current, starting=True
+                )
+                execution_deadline = execution_bound.at
 
             def execution_fence():
                 self.fence()
+                self.scheduler.check_execution_bound(
+                    execution_bound, request.get("arena", {}).get("evaluation_id")
+                )
                 check_deadline(execution_deadline)
 
             def remaining_execution():
-                nonlocal execution_deadline
-                # Persisted wall time remains the cross-restart authority. A
-                # backwards clock step cannot extend this process's allowance.
-                current = self.store.get(run_id)
-                execution_deadline = min(
-                    execution_deadline,
-                    time.monotonic()
-                    + max(0, request["budget"]["max_seconds"] - elapsed(current)),
-                )
+                nonlocal execution_deadline, execution_bound
+                with self.store.locked(run_id, self.owner, dispatch=True) as (
+                    c,
+                    current,
+                ):
+                    execution_bound = self.scheduler.execution_bound(
+                        c, current, deadline=execution_deadline
+                    )
+                    execution_deadline = execution_bound.at
                 return remaining_time(execution_deadline)
+
+            def dispatch_check(connection, current):
+                nonlocal execution_deadline, execution_bound
+                execution_fence()
+                bound = self.scheduler.preflight(
+                    connection, current, deadline=execution_deadline
+                )
+                if bound is not None:
+                    execution_bound = bound
+                    execution_deadline = bound.at
+                execution_fence()
 
             execution_fence()
             for role in run_roles(request):
@@ -382,6 +430,7 @@ class Worker:
                     request["arena"]["evaluation_id"], deadline=execution_deadline
                 ):
                     raise BatchHalt("评测批次已停止", request["arena"]["evaluation_id"])
+                remaining_execution()
             check_deadline(execution_deadline)
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             if generation_service:
@@ -532,13 +581,7 @@ class Worker:
                     self.store,
                     run_id,
                     self.owner,
-                    dispatch_check=lambda c, current: (
-                        check_deadline(execution_deadline),
-                        self.scheduler.preflight(
-                            c, current, deadline=execution_deadline
-                        ),
-                        check_deadline(execution_deadline),
-                    ),
+                    dispatch_check=dispatch_check,
                 )
                 attribution = ledger.attribution()
                 responses_transport = None
@@ -593,6 +636,9 @@ class Worker:
                         raise Halt("运行或角色已停止派发新动作")
                     intent = None
                     if responses_transport is not None:
+                        responses_transport.execution_deadline = min(
+                            responses_transport.execution_deadline, execution_deadline
+                        )
                         intent = responses_transport.prepare_intent(
                             responses_request_id
                         )
@@ -600,9 +646,14 @@ class Worker:
                         raise ValueError(
                             "Direct model cannot reserve a helper identity"
                         )
-                    return ledger.reserve(
+                    reservation = ledger.reserve(
                         input_tokens, output_tokens, helper_intent=intent
                     )
+                    if responses_transport is not None:
+                        responses_transport.execution_deadline = min(
+                            responses_transport.execution_deadline, execution_deadline
+                        )
+                    return reservation
 
                 def after_model(reservation, usage):
                     self.lease()
@@ -787,7 +838,9 @@ class Worker:
                     saved = self.store.get(run_id).get("scheduling") or {}
                     scheduling = SessionScheduling(
                         generation=generation,
-                        should_yield=lambda: self.scheduler.should_yield(run_id),
+                        should_yield=lambda: self.scheduler.should_yield(
+                            run_id, deadline=execution_deadline
+                        ),
                         on_yield=lambda receipt: self.scheduler.save_yield(
                             run_id,
                             self.owner,
@@ -823,6 +876,7 @@ class Worker:
                     on_event=lambda payload: role_event("sdk", payload),
                     should_stop=role_stop,
                     persistence_deadline=execution_deadline,
+                    deadline_provider=lambda: execution_deadline,
                     **(
                         {"responses_transport": responses_transport}
                         if responses_transport is not None
@@ -1099,9 +1153,7 @@ class Worker:
                                     "容器或模型传输进程终止状态不明；禁止验证派发"
                                 )
                             _locked_batch(c, current, dispatch=True)
-                            self.scheduler.preflight(
-                                c, current, deadline=execution_deadline
-                            )
+                            dispatch_check(c, current)
                             check_deadline(execution_deadline)
                             action = self.store.action(
                                 run_id,
@@ -1312,6 +1364,28 @@ class Worker:
         except BaseException as exc:  # noqa: BLE001 - record shutdown and clean task containers
             # A new lock holder owns cleanup after a connection loss.
             self.lease()
+            from doonex.budget import BatchHalt
+            from doonex.scheduling import PREPARATION_SECONDS
+
+            # Settling an admitted outcome remains necessary after business
+            # expiry. This one independent allowance never authorizes dispatch.
+            settlement_deadline = time.monotonic() + PREPARATION_SECONDS
+
+            if request.get("arena") and (
+                exception_cause(exc, BatchHalt)
+                or execution_bound is not None
+                and execution_bound.scope.kind
+                in {"batch", "allocation", "window", "day"}
+                and exception_cause(exc, ExecutionDeadlineExceeded)
+            ):
+                if not exception_cause(exc, BatchHalt):
+                    stopped = BatchHalt(str(exc), request["arena"]["evaluation_id"])
+                    stopped.__cause__ = exc
+                    exc = stopped
+                if arena is None:
+                    from doonex.arena import Arena
+
+                    arena = Arena(self.settings, self.store)
             from doonex.controller_operations import current_registry
 
             with self.store.locked(run_id, self.owner, dispatch=True) as (c, current):
@@ -1433,22 +1507,36 @@ class Worker:
                         request["arena"]["evaluation_id"],
                         "budget_exceeded",
                         str(exception_cause(exc, BatchHalt)),
+                        deadline=settlement_deadline,
                     )
-                elif (
-                    arena.stopped(request["arena"]["evaluation_id"])
-                    and arena.get(request["arena"]["evaluation_id"])["state"]
-                    == "running"
-                ):
-                    arena.stop(
-                        request["arena"]["evaluation_id"],
-                        "budget_exceeded",
-                        "批次时长预算已用尽",
+                else:
+                    current_batch = arena.get(
+                        request["arena"]["evaluation_id"], deadline=settlement_deadline
                     )
+                    if (
+                        current_batch["state"] == "running"
+                        and elapsed(current_batch)
+                        >= current_batch["batch_budget"]["max_seconds"]
+                    ):
+                        arena.stop(
+                            request["arena"]["evaluation_id"],
+                            "budget_exceeded",
+                            "批次时长预算已用尽",
+                            deadline=settlement_deadline,
+                        )
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 self.stopping = True
         finally:
             if arena:
-                arena.sync(request["arena"]["evaluation_id"])
+                from doonex.scheduling import PREPARATION_SECONDS
+
+                if settlement_deadline is None:
+                    settlement_deadline = min(
+                        time.monotonic() + PREPARATION_SECONDS, execution_deadline
+                    )
+                arena.sync(
+                    request["arena"]["evaluation_id"], deadline=settlement_deadline
+                )
 
     def run(self, once=False):
         self.store.initialize()
@@ -1466,13 +1554,23 @@ class Worker:
                 self.lock_connection = None
 
     def _run_ready(self, once):
-        self.reconcile()
         from doonex.arena import Arena
+        from doonex.scheduling import PREPARATION_SECONDS
 
-        arena = Arena(self.settings, self.store)
-        for batch in arena.list(states={"running", "cancelling"}):
-            arena.sync(batch["id"])
+        startup_deadline = time.monotonic() + PREPARATION_SECONDS
+        arena = Arena(self.settings, self.store, deadline=startup_deadline)
+        batches = arena.list(
+            states={"running", "cancelling"},
+            capacity=MAX_STARTUP_BATCHES,
+            deadline=startup_deadline,
+        )
+        self.reconcile(deadline=startup_deadline)
+        for batch in batches:
+            check_deadline(startup_deadline)
+            arena.sync(batch["id"], deadline=startup_deadline)
+        check_deadline(startup_deadline)
         while not self.stopping:
+            preparation_deadline = time.monotonic() + PREPARATION_SECONDS
             self.fence()
             from doonex.store import execution_fenced
 
@@ -1482,29 +1580,43 @@ class Worker:
                 raise RuntimeError(
                     "容器或模型传输进程终止状态不明；执行服务阻止后续任务，须核查"
                 )
-            self.scheduler.maintain()
             from doonex.budget import BatchHalt
 
-            for run in self.store.list_runs(limit=None, states={"yielded"}):
+            yielded_runs = self.store.scheduling_runs(
+                capacity=MAX_YIELDED_RUNS,
+                states={"yielded"},
+                deadline=preparation_deadline,
+            )
+            self.scheduler.maintain(deadline=preparation_deadline)
+            for run in yielded_runs:
                 try:
                     self.scheduler.resume_yielded(
                         run,
                         get_workspace(run, run_directory(self.settings, run["id"])),
+                        deadline=preparation_deadline,
                     )
-                    arena.sync(run["request"]["arena"]["evaluation_id"])
+                    arena.sync(
+                        run["request"]["arena"]["evaluation_id"],
+                        deadline=preparation_deadline,
+                    )
                 except BatchHalt as error:
                     arena.stop(
                         run["request"]["arena"]["evaluation_id"],
                         "budget_exceeded",
                         str(error),
+                        deadline=preparation_deadline,
                     )
                 if self.scheduler.cleanup_blocked:
                     raise RuntimeError("后台检查点存在残留或未知容器；须核查后恢复服务")
-            self.scheduler.claim_next()
+            check_deadline(preparation_deadline)
+            self.scheduler.claim_next(deadline=preparation_deadline)
             queued = self.store.next_queued_run()
+            check_deadline(preparation_deadline)
             if queued:
                 self.execute(queued["id"])
-            self.scheduler.maintain()
+            # Post-execution settlement is a separate finite slice. It cannot
+            # renew the original Run/batch clocks or the next admission census.
+            self.scheduler.maintain(deadline=time.monotonic() + PREPARATION_SECONDS)
             if once:
                 break
             time.sleep(0.5)
