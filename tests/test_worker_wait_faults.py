@@ -8,11 +8,14 @@ import hashlib
 import json
 import multiprocessing
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,6 +43,40 @@ tuning = tuning_fixture
 pytestmark = [pytest.mark.postgres, pytest.mark.docker]
 
 
+class _FaultWatchdogExpired(BaseException):
+    """A fixture failure guard, never a product deadline success."""
+
+
+@contextmanager
+def _failure_watchdog(events, seconds=60):
+    # SIGALRM belongs to this main-thread test only. A repeating alarm can also
+    # interrupt cleanup after the first alarm; the outer private runner remains
+    # responsible for genuinely uninterruptible native calls/process death.
+    assert threading.current_thread() is threading.main_thread()
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    assert previous_timer == (0.0, 0.0)
+    fired = []
+
+    def expired(signum, frame):
+        fired.append(time.monotonic())
+        events.append(
+            {"kind": "fixture_failure_watchdog_fired", "monotonic": fired[-1]}
+        )
+        raise _FaultWatchdogExpired(
+            "Worker fault fixture exceeded its external failure guard"
+        )
+
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds, 5)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        assert not fired, "Failure watchdog fired; this is a failed fault sample"
+
+
 def _tool_response():
     result = response("doonex_shell", {"command": "touch must-not-dispatch"}, 0)
     result.choices[0].message.tool_calls.extend(
@@ -64,11 +101,170 @@ def _foreground_request(request_data, tmp_path):
     return request
 
 
+def _durable_snapshot(store):
+    # This Store is the fixture's disposable schema. Preserve the actual rows
+    # before resource cleanup/schema teardown, including failure/unknown data.
+    tables = {
+        "runs": "id",
+        "events": "id",
+        "actions": "id",
+        "controller_operations": "id",
+        "arena_evaluations": "id",
+        "background_authorizations": "id",
+        "background_allocations": "id",
+        "background_days": "day",
+    }
+    with store.connect() as connection:
+        return {
+            table: connection.execute(
+                f"SELECT * FROM {table} ORDER BY {order}"
+            ).fetchall()
+            for table, order in tables.items()
+        }
+
+
+def _parent_accounting(store, evaluation_id):
+    with store.connect() as connection:
+        parent = connection.execute(
+            "SELECT data FROM arena_evaluations WHERE id=%s", (evaluation_id,)
+        ).fetchone()["data"]
+        allocations = connection.execute(
+            "SELECT * FROM background_allocations WHERE evaluation_id=%s ORDER BY id",
+            (evaluation_id,),
+        ).fetchall()
+        days = connection.execute(
+            "SELECT * FROM background_days WHERE day IN "
+            "(SELECT day FROM background_allocations WHERE evaluation_id=%s) ORDER BY day",
+            (evaluation_id,),
+        ).fetchall()
+    assert allocations and days
+    # Startup sync legitimately changes only the parent's status metadata.
+    # Frozen inputs, original first clock and every usage field remain exact.
+    return {
+        "arena_frozen_and_usage": {
+            key: value
+            for key, value in parent.items()
+            if key not in {"state", "reason", "updated_at"}
+        },
+        "allocations": allocations,
+        "days": days,
+    }
+
+
+def _cleanup_fixture_resources(settings, store, run_ids, *, processes=()):
+    """Reap live handles and remove only inspected, registered fixture IDs."""
+    before = _durable_snapshot(store)
+    print(
+        "worker_wait_fault_before_resource_cleanup="
+        + json.dumps(before, default=str, sort_keys=True)
+    )
+    reaped = []
+    for process in processes:
+        # These are this parent process's actual Popen handles, never old DB
+        # PIDs. A live, unreaped child cannot have had its PID reused.
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+            reaped.append(process.pid)
+        if process.stdout is not None:
+            process.stdout.close()
+    docker = shutil.which("docker")
+    assert docker is not None
+    removed = []
+    for run_id in sorted(set(run_ids)):
+        known_names = {
+            row["data"]["scope"]["container_name"]
+            for row in before["controller_operations"]
+            if row["data"]["run_id"] == run_id
+            and row["data"]["scope"]["container_name"] is not None
+        }
+        listed = subprocess.run(
+            [
+                docker,
+                "ps",
+                "-aq",
+                "--no-trunc",
+                "--filter",
+                "label=doonex.run_id=" + run_id,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        for identifier in listed.stdout.splitlines():
+            assert re.fullmatch(r"[0-9a-f]{64}", identifier)
+            inspected = subprocess.run(
+                [docker, "inspect", identifier],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=True,
+            )
+            values = json.loads(inspected.stdout)
+            assert len(values) == 1
+            value = values[0]
+            assert value["Id"] == identifier
+            assert value["Config"]["Labels"]["doonex.run_id"] == run_id
+            assert value["Name"].removeprefix("/") in known_names
+            root = run_directory(settings, run_id).resolve()
+            mounts = [
+                mount
+                for mount in value["Mounts"]
+                if mount["Destination"] == "/workspace"
+            ]
+            assert len(mounts) == 1 and mounts[0]["Type"] == "bind"
+            assert Path(mounts[0]["Source"]).resolve().is_relative_to(root)
+            removed.append(
+                {
+                    "run_id": run_id,
+                    "container_id": identifier,
+                    "container_name": value["Name"],
+                }
+            )
+            subprocess.run(
+                [docker, "rm", "-f", identifier],
+                capture_output=True,
+                timeout=15,
+                check=True,
+            )
+        remaining = subprocess.run(
+            [
+                docker,
+                "ps",
+                "-aq",
+                "--no-trunc",
+                "--filter",
+                "label=doonex.run_id=" + run_id,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        assert remaining.stdout == ""
+    assert _durable_snapshot(store) == before, (
+        "Fixture cleanup changed product accounting or recovery records"
+    )
+    print(
+        "worker_wait_fault_resource_cleanup="
+        + json.dumps(
+            {
+                "removed_exact_ids": removed,
+                "reaped_live_handles": reaped,
+                "durable_records_unchanged": True,
+            },
+            sort_keys=True,
+        )
+    )
+
+
 @pytest.fixture
 def wait_fault(tuning, store, request_data, tmp_path, monkeypatch):
     """One background Run, then an ordinary foreground through Worker.run."""
     settings, _, body, _ = tuning
     foreground_request = _foreground_request(request_data, tmp_path)
+    contexts = []
 
     def build(*, seconds=600):
         body["run_budget"]["max_seconds"] = seconds
@@ -94,7 +290,9 @@ def wait_fault(tuning, store, request_data, tmp_path, monkeypatch):
             on_checkpoint=None,
             after_background=None,
             response=_tool_response,
+            processes=[],
         )
+        contexts.append(context)
 
         def observe(kind, **values):
             context.events.append(
@@ -159,7 +357,8 @@ def wait_fault(tuning, store, request_data, tmp_path, monkeypatch):
 
         def run():
             try:
-                context.worker.run()
+                with _failure_watchdog(context.events):
+                    context.worker.run()
             except BaseException as error:  # noqa: BLE001 - assert actual runtime errors below
                 context.errors.append(error)
             finally:
@@ -180,15 +379,34 @@ def wait_fault(tuning, store, request_data, tmp_path, monkeypatch):
                         sort_keys=True,
                     )
                 )
+            assert not any(
+                item["kind"] == "fixture_failure_watchdog_fired"
+                for item in context.events
+            ), "Failure watchdog fired; this is a failed fault sample"
 
         context.enqueue, context.observe, context.run = enqueue, observe, run
+
+        def popen(*args, **kwargs):
+            assert kwargs.get("start_new_session") is True
+            process = subprocess.Popen(*args, **kwargs)
+            context.processes.append(process)
+            return process
+
+        supervised_subprocess = SimpleNamespace(**{**vars(subprocess), "Popen": popen})
+        monkeypatch.setattr(sandbox_module, "subprocess", supervised_subprocess)
+        monkeypatch.setattr(workspace_module, "subprocess", supervised_subprocess)
         monkeypatch.setattr(sdk.GuardedLLM, "_transport_call", transport)
         monkeypatch.setattr(sdk, "run_session", session)
         monkeypatch.setattr(Scheduler, "save_yield", checkpoint)
         monkeypatch.setattr(context.worker, "execute", execute)
         return context
 
-    return build
+    yield build
+    for context in contexts:
+        owned = [attempt["run_id"] for attempt in context.batch["attempts"]]
+        if context.foreground is not None:
+            owned.append(context.foreground["id"])
+        _cleanup_fixture_resources(settings, store, owned, processes=context.processes)
 
 
 def _assert_preserved(context, *, calls=1):
@@ -301,18 +519,36 @@ def test_worker_common_deadline_expires_without_fresh_background_admission(
 def test_worker_held_sdk_lock_expires_before_model_reservation(wait_fault):
     context = wait_fault(seconds=3)
     held = []
+    guard = threading.Lock()
+    watchdog_fired = []
+    watchdog = []
+
+    def release(*, rescue=False):
+        with guard:
+            if held:
+                sdk._RUN_LOCK.release()
+                held.clear()
+                if rescue:
+                    watchdog_fired.append(time.monotonic())
+                context.observe("actual_sdk_lock_released", watchdog_rescue=rescue)
+        if not rescue and watchdog:
+            watchdog[0].cancel()
+            watchdog[0].join(timeout=2)
+            assert not watchdog[0].is_alive()
 
     def lock_and_enqueue():
         assert sdk._RUN_LOCK.acquire(blocking=False)
-        held.append(True)
+        with guard:
+            held.append(True)
         context.enqueue()
         context.observe("actual_sdk_lock_held")
-
-    def release():
-        if held:
-            sdk._RUN_LOCK.release()
-            held.clear()
-            context.observe("actual_sdk_lock_released")
+        timer = threading.Timer(
+            max(0, context.deadline - time.monotonic()) + 10,
+            lambda: release(rescue=True),
+        )
+        timer.daemon = True
+        watchdog.append(timer)
+        timer.start()
 
     context.on_session = lock_and_enqueue
     context.after_background = release
@@ -320,6 +556,7 @@ def test_worker_held_sdk_lock_expires_before_model_reservation(wait_fault):
         context.run()
     finally:
         release()
+    assert not watchdog_fired, "SDK-lock rescue fired; this is a failed fault sample"
     current = _assert_preserved(context, calls=0)
     assert current["state"] in {"failed", "budget_exceeded"}, current["reason"]
     assert "deadline" in current["reason"].lower()
@@ -365,8 +602,6 @@ def test_worker_real_checkpoint_lock_timeout_rolls_back_receipt(
     def at_checkpoint():
         checkpoint_active.append(True)
 
-    from contextlib import contextmanager
-
     @contextmanager
     def locked(current_store, run_id, *args, **kwargs):
         if run_id != context.background_id or not checkpoint_active or faults:
@@ -401,23 +636,33 @@ from pathlib import Path
 root = Path(__file__).parent
 configuration = json.loads((root / 'configuration.json').read_text())
 operation = sys.argv[1]
-result = subprocess.run([configuration['docker'], *sys.argv[1:]], capture_output=True)
+binding = json.loads((root / 'current-call.json').read_text())
+assert binding['arguments'] == sys.argv[1:]
+delegate = subprocess.Popen([configuration['docker'], *sys.argv[1:]], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+stdout, stderr = delegate.communicate()
+record = {**binding, 'delegate_pid': delegate.pid, 'shim_pid': os.getpid(),
+          'delegate_executable': configuration['docker'], 'returncode': delegate.returncode,
+          'delegate_returned_monotonic': time.monotonic()}
 with (root / 'operations.jsonl').open('a') as output:
-    output.write(json.dumps({'operation': operation, 'returncode': result.returncode,
-                             'delegate_returned_monotonic': time.monotonic()}) + '\n')
-if (root / 'armed').exists() and operation == configuration['fault_operation']:
+    output.write(json.dumps(record) + '\n')
+if ((root / 'armed').exists() and operation == configuration['fault_operation']
+        and binding['run_id'] == configuration['run_id']):
     try:
-        descriptor = os.open(root / 'fired', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        descriptor = os.open(root / 'fired-claim', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         pass
     else:
         os.close(descriptor)
+        pending = root / ('fired-' + str(os.getpid()) + '.tmp')
+        pending.write_text(json.dumps({**record, 'phase': 'actual_delegate_returned_ack_withheld'}))
+        os.replace(pending, root / 'fired.json')
         # The real Docker CLI completed. Its ACK is withheld from the product;
         # the production supervisor must actually kill/reap this shim and EOF.
         time.sleep(30)
-os.write(1, result.stdout)
-os.write(2, result.stderr)
-raise SystemExit(result.returncode)
+os.write(1, stdout)
+os.write(2, stderr)
+raise SystemExit(delegate.returncode)
 """
 
 
@@ -431,7 +676,13 @@ def test_worker_real_docker_delayed_ack_keeps_proof_or_durable_unknown(
     control = tmp_path / "docker-ack-fault"
     control.mkdir()
     (control / "configuration.json").write_text(
-        json.dumps({"docker": real_docker, "fault_operation": fault_operation})
+        json.dumps(
+            {
+                "docker": real_docker,
+                "fault_operation": fault_operation,
+                "run_id": context.background_id,
+            }
+        )
     )
     executable = control / "docker"
     executable.write_text(f"#!{sys.executable}\n" + _DELAYED_DOCKER_ACK)
@@ -450,6 +701,22 @@ def test_worker_real_docker_delayed_ack_keeps_proof_or_durable_unknown(
         supervisor = kwargs.get("_supervisor")
         run_id = (
             supervisor.capability._operation.record["run_id"] if supervisor else None
+        )
+        assert supervisor is not None
+        operation_record = supervisor.capability._operation.record
+        # Worker actions are sequential. Publish the exact invocation before
+        # launching this shim; the shim refuses any argv/binding mismatch.
+        (control / "current-call.json").write_text(
+            json.dumps(
+                {
+                    "operation": arguments[0],
+                    "arguments": list(arguments),
+                    "run_id": run_id,
+                    "controller_operation_id": operation_record["operation_id"],
+                    "controller_operation_kind": operation_record["operation_kind"],
+                    "container_name": operation_record["scope"]["container_name"],
+                }
+            )
         )
         if (
             arguments[0] == "rm"
@@ -485,16 +752,38 @@ def test_worker_real_docker_delayed_ack_keeps_proof_or_durable_unknown(
     monkeypatch.setattr(sandbox_module.Sandbox, "_docker", docker)
     monkeypatch.setattr(sandbox_module.Sandbox, "run", run)
     context.run()
-    assert (control / "fired").exists()
+    fired = json.loads((control / "fired.json").read_text())
+    assert fired["phase"] == "actual_delegate_returned_ack_withheld"
+    assert fired["operation"] == fault_operation
+    assert fired["run_id"] == context.background_id
+    assert fired["controller_operation_kind"] == "sandbox_execute"
+    assert fired["delegate_executable"] == real_docker
+    assert fired["returncode"] == 0
+    assert fired["delegate_pid"] > 0 and fired["shim_pid"] > 0
     assert len(results) == 1
     result = results[0]
     records = [
         json.loads(line)
         for line in (control / "operations.jsonl").read_text().splitlines()
     ]
-    assert any(
-        row["operation"] == fault_operation and row["returncode"] == 0
+    assert [
+        {**row, "phase": fired["phase"]}
         for row in records
+        if row["shim_pid"] == fired["shim_pid"]
+    ] == [fired]
+    matching_operations = [
+        row
+        for row in _controller_rows(context.store)
+        if row["data"]["operation_id"] == fired["controller_operation_id"]
+    ]
+    assert len(matching_operations) == 1
+    actual_operation = matching_operations[0]["data"]
+    assert actual_operation["run_id"] == context.background_id
+    assert actual_operation["scope"]["container_name"] == fired["container_name"]
+    assert any(
+        item["pid"] == fired["shim_pid"]
+        and item["phase"] == "docker_" + fault_operation
+        for item in actual_operation["processes"]
     )
     assert result["exit_code"] == 0
     assert all(
@@ -538,14 +827,24 @@ def test_worker_real_docker_delayed_ack_keeps_proof_or_durable_unknown(
             and unknown[0]["data"]["operation_kind"] == "sandbox_execute"
         )
         assert unknown[0]["data"]["run_id"] == context.background_id
-        name = unknown[0]["data"]["scope"]["container_name"]
-        inspected = subprocess.run(
-            [real_docker, "inspect", name], check=False, capture_output=True, timeout=10
+        absent = subprocess.run(
+            [
+                real_docker,
+                "ps",
+                "-aq",
+                "--no-trunc",
+                "--filter",
+                "label=doonex.run_id=" + context.background_id,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         assert (
-            inspected.returncode != 0
-        )  # actual remove succeeded before its lost/late ACK
-        with pytest.raises(RuntimeError, match="终止状态不明"):
+            absent.stdout == ""
+        )  # successful complete observation, not inspect failure
+        with _failure_watchdog([]), pytest.raises(RuntimeError, match="终止状态不明"):
             Worker(context.settings).run(once=True)
         assert _controller_rows(context.store) == original_rows
         assert context.store.get(context.background_id)["usage"] == current["usage"]
@@ -564,14 +863,51 @@ def _crash_worker_child(settings, background_id, foreground_request, marker, sta
     original_save = Scheduler.save_yield
     original_cleanup = worker_module.stop_containers
     foreground = []
+    processes = []
+
+    def popen(*args, **kwargs):
+        assert kwargs.get("start_new_session") is True
+        process = subprocess.Popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    supervised_subprocess = SimpleNamespace(**{**vars(subprocess), "Popen": popen})
+    sandbox_module.subprocess = supervised_subprocess
+    workspace_module.subprocess = supervised_subprocess
+
+    def terminated(signum, frame):
+        worker.stopping = True
+        raise _FaultWatchdogExpired("Parent aborted an unreached crash fixture gate")
+
+    signal.signal(signal.SIGTERM, terminated)
 
     def gate():
-        Path(marker).write_text(
-            json.dumps({"foreground_id": foreground[0]["id"], "stage": stage})
+        # These gates contain no external operation in flight. Actual SIGKILL
+        # must never leave an untracked local CLI handle behind in this test.
+        operations = _controller_rows(worker.store)
+        assert all(
+            row["data"]["state"] in {"terminal", "not_spawned"} for row in operations
         )
+        assert all(process.poll() is not None for process in processes)
+        pending = Path(marker).with_suffix(f".{os.getpid()}.tmp")
+        pending.write_text(
+            json.dumps(
+                {
+                    "foreground_id": foreground[0]["id"],
+                    "background_id": background_id,
+                    "stage": stage,
+                    "no_live_controller_operation": True,
+                    "terminal_controller_hashes": [
+                        row["data"]["record_sha256"] for row in operations
+                    ],
+                }
+            )
+        )
+        os.replace(pending, marker)
         end = time.monotonic() + 30
         while time.monotonic() < end:
             time.sleep(0.02)
+        worker.stopping = True
         raise AssertionError("Fixture crash gate expired before parent killed worker")
 
     def transport(*args, **kwargs):
@@ -583,7 +919,7 @@ def _crash_worker_child(settings, background_id, foreground_request, marker, sta
 
     def save(scheduler, run_id, *args, **kwargs):
         assert run_id == background_id
-        if stage == "checkpoint_before_commit":
+        if stage == "checkpoint_before_save":
             gate()
         value = original_save(scheduler, run_id, *args, **kwargs)
         if stage == "checkpoint_after_commit":
@@ -598,7 +934,15 @@ def _crash_worker_child(settings, background_id, foreground_request, marker, sta
     sdk.GuardedLLM._transport_call = transport
     Scheduler.save_yield = save
     worker_module.stop_containers = cleanup
-    worker.run()
+    try:
+        worker.run()
+    finally:
+        _cleanup_fixture_resources(
+            settings,
+            worker.store,
+            [background_id, *[item["id"] for item in foreground]],
+            processes=processes,
+        )
 
 
 def _controller_rows(store):
@@ -619,7 +963,7 @@ def _session_hashes(directory):
 
 @pytest.mark.parametrize(
     "stage",
-    ["checkpoint_before_commit", "checkpoint_after_commit", "cleanup_intent_committed"],
+    ["checkpoint_before_save", "checkpoint_after_commit", "cleanup_intent_committed"],
 )
 def test_worker_sigkill_at_checkpoint_or_cleanup_restarts_without_replay(
     tuning, store, request_data, tmp_path, monkeypatch, stage
@@ -636,18 +980,23 @@ def test_worker_sigkill_at_checkpoint_or_cleanup_restarts_without_replay(
     process.start()
     directory = run_directory(settings, background_id)
     calls = []
+    front_id = None
+    processes = []
     try:
         end = time.monotonic() + 25
         while not marker.exists() and time.monotonic() < end and process.is_alive():
             time.sleep(0.02)
         assert marker.exists(), "Actual Worker did not reach the named crash boundary"
-        front_id = json.loads(marker.read_text())["foreground_id"]
+        gate = json.loads(marker.read_text())
+        assert gate["background_id"] == background_id
+        assert gate["stage"] == stage and gate["no_live_controller_operation"] is True
+        front_id = gate["foreground_id"]
         before = store.get(background_id)
         assert before["first_started_at"] is not None
         assert (
             before["state"]
             == {
-                "checkpoint_before_commit": "running",
+                "checkpoint_before_save": "running",
                 "checkpoint_after_commit": "yielded",
                 "cleanup_intent_committed": "pausing",
             }[stage]
@@ -665,6 +1014,14 @@ def test_worker_sigkill_at_checkpoint_or_cleanup_restarts_without_replay(
             assert before["usage"]["unknown_calls"] == 0
             assert original_actions[0]["status"] == "completed"
         original_operations = _controller_rows(store)
+        assert all(
+            row["data"]["state"] in {"terminal", "not_spawned"}
+            for row in original_operations
+        )
+        assert [row["data"]["record_sha256"] for row in original_operations] == gate[
+            "terminal_controller_hashes"
+        ]
+        original_parent_accounting = _parent_accounting(store, batch["id"])
         process.kill()
         process.join(timeout=10)
         assert not process.is_alive() and process.exitcode == -signal.SIGKILL
@@ -689,6 +1046,15 @@ def test_worker_sigkill_at_checkpoint_or_cleanup_restarts_without_replay(
                 "finish", {"message": "Synthetic foreground after crash"}, 20
             )
 
+        def popen(*args, **kwargs):
+            assert kwargs.get("start_new_session") is True
+            child = subprocess.Popen(*args, **kwargs)
+            processes.append(child)
+            return child
+
+        supervised_subprocess = SimpleNamespace(**{**vars(subprocess), "Popen": popen})
+        monkeypatch.setattr(sandbox_module, "subprocess", supervised_subprocess)
+        monkeypatch.setattr(workspace_module, "subprocess", supervised_subprocess)
         monkeypatch.setattr(sdk.GuardedLLM, "_transport_call", foreground_transport)
         monkeypatch.setattr(restarted, "execute", execute)
         if stage == "cleanup_intent_committed":
@@ -699,7 +1065,10 @@ def test_worker_sigkill_at_checkpoint_or_cleanup_restarts_without_replay(
                 pytest.fail("Pending cleanup intent was replayed after SIGKILL")
 
             monkeypatch.setattr("doonex.worker.stop_containers", forbidden)
-            with pytest.raises(RuntimeError, match="终止状态不明"):
+            with (
+                _failure_watchdog([]),
+                pytest.raises(RuntimeError, match="终止状态不明"),
+            ):
                 restarted.run(once=True)
             current = store.get(background_id)
             assert current["cleanup_intent"] == intent
@@ -711,7 +1080,8 @@ def test_worker_sigkill_at_checkpoint_or_cleanup_restarts_without_replay(
             with store.connect() as connection:
                 assert execution_fenced(connection)
         else:
-            restarted.run(once=True)
+            with _failure_watchdog([]):
+                restarted.run(once=True)
             current = store.get(background_id)
             assert current["state"] == (
                 "yielded" if stage == "checkpoint_after_commit" else "interrupted"
@@ -726,6 +1096,7 @@ def test_worker_sigkill_at_checkpoint_or_cleanup_restarts_without_replay(
             assert all(row in _controller_rows(store) for row in original_operations)
         assert current["first_started_at"] == before["first_started_at"]
         assert current["request"] == before["request"]
+        assert _parent_accounting(store, batch["id"]) == original_parent_accounting
         assert action_rows(store, background_id) == original_actions
         assert _session_hashes(directory) == session_hashes
         assert not (directory / "workspace" / "must-not-dispatch").exists()
@@ -740,11 +1111,31 @@ def test_worker_sigkill_at_checkpoint_or_cleanup_restarts_without_replay(
                     "background_state_after_restart": current["state"],
                     "provider": "synthetic",
                     "latency_sample": False,
+                    "parent_accounting_before_kill": original_parent_accounting,
+                    "parent_accounting_after_restart": _parent_accounting(
+                        store, batch["id"]
+                    ),
                 },
                 sort_keys=True,
+                default=str,
             )
         )
     finally:
         if process.is_alive():
+            process.terminate()
+            process.join(timeout=10)
+        if process.is_alive():
             process.kill()
             process.join(timeout=10)
+        assert not process.is_alive(), "Actual worker child was not reaped"
+        owned = [attempt["run_id"] for attempt in batch["attempts"]]
+        # If the child failed before publishing its marker, its foreground
+        # creation may still have committed. Discover only rows bound to this
+        # fixture's authored repository, then inspect IDs/labels/mounts below.
+        with store.connect() as connection:
+            owned.extend(
+                row["data"]["id"]
+                for row in connection.execute("SELECT data FROM runs").fetchall()
+                if row["data"]["request"]["repo_path"] == request["repo_path"]
+            )
+        _cleanup_fixture_resources(settings, store, owned, processes=processes)
