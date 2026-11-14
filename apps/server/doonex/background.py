@@ -8,6 +8,7 @@ locks a Run or dispatches work. No schedule, retry, or model call lives here.
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from uuid import UUID, uuid4
 
@@ -15,8 +16,9 @@ from psycopg.types.json import Jsonb
 from pydantic import Field, model_validator
 
 from doonex.arena import BatchBudget, EvaluationInput, digest, environment
-from doonex.deadline import check_deadline
+from doonex.deadline import ExecutionDeadlineExceeded, check_deadline
 from doonex.evidence import _raise_execution_control
+from doonex.execution_clock import ClockError
 from doonex.library import Library
 from doonex.model_registry import ModelRegistry
 from doonex.models import Budget, StrictModel
@@ -61,6 +63,34 @@ class BackgroundWaiting(ValueError):
 
 class BackgroundConflict(ValueError):
     """A stale revision or already consumed grant cannot grant more work."""
+
+
+def _clock_stopped(error):
+    stopped = BackgroundStopped(str(error))
+    stopped.scope, stopped.reason = error.scope, error.reason
+    return stopped
+
+
+@contextmanager
+def _clock_guard(clock):
+    """Preserve the already observed business source of a nested IO timeout."""
+    observed = None
+
+    def bound(value):
+        nonlocal observed
+        observed = value
+        return value.at
+
+    try:
+        yield bound
+    except ExecutionDeadlineExceeded as timeout:
+        if observed is not None and observed.scope.kind != "outer":
+            try:
+                clock.check(observed)
+            except ClockError as error:
+                error.__cause__ = timeout
+                raise _clock_stopped(error) from error
+        raise
 
 
 class DailyBudget(StrictModel):
@@ -161,11 +191,20 @@ def _sum_usage(values):
 
 
 class Background:
-    def __init__(self, settings, store, *, clock=None, deadline: float | None = None):
+    def __init__(
+        self,
+        settings,
+        store,
+        *,
+        clock=None,
+        deadline: float | None = None,
+        execution_clock=None,
+    ):
         check_deadline(deadline)
         self.settings, self.store = settings, store
         self.library = Library(settings, store, deadline=deadline)
         self.clock = clock or (lambda: datetime.now(UTC))
+        self.execution_clock = execution_clock
         check_deadline(deadline)
 
     def _now(self):
@@ -178,14 +217,24 @@ class Background:
         if connection is None:
             with self.store.connect() as c:
                 return self.get(identifier, c, lock=lock, deadline=deadline)
+        columns = "id,state,data" if self.execution_clock is not None else "data"
         row = connection.execute(
-            "SELECT data FROM background_authorizations WHERE id=%s"
+            f"SELECT {columns} FROM background_authorizations WHERE id=%s"
             + (" FOR UPDATE" if lock else ""),
             (_identifier(identifier),),
         ).fetchone()
         check_deadline(deadline)
         if not row:
             raise KeyError("找不到后台授权")
+        if self.execution_clock is not None:
+            try:
+                if (
+                    row["data"]["id"] != str(row["id"])
+                    or row["data"]["state"] != row["state"]
+                ):
+                    raise ValueError
+            except (KeyError, TypeError, ValueError):
+                raise BackgroundConflict("后台授权标识或状态与持久列不一致") from None
         return row["data"]
 
     def list(self):
@@ -308,28 +357,209 @@ class Background:
         check_deadline(deadline)
         return parent["data"]
 
-    def day(self, value, connection=None, *, lock=False):
+    def day(self, value, connection=None, *, lock=False, deadline=None):
+        check_deadline(deadline)
         if connection is None:
             with self.store.connect() as c:
-                return self.day(value, c, lock=lock)
+                return self.day(value, c, lock=lock, deadline=deadline)
+        columns = "day,data" if self.execution_clock is not None else "data"
         row = connection.execute(
-            "SELECT data FROM background_days WHERE day=%s"
+            f"SELECT {columns} FROM background_days WHERE day=%s"
             + (" FOR UPDATE" if lock else ""),
             (_day(value),),
         ).fetchone()
+        check_deadline(deadline)
         if not row:
             raise KeyError("该 UTC 日期尚未设置后台日预算")
+        if self.execution_clock is not None:
+            try:
+                if row["day"].isoformat() != _day(value) or row["data"]["date"] != _day(
+                    value
+                ):
+                    raise ValueError
+            except (KeyError, TypeError, ValueError, AttributeError):
+                raise BackgroundConflict("后台日账的日期与持久列不一致") from None
         return row["data"]
 
-    def _save(self, c, value, event, **details):
+    def _allocation(self, row, value, evaluation_id):
+        """Bind actual columns before using a reservation's clock or ledger."""
+        try:
+            allocation = row["data"]
+            expected = {
+                "id": _identifier(row["id"]),
+                "authorization_id": _identifier(value["id"]),
+                "evaluation_id": evaluation_id,
+                "date": value["date"],
+            }
+            if (
+                row["state"] not in {"reserved", "settled"}
+                or str(row["authorization_id"]) != expected["authorization_id"]
+                or (
+                    str(row["evaluation_id"])
+                    if row["evaluation_id"] is not None
+                    else None
+                )
+                != evaluation_id
+                or row["day"].isoformat() != value["date"]
+                or any(allocation[key] != item for key, item in expected.items())
+                or value["evaluation_id"] != evaluation_id
+                or allocation["reserved"]
+                != self._reservation(BackgroundInput.model_validate(value["input"]))
+            ):
+                raise ValueError
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise BackgroundConflict(
+                "后台分配的标识、父批次、日期或原预留绑定无效"
+            ) from None
+        return allocation
+
+    @staticmethod
+    def _allocation_clock_arguments(allocation, *, deadline=None):
+        return {
+            "started_at": allocation["claimed_at"],
+            "seconds": allocation["reserved"]["seconds"],
+            "binding": digest(
+                {
+                    key: allocation[key]
+                    for key in (
+                        "id",
+                        "authorization_id",
+                        "evaluation_id",
+                        "date",
+                        "claimed_at",
+                        "reserved",
+                    )
+                },
+                deadline=deadline,
+            ),
+        }
+
+    def _execution_bound(self, value, ledger, allocation=None, *, deadline=None):
+        check_deadline(deadline)
+        if self.execution_clock is None:
+            return None
+        try:
+            body = BackgroundInput.model_validate(value["input"])
+            if (
+                ledger["date"] != value["date"]
+                or ledger["budget"] != body.daily_budget.model_dump()
+                or body.window_start.date().isoformat() != value["date"]
+                or body.window_start
+                != _utc(datetime.fromisoformat(value["window_start"]))
+                or body.window_end != _utc(datetime.fromisoformat(value["window_end"]))
+                or not isinstance(value["snapshot"], dict)
+            ):
+                raise ValueError
+            self._window(value)
+            bounds = [
+                self.execution_clock.window(
+                    value["id"],
+                    date=value["date"],
+                    window_start=value["window_start"],
+                    window_end=value["window_end"],
+                    expires_at=value["expires_at"],
+                    binding=digest(
+                        {
+                            key: value[key]
+                            for key in (
+                                "id",
+                                "date",
+                                "window_start",
+                                "window_end",
+                                "expires_at",
+                                "input",
+                                "snapshot",
+                            )
+                        },
+                        deadline=deadline,
+                    ),
+                ),
+                self.execution_clock.day(
+                    value["date"],
+                    binding=digest(
+                        {"date": ledger["date"], "budget": ledger["budget"]},
+                        deadline=deadline,
+                    ),
+                ),
+            ]
+            if allocation is not None:
+                bounds.append(
+                    self.execution_clock.duration(
+                        "allocation",
+                        allocation["id"],
+                        **self._allocation_clock_arguments(
+                            allocation, deadline=deadline
+                        ),
+                    )
+                )
+            result = self.execution_clock.minimum(*bounds, deadline=deadline)
+            self.execution_clock.check(result)
+            check_deadline(deadline)
+            return result
+        except ClockError as error:
+            raise _clock_stopped(error) from error
+        except BackgroundStopped:
+            raise
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise BackgroundStopped(
+                "后台窗口、日预算或分配的冻结时钟绑定无效"
+            ) from None
+
+    def deadline(
+        self, connection, authorization_id, evaluation_id=None, *, deadline=None
+    ):
+        """Return a checked bound without repeating content/profile inspection.
+
+        Caller retains dispatch -> Run -> batch lock order. This method takes
+        grant-share then day-update locks and never locks a Run or parent.
+        The wall callable is the legacy admission clock; execution_clock is one
+        separately shared Worker epoch and is never manufactured here.
+        """
+        check_deadline(deadline)
+        if self.execution_clock is None:
+            return None
+        row = connection.execute(
+            "SELECT id,state,data FROM background_authorizations WHERE id=%s FOR SHARE",
+            (_identifier(authorization_id),),
+        ).fetchone()
+        check_deadline(deadline)
+        try:
+            value = row["data"]
+            expected = _identifier(evaluation_id) if evaluation_id is not None else None
+            if (
+                value["id"] != str(row["id"])
+                or value["state"] != row["state"]
+                or value["evaluation_id"] != expected
+                or value["state"] != ("consumed" if expected else "enabled")
+            ):
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            raise BackgroundStopped("后台授权的标识、状态或批次关联无效") from None
+        allocation = None
+        if expected is not None:
+            row = connection.execute(
+                "SELECT id,authorization_id,evaluation_id,day,state,data "
+                "FROM background_allocations WHERE authorization_id=%s AND evaluation_id=%s",
+                (value["id"], expected),
+            ).fetchone()
+            check_deadline(deadline)
+            allocation = self._allocation(row, value, expected)
+            if row["state"] != "reserved":
+                raise BackgroundStopped("后台日额度已经结算，不能派发")
+        ledger = self.day(value["date"], connection, lock=True, deadline=deadline)
+        return self._execution_bound(value, ledger, allocation, deadline=deadline)
+
+    def _save(self, c, value, event, *, deadline=None, **details):
+        check_deadline(deadline)
         stamp = self._now().isoformat()
         value["updated_at"] = stamp
         value["history"].append({"event": event, "at": stamp, **details})
-        value["revision"] = _revision(value)
+        value["revision"] = _revision(value, deadline=deadline)
         c.execute(
             "UPDATE background_authorizations SET state=%s,data=%s WHERE id=%s",
             (value["state"], Jsonb(value), value["id"]),
         )
+        check_deadline(deadline)
         return value
 
     def _snapshot(
@@ -596,11 +826,13 @@ class Background:
         ):
             raise BackgroundStopped("后台共享日费用预算不足")
 
-    def _refresh_day(self, c, day):
-        ledger = self.day(day, c, lock=True)
+    def _refresh_day(self, c, day, *, deadline=None):
+        check_deadline(deadline)
+        ledger = self.day(day, c, lock=True, deadline=deadline)
         rows = c.execute(
             "SELECT state,data FROM background_allocations WHERE day=%s", (day,)
         ).fetchall()
+        check_deadline(deadline)
         ledger["used"] = _sum_usage(
             row["data"]["actual"] for row in rows if row["state"] == "settled"
         )
@@ -611,6 +843,7 @@ class Background:
         c.execute(
             "UPDATE background_days SET data=%s WHERE day=%s", (Jsonb(ledger), day)
         )
+        check_deadline(deadline)
         return ledger
 
     def _window(self, value, *, waiting=False):
@@ -624,139 +857,187 @@ class Background:
             raise BackgroundStopped("后台授权已到期或不在原 UTC 日窗口内")
 
     def claim(self, connection, identifier, *, prepared=None, deadline=None):
-        check_deadline(deadline)
-        value = self.get(identifier, connection, lock=True, deadline=deadline)
-        if value["state"] != "enabled" or value["evaluation_id"]:
-            raise BackgroundConflict("后台授权未启用或已消费")
-        self._window(value, waiting=True)
-        if prepared is not None and (
-            prepared.get("authorization_id") != value["id"]
-            or prepared.get("revision") != value["revision"]
-            or prepared.get("snapshot") != value["snapshot"]
-            or not 0
-            <= (
-                self._now() - datetime.fromisoformat(prepared["checked_at"])
-            ).total_seconds()
-            <= 10
-        ):
-            raise BackgroundStopped("后台使用前检查回执已变化或过期")
-        body = self._unchanged(
-            value, connection, inspect_contents=prepared is None, deadline=deadline
-        )
-        ledger = self.day(value["date"], connection, lock=True)
-        check_deadline(deadline)
-        if ledger["budget"] != body.daily_budget.model_dump():
-            raise BackgroundStopped("后台日预算绑定已变化")
-        required = self._reservation(body)
-        self._capacity(ledger, required)
-        allocation = {
-            "id": str(uuid4()),
-            "authorization_id": value["id"],
-            "evaluation_id": None,
-            "date": value["date"],
-            "claimed_at": self._now().isoformat(),
-            "settled_at": None,
-            "reserved": required,
-            "actual": None,
-        }
-        connection.execute(
-            "INSERT INTO background_allocations VALUES(%s,%s,NULL,%s,'reserved',%s)",
-            (allocation["id"], value["id"], value["date"], Jsonb(allocation)),
-        )
-        self._refresh_day(connection, value["date"])
-        check_deadline(deadline)
-        value.update(state="consumed", consumed_at=allocation["claimed_at"])
-        self._save(connection, value, "claimed", reservation_id=allocation["id"])
-        check_deadline(deadline)
-        return {
-            "authorization_id": value["id"],
-            "date": value["date"],
-            "reservation_id": allocation["id"],
-            "evaluation_input": {
-                key: body.model_dump(mode="json")[key]
-                for key in (
-                    "taskset_id",
-                    "skill_version_ids",
-                    "model_profile_id",
-                    "repeats",
-                    "run_budget",
-                    "batch_budget",
+        with _clock_guard(self.execution_clock) as bound:
+            check_deadline(deadline)
+            value = self.get(identifier, connection, lock=True, deadline=deadline)
+            if value["state"] != "enabled" or value["evaluation_id"]:
+                raise BackgroundConflict("后台授权未启用或已消费")
+            self._window(value, waiting=True)
+            if self.execution_clock is not None:
+                ledger = self.day(value["date"], connection, deadline=deadline)
+                deadline = bound(
+                    self._execution_bound(value, ledger, deadline=deadline)
                 )
-            },
-            "frozen_snapshot": value["snapshot"],
-        }
+            if prepared is not None and (
+                prepared.get("authorization_id") != value["id"]
+                or prepared.get("revision") != value["revision"]
+                or prepared.get("snapshot") != value["snapshot"]
+                or not 0
+                <= (
+                    self._now() - datetime.fromisoformat(prepared["checked_at"])
+                ).total_seconds()
+                <= 10
+            ):
+                raise BackgroundStopped("后台使用前检查回执已变化或过期")
+            body = self._unchanged(
+                value, connection, inspect_contents=prepared is None, deadline=deadline
+            )
+            ledger = self.day(value["date"], connection, lock=True, deadline=deadline)
+            check_deadline(deadline)
+            if ledger["budget"] != body.daily_budget.model_dump():
+                raise BackgroundStopped("后台日预算绑定已变化")
+            if self.execution_clock is not None:
+                deadline = bound(
+                    self._execution_bound(value, ledger, deadline=deadline)
+                )
+            required = self._reservation(body)
+            self._capacity(ledger, required)
+            allocation = {
+                "id": str(uuid4()),
+                "authorization_id": value["id"],
+                "evaluation_id": None,
+                "date": value["date"],
+                "claimed_at": self._now().isoformat(),
+                "settled_at": None,
+                "reserved": required,
+                "actual": None,
+            }
+            connection.execute(
+                "INSERT INTO background_allocations VALUES(%s,%s,NULL,%s,'reserved',%s)",
+                (allocation["id"], value["id"], value["date"], Jsonb(allocation)),
+            )
+            check_deadline(deadline)
+            self._refresh_day(connection, value["date"], deadline=deadline)
+            check_deadline(deadline)
+            value.update(state="consumed", consumed_at=allocation["claimed_at"])
+            self._save(
+                connection,
+                value,
+                "claimed",
+                deadline=deadline,
+                reservation_id=allocation["id"],
+            )
+            check_deadline(deadline)
+            return {
+                "authorization_id": value["id"],
+                "date": value["date"],
+                "reservation_id": allocation["id"],
+                "evaluation_input": {
+                    key: body.model_dump(mode="json")[key]
+                    for key in (
+                        "taskset_id",
+                        "skill_version_ids",
+                        "model_profile_id",
+                        "repeats",
+                        "run_budget",
+                        "batch_budget",
+                    )
+                },
+                "frozen_snapshot": value["snapshot"],
+            }
 
-    def attach(self, connection, claim, evaluation):
-        identifier = evaluation["id"] if isinstance(evaluation, dict) else evaluation
-        identifier = _identifier(identifier)
-        value = self.get(claim["authorization_id"], connection, lock=True)
-        row = connection.execute(
-            "SELECT data FROM background_allocations WHERE id=%s AND authorization_id=%s",
-            (_identifier(claim["reservation_id"]), value["id"]),
-        ).fetchone()
-        if (
-            not row
-            or row["data"]["evaluation_id"]
-            or value["evaluation_id"]
-            or value["state"] != "consumed"
-        ):
-            raise BackgroundConflict("后台授权与预留关联冲突")
-        batch = connection.execute(
-            "SELECT data FROM arena_evaluations WHERE id=%s", (identifier,)
-        ).fetchone()
-        if not batch:
-            raise BackgroundConflict("后台批次必须在同一事务中已创建")
-        batch = batch["data"]
-        body = BackgroundInput.model_validate(value["input"])
-        snapshot = value["snapshot"]
-        expected_skills = {
-            key: {k: v for k, v in skill.items() if k != "review_revision"}
-            for key, skill in snapshot["skills"].items()
-        }
-        checks = {
-            "split": "tuning",
-            "taskset_id": body.taskset_id,
-            "taskset_report_sha256": snapshot["taskset_report_sha256"],
-            "model": snapshot["model"],
-            "model_profile": snapshot["model_profile"],
-            "environment": snapshot["environment"],
-            "run_budget": body.run_budget.model_dump(),
-            "batch_budget": body.batch_budget.model_dump(),
-            "repeats": body.repeats,
-            "skills": expected_skills,
-            "skill_version_ids": body.skill_version_ids,
-        }
-        binding = {
-            "authorization_id": value["id"],
-            "reservation_id": claim["reservation_id"],
-            "date": value["date"],
-        }
-        if any(batch.get(key) != expected for key, expected in checks.items()) or (
-            batch.get("background") is not None and batch["background"] != binding
-        ):
-            raise BackgroundStopped("创建的批次不符合后台冻结授权")
-        child_bindings = connection.execute(
-            "SELECT data->'request'->'background' AS binding FROM runs WHERE data->'request'->'arena'->>'evaluation_id'=%s",
-            (identifier,),
-        ).fetchall()
-        if batch.get("background") is not None and any(
-            row["binding"] != binding for row in child_bindings
-        ):
-            raise BackgroundStopped("后台子运行授权绑定不一致")
-        batch["background"] = binding
-        connection.execute(
-            "UPDATE arena_evaluations SET data=%s WHERE id=%s",
-            (Jsonb(batch), identifier),
-        )
-        allocation = row["data"]
-        allocation["evaluation_id"] = identifier
-        connection.execute(
-            "UPDATE background_allocations SET evaluation_id=%s,data=%s WHERE id=%s",
-            (identifier, Jsonb(allocation), claim["reservation_id"]),
-        )
-        value["evaluation_id"] = identifier
-        self._save(connection, value, "attached", evaluation_id=identifier)
-        return batch
+    def attach(self, connection, claim, evaluation, *, deadline=None):
+        with _clock_guard(self.execution_clock) as bound:
+            check_deadline(deadline)
+            identifier = (
+                evaluation["id"] if isinstance(evaluation, dict) else evaluation
+            )
+            identifier = _identifier(identifier)
+            value = self.get(
+                claim["authorization_id"], connection, lock=True, deadline=deadline
+            )
+            if self.execution_clock is not None:
+                ledger = self.day(value["date"], connection, deadline=deadline)
+                deadline = bound(
+                    self._execution_bound(value, ledger, deadline=deadline)
+                )
+            row = connection.execute(
+                "SELECT id,authorization_id,evaluation_id,day,state,data FROM background_allocations WHERE id=%s AND authorization_id=%s",
+                (_identifier(claim["reservation_id"]), value["id"]),
+            ).fetchone()
+            check_deadline(deadline)
+            if (
+                not row
+                or row["data"]["evaluation_id"]
+                or value["evaluation_id"]
+                or value["state"] != "consumed"
+            ):
+                raise BackgroundConflict("后台授权与预留关联冲突")
+            allocation = self._allocation(row, value, None)
+            if row["state"] != "reserved":
+                raise BackgroundConflict("后台预留已经结算")
+            batch = connection.execute(
+                "SELECT data FROM arena_evaluations WHERE id=%s", (identifier,)
+            ).fetchone()
+            check_deadline(deadline)
+            if not batch:
+                raise BackgroundConflict("后台批次必须在同一事务中已创建")
+            batch = batch["data"]
+            body = BackgroundInput.model_validate(value["input"])
+            snapshot = value["snapshot"]
+            expected_skills = {
+                key: {k: v for k, v in skill.items() if k != "review_revision"}
+                for key, skill in snapshot["skills"].items()
+            }
+            checks = {
+                "split": "tuning",
+                "taskset_id": body.taskset_id,
+                "taskset_report_sha256": snapshot["taskset_report_sha256"],
+                "model": snapshot["model"],
+                "model_profile": snapshot["model_profile"],
+                "environment": snapshot["environment"],
+                "run_budget": body.run_budget.model_dump(),
+                "batch_budget": body.batch_budget.model_dump(),
+                "repeats": body.repeats,
+                "skills": expected_skills,
+                "skill_version_ids": body.skill_version_ids,
+            }
+            binding = {
+                "authorization_id": value["id"],
+                "reservation_id": claim["reservation_id"],
+                "date": value["date"],
+            }
+            if any(batch.get(key) != expected for key, expected in checks.items()) or (
+                batch.get("background") is not None and batch["background"] != binding
+            ):
+                raise BackgroundStopped("创建的批次不符合后台冻结授权")
+            child_bindings = connection.execute(
+                "SELECT data->'request'->'background' AS binding FROM runs WHERE data->'request'->'arena'->>'evaluation_id'=%s",
+                (identifier,),
+            ).fetchall()
+            check_deadline(deadline)
+            if batch.get("background") is not None and any(
+                row["binding"] != binding for row in child_bindings
+            ):
+                raise BackgroundStopped("后台子运行授权绑定不一致")
+            batch["background"] = binding
+            connection.execute(
+                "UPDATE arena_evaluations SET data=%s WHERE id=%s",
+                (Jsonb(batch), identifier),
+            )
+            check_deadline(deadline)
+            allocation["evaluation_id"] = identifier
+            connection.execute(
+                "UPDATE background_allocations SET evaluation_id=%s,data=%s WHERE id=%s",
+                (identifier, Jsonb(allocation), claim["reservation_id"]),
+            )
+            check_deadline(deadline)
+            value["evaluation_id"] = identifier
+            self._save(
+                connection,
+                value,
+                "attached",
+                deadline=deadline,
+                evaluation_id=identifier,
+            )
+            if self.execution_clock is not None:
+                # claim and attach share one transaction. The first immutable
+                # observation uses the actual parent and original claimed_at.
+                deadline = bound(
+                    self._execution_bound(value, ledger, allocation, deadline=deadline)
+                )
+            check_deadline(deadline)
+            return batch
 
     def preflight(
         self,
@@ -768,70 +1049,106 @@ class Background:
     ):
         # A row-share lock serializes revocation with an admitted dispatch intent.
         # Metadata includes local profile/credential reads and controller hashes.
-        check_deadline(deadline)
-        row = connection.execute(
-            "SELECT data FROM background_authorizations WHERE id=%s FOR SHARE",
-            (_identifier(authorization_id),),
-        ).fetchone()
-        check_deadline(deadline)
-        if not row:
-            raise BackgroundStopped("后台授权不存在")
-        value = row["data"]
-        if value["state"] != "consumed" or value["evaluation_id"] != _identifier(
-            evaluation_id
-        ):
-            raise BackgroundStopped("后台授权已撤销或批次关联无效")
-        self._window(value)
-        self._unchanged(value, connection, inspect_contents=False, deadline=deadline)
-        check_deadline(deadline)
-        allocation = connection.execute(
-            "SELECT state,data FROM background_allocations WHERE authorization_id=%s AND evaluation_id=%s",
-            (value["id"], evaluation_id),
-        ).fetchone()
-        check_deadline(deadline)
-        if not allocation or allocation["state"] != "reserved":
-            raise BackgroundStopped("后台日额度预留无效或已经结算")
-        duration = (
-            self._now() - datetime.fromisoformat(allocation["data"]["claimed_at"])
-        ).total_seconds()
-        if duration < 0 or duration >= allocation["data"]["reserved"]["seconds"]:
-            raise BackgroundStopped(
-                "后台分配累计时长已达上限或时钟倒退；排队和让出不延长日预留"
+        with _clock_guard(self.execution_clock) as bound:
+            check_deadline(deadline)
+            row = connection.execute(
+                "SELECT id,state,data FROM background_authorizations WHERE id=%s FOR SHARE",
+                (_identifier(authorization_id),),
+            ).fetchone()
+            check_deadline(deadline)
+            if not row:
+                raise BackgroundStopped("后台授权不存在")
+            value = row["data"]
+            if (
+                value["id"] != str(row["id"])
+                or value["state"] != row["state"]
+                or value["state"] != "consumed"
+                or value["evaluation_id"] != _identifier(evaluation_id)
+            ):
+                raise BackgroundStopped("后台授权已撤销或批次关联无效")
+            self._window(value)
+            if self.execution_clock is not None:
+                deadline = bound(
+                    self.deadline(
+                        connection, authorization_id, evaluation_id, deadline=deadline
+                    )
+                )
+            self._unchanged(
+                value, connection, inspect_contents=False, deadline=deadline
             )
-        ledger = self.day(value["date"], connection, lock=True)
-        check_deadline(deadline)
-        if ledger["budget"] != value["input"]["daily_budget"]:
-            raise BackgroundStopped("后台日预算绑定已变化")
-        # Existing allocations need no second reservation, but overrun in another
-        # batch cannot make an already admitted grant dispatch beyond the day cap.
-        self._capacity(ledger, _empty_usage())
-        check_deadline(deadline)
-        return value
+            check_deadline(deadline)
+            allocation = connection.execute(
+                "SELECT id,authorization_id,evaluation_id,day,state,data FROM background_allocations WHERE authorization_id=%s AND evaluation_id=%s",
+                (value["id"], evaluation_id),
+            ).fetchone()
+            check_deadline(deadline)
+            if not allocation or allocation["state"] != "reserved":
+                raise BackgroundStopped("后台日额度预留无效或已经结算")
+            data = self._allocation(allocation, value, _identifier(evaluation_id))
+            duration = (
+                self._now() - datetime.fromisoformat(data["claimed_at"])
+            ).total_seconds()
+            if duration < 0 or duration >= data["reserved"]["seconds"]:
+                raise BackgroundStopped(
+                    "后台分配累计时长已达上限或时钟倒退；排队和让出不延长日预留"
+                )
+            ledger = self.day(value["date"], connection, lock=True, deadline=deadline)
+            check_deadline(deadline)
+            if ledger["budget"] != value["input"]["daily_budget"]:
+                raise BackgroundStopped("后台日预算绑定已变化")
+            # Existing allocations need no second reservation, but overrun in another
+            # batch cannot make an already admitted grant dispatch beyond the day cap.
+            self._capacity(ledger, _empty_usage())
+            if self.execution_clock is not None:
+                deadline = bound(
+                    self._execution_bound(value, ledger, data, deadline=deadline)
+                )
+            check_deadline(deadline)
+            return value
 
-    def settle(self, connection, evaluation_id, batch=None):
+    def settle(self, connection, evaluation_id, batch=None, *, deadline=None):
+        check_deadline(deadline)
         identifier = _identifier(evaluation_id)
         # The caller holds its batch lock. Never acquire any Run lock here.
         if batch is None:
             row = connection.execute(
                 "SELECT data FROM arena_evaluations WHERE id=%s", (identifier,)
             ).fetchone()
+            check_deadline(deadline)
             if not row:
                 raise KeyError("找不到后台批次")
             batch = row["data"]
         if batch["id"] != identifier:
             raise BackgroundConflict("结算批次关联无效")
         row = connection.execute(
-            "SELECT day,data FROM background_allocations WHERE evaluation_id=%s",
+            "SELECT id,authorization_id,evaluation_id,day,state,data FROM background_allocations WHERE evaluation_id=%s",
             (identifier,),
         ).fetchone()
+        check_deadline(deadline)
         if not row:
             raise KeyError("后台批次没有日额度分配")
-        self.day(row["day"], connection, lock=True)
+        value = self.get(row["authorization_id"], connection, deadline=deadline)
+        if value["state"] not in {"consumed", "disabled"}:
+            raise BackgroundConflict("后台结算授权状态无效；保留预留")
+        self._allocation(row, value, identifier)
+        ledger = self.day(row["day"], connection, lock=True, deadline=deadline)
+        reservation_id = str(row["id"])
         row = connection.execute(
-            "SELECT state,data FROM background_allocations WHERE evaluation_id=%s FOR UPDATE",
-            (identifier,),
+            "SELECT id,authorization_id,evaluation_id,day,state,data FROM background_allocations WHERE id=%s AND evaluation_id=%s FOR UPDATE",
+            (reservation_id, identifier),
         ).fetchone()
-        allocation = row["data"]
+        check_deadline(deadline)
+        allocation = self._allocation(row, value, identifier)
+        if (
+            batch.get("background")
+            != {
+                "authorization_id": value["id"],
+                "reservation_id": allocation["id"],
+                "date": allocation["date"],
+            }
+            or ledger["budget"] != value["input"]["daily_budget"]
+        ):
+            raise BackgroundConflict("后台结算的批次或冻结日预算绑定无效；保留预留")
         if row["state"] == "settled":
             return allocation
         if batch["state"] not in TERMINAL_BATCHES or batch["usage"]["unknown_calls"]:
@@ -840,10 +1157,12 @@ class Background:
             "SELECT state,data->'usage' AS usage FROM runs WHERE data->'request'->'arena'->>'evaluation_id'=%s",
             (identifier,),
         ).fetchall()
+        check_deadline(deadline)
         unresolved = connection.execute(
             "SELECT count(*) AS count FROM actions JOIN runs ON runs.id=actions.run_id WHERE runs.data->'request'->'arena'->>'evaluation_id'=%s AND actions.status IN ('pending','unknown','acknowledged')",
             (identifier,),
         ).fetchone()["count"]
+        check_deadline(deadline)
         if (
             not states
             or any(item["state"] not in TERMINAL_RUNS for item in states)
@@ -875,6 +1194,19 @@ class Background:
         elapsed = (
             self._now() - datetime.fromisoformat(allocation["claimed_at"])
         ).total_seconds()
+        if self.execution_clock is not None:
+            try:
+                elapsed = max(
+                    elapsed,
+                    self.execution_clock.allocation_elapsed(
+                        allocation["id"],
+                        **self._allocation_clock_arguments(
+                            allocation, deadline=deadline
+                        ),
+                    ),
+                )
+            except ClockError as error:
+                raise _clock_stopped(error) from error
         if elapsed < 0:
             raise BackgroundStopped("后台时钟早于分配记录，保留整批分配")
         actual = {
@@ -900,5 +1232,7 @@ class Background:
             "UPDATE background_allocations SET state='settled',data=%s WHERE evaluation_id=%s",
             (Jsonb(allocation), identifier),
         )
-        self._refresh_day(connection, allocation["date"])
+        check_deadline(deadline)
+        self._refresh_day(connection, allocation["date"], deadline=deadline)
+        check_deadline(deadline)
         return allocation
