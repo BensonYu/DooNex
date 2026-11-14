@@ -12,6 +12,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -31,7 +32,7 @@ from doonex.store import Store
 from doonex.worker import Worker, run_directory
 from openhands.sdk.conversation.event_store import EventLog
 from openhands.sdk.conversation.persistence_const import EVENT_NAME_RE
-from openhands.sdk.event import MessageEvent
+from openhands.sdk.event import Event, MessageEvent
 from openhands.sdk.io import LocalFileStore
 from openhands.sdk.llm import Message, TextContent
 from test_api import repository
@@ -89,6 +90,34 @@ def _files(root):
         str(path.relative_to(root)): _sha(path.read_bytes())
         for path in sorted(root.rglob("*"))
         if path.is_file()
+    }
+
+
+def _persisted_branch_evidence(root, receipt):
+    """Read-only oracle; the actual cold Worker still uses SessionFileStore."""
+    events = {
+        event.id: event
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and _is_event(str(path.relative_to(root)))
+        for event in [Event.model_validate_json(path.read_text())]
+    }
+    branch, seen = [], set()
+    leaf = receipt["leaf_event_id"]
+    while leaf is not None:
+        assert leaf in events and leaf not in seen
+        seen.add(leaf)
+        event = events[leaf]
+        branch.append(event.model_dump(mode="json"))
+        leaf = event.parent_id
+    branch.reverse()
+    assert canonical_sha256(branch) == receipt["branch_sha256"]
+    return {
+        "signature": [
+            (event["id"], event["kind"], event["parent_id"], canonical_sha256(event))
+            for event in branch
+        ],
+        "leaf": branch[-1],
+        "branch_sha256": receipt["branch_sha256"],
     }
 
 
@@ -270,6 +299,9 @@ def _census(conversation):
 
 def _seed_active(conversation, shape, *, target=1000, entry_headroom=None):
     state, store = conversation.state, conversation.state._fs
+    # Preserve the SDK's real bootstrap before adding capacity history. Its
+    # cold init only searches the first three events for the original prompt.
+    assert any(event.kind == "SystemPromptEvent" for event in state.events[:3])
     count = target - len(state.events)
     assert count > 900
     text_bytes = {
@@ -331,24 +363,19 @@ def _seed_hook(monkeypatch, store, shape, records, *, phase, entry_headroom=None
 
         monkeypatch.setattr(sdk._SchedulingRuntime, "receipt", receipt)
         return
-    original = sdk._M1Conversation.__init__
-    original_close = sdk._M1Conversation.close
+    assert phase == "before_model"
+    original = sdk._M1Conversation.run
 
-    def initialize(conversation, *args, **kwargs):
-        original(conversation, *args, **kwargs)
+    def run(conversation, *args, **kwargs):
         identifier = conversation.state.agent.doonex_run_id
         if not records and store.get(identifier)["request"].get("background"):
-            try:
-                records.append(
-                    _seed_active(conversation, shape, entry_headroom=entry_headroom)
-                )
-            except BaseException:
-                # __init__ has returned from the real SDK, but the outer local
-                # variable is not assigned yet. Close that actual SDK instance.
-                original_close(conversation)
-                raise
+            assert conversation._agent_ready
+            records.append(
+                _seed_active(conversation, shape, entry_headroom=entry_headroom)
+            )
+        return original(conversation, *args, **kwargs)
 
-    monkeypatch.setattr(sdk._M1Conversation, "__init__", initialize)
+    monkeypatch.setattr(sdk._M1Conversation, "run", run)
 
 
 def _replace_pending_command(monkeypatch):
@@ -616,7 +643,7 @@ def test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore(
             store,
             shape,
             seeded,
-            phase="init" if shape == "small" else "receipt",
+            phase="before_model" if shape == "small" else "receipt",
             # Native sidecars count toward the unchanged directory contract.
             # Leave 32 entries for real model/status and restored observations;
             # retain every sidecar through the complete cold inventory.
@@ -643,9 +670,13 @@ def test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore(
     assert paused["usage"]["calls"] == 1
     assert paused["usage"]["unknown_calls"] == paused["usage"]["reserved_tokens"] == 0
     assert len(paused["scheduling"]["receipt"]["pending_actions"]) == 2
+    original_receipt_value = paused["scheduling"]["receipt"]
+    original_branch = _persisted_branch_evidence(root, original_receipt_value)
     evaluation_id = paused["request"]["arena"]["evaluation_id"]
     parent_before = _accounting(store, evaluation_id)
-    reads, receipts, closes, close_calls, sessions = [], [], [], [], []
+    reads, receipts, receipt_calls, closes, close_calls, sessions = (
+        [] for _ in range(6)
+    )
     original_read = SessionFileStore._read_fd
     original_receipt = sdk._SchedulingRuntime.receipt
     original_close = sdk._M1Conversation.close
@@ -660,10 +691,19 @@ def test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore(
     def receipt(runtime, conversation):
         value = original_receipt(runtime, conversation)
         receipts.append(value)
+        receipt_calls.append(
+            {
+                "caller": sys._getframe(1).f_code.co_name,
+                "returned_monotonic": time.monotonic(),
+                "receipt": value,
+            }
+        )
+        print("worker_capacity_native_receipt=" + json.dumps(receipt_calls[-1]))
         return value
 
     def close(conversation):
         entered = time.monotonic()
+        caller = sys._getframe(1).f_code.co_name
         already_complete = conversation._cleanup_complete
         value = original_close(conversation)
         identifier = conversation.state.agent.doonex_run_id
@@ -675,10 +715,12 @@ def test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore(
                 "entered_monotonic": entered,
                 "returned_monotonic": time.monotonic(),
                 "cleanup_complete": conversation._cleanup_complete,
+                "caller": caller,
             }
         )
-        # The SDK finish path closes natively; run_session's finally closes
-        # again idempotently. Count real first cleanup while recording both.
+        print("worker_capacity_native_close=" + json.dumps(close_calls[-1]))
+        # run_session's finally closes; SDK __del__ can repeat it idempotently.
+        # Count the first real cleanup while recording every actual caller.
         if not already_complete:
             closes.append(identifier)
         return value
@@ -719,6 +761,31 @@ def test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore(
             monkeypatch,
         )
     assert _accounting(store, evaluation_id) == parent_before
+    repaused = store.get(paused["id"])
+    assert repaused["state"] == "yielded"
+    assert repaused["request"] == paused["request"]
+    for key in ("ledger", "workspace_digest"):
+        assert repaused["scheduling"][key] == paused["scheduling"][key]
+    renewed_receipt = repaused["scheduling"]["receipt"]
+    assert set(renewed_receipt) == set(original_receipt_value)
+    assert {
+        key: value
+        for key, value in renewed_receipt.items()
+        if key not in {"leaf_event_id", "branch_sha256"}
+    } == {
+        key: value
+        for key, value in original_receipt_value.items()
+        if key not in {"leaf_event_id", "branch_sha256"}
+    }
+    renewed_branch = _persisted_branch_evidence(root, renewed_receipt)
+    assert renewed_branch["signature"][:-1] == original_branch["signature"]
+    assert renewed_branch["leaf"]["kind"] == "PauseEvent"
+    assert (
+        renewed_branch["leaf"]["parent_id"] == original_receipt_value["leaf_event_id"]
+    )
+    assert renewed_receipt["leaf_event_id"] != original_receipt_value["leaf_event_id"]
+    assert renewed_receipt["branch_sha256"] != original_receipt_value["branch_sha256"]
+    assert receipts == [original_receipt_value, renewed_receipt]
     with _watchdog():
         Worker(wide[0]).run(once=True)
     final = store.get(paused["id"])
@@ -739,7 +806,17 @@ def test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore(
         cold_wait["foreground_id"],
         paused["id"],
     ]
-    assert receipts == [paused["scheduling"]["receipt"]] * 3
+    assert receipts == [original_receipt_value, renewed_receipt, renewed_receipt]
+    assert [call["caller"] for call in receipt_calls] == [
+        "verify_resume",
+        "run_session",
+        "verify_resume",
+    ]
+    assert all(
+        call["caller"] == "run_session"
+        for call in close_calls
+        if not call["already_complete"]
+    )
     assert set(original_files.items()).issubset(set(reads))
     final_files = _files(root)
     assert all(final_files[name] == digest for name, digest in original_events.items())
@@ -768,6 +845,8 @@ def test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore(
                 "cold_startup_foreground_wait": cold_startup,
                 "cold_foreground_wait": cold_wait,
                 "native_close_calls": close_calls,
+                "native_receipt_calls": receipt_calls,
+                "repeated_yield_extends_original_branch_by_one_native_pause": True,
                 "original_usage_and_parent_ledgers_preserved": True,
                 "additional_model_calls": 0,
                 "transport": "synthetic",
@@ -788,7 +867,7 @@ def test_full_active_prompt_respects_original_input_contract_before_reserving(
     _, _, _, batch = claimed(wide, store)
     identifier = batch["attempts"][0]["run_id"]
     records, calls, reservations = [], [], []
-    _seed_hook(monkeypatch, store, shape, records, phase="init")
+    _seed_hook(monkeypatch, store, shape, records, phase="before_model")
     original = Ledger.reserve
 
     def reserve(ledger, *args, **kwargs):
@@ -943,7 +1022,7 @@ def test_near_capacity_unknown_model_reservation_survives_worker_restart(
     _, _, _, batch = claimed(wide, store)
     identifier = batch["attempts"][0]["run_id"]
     seeded, calls = [], []
-    _seed_hook(monkeypatch, store, "small", seeded, phase="init")
+    _seed_hook(monkeypatch, store, "small", seeded, phase="before_model")
 
     def unknown(*args, **kwargs):
         calls.append(identifier)
