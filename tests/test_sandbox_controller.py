@@ -689,6 +689,7 @@ def pg_sandbox(controller_store, request_data, tmp_path, monkeypatch):
     with store.locked(run["id"]) as (_connection, value):
         value["owner"] = "sandbox-controller-test-owner"
     action_id = store.action(run["id"], "shell", {"command": "controlled fixture"})
+    saved = store.get(run["id"])
     control = tmp_path / "control"
     control.mkdir()
     executable = control / "docker"
@@ -716,8 +717,8 @@ def pg_sandbox(controller_store, request_data, tmp_path, monkeypatch):
         configure=configure,
         run_id=run["id"],
         binding={
-            "expected_run_owner": "sandbox-controller-test-owner",
-            "project_id": request_data["project_id"],
+            "expected_run_owner": saved["owner"],
+            "project_id": saved["request"]["project_id"],
             "parent_action_id": action_id,
         },
     )

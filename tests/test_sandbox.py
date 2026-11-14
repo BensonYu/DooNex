@@ -1,16 +1,20 @@
 import json
 import os
+import subprocess
 import time
-import uuid
 
 import pytest
 from doonex.sandbox import Sandbox, SandboxError
+from sandbox_test_support import sandbox_context as sandbox_context_fixture
+
+sandbox_context = sandbox_context_fixture
 
 pytestmark = pytest.mark.docker
 
 
+@pytest.mark.postgres
 def test_isolation_files_network_environment_and_container_permissions(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, sandbox_context
 ):
     sandbox = Sandbox()
     workspace = tmp_path / "workspace"
@@ -18,7 +22,7 @@ def test_isolation_files_network_environment_and_container_permissions(
     outside = tmp_path / "outside-secret"
     outside.write_text("synthetic host secret")
     monkeypatch.setenv("OPENAI_API_KEY", "synthetic-must-not-enter-container")
-    run_id = uuid.uuid4().hex
+    run_id = sandbox_context.run_id
     script = """import json, os, socket
 try:
     socket.create_connection(('1.1.1.1', 443), timeout=0.5)
@@ -41,7 +45,13 @@ print(json.dumps({'uid': os.getuid(), 'outside': os.path.exists(OUTSIDE),
 open('/workspace/result.txt', 'w').write('isolated')
 """
     script = script.replace("OUTSIDE", repr(str(outside)))
-    result = sandbox.run(workspace, "python - <<'PY'\n" + script + "\nPY", 10, run_id)
+    result = sandbox.run(
+        workspace,
+        "python - <<'PY'\n" + script + "\nPY",
+        10,
+        run_id,
+        **sandbox_context.binding,
+    )
     assert result["exit_code"] == 0, result
     facts = json.loads(result["output"])
     assert facts == {
@@ -57,58 +67,77 @@ open('/workspace/result.txt', 'w').write('isolated')
         "capabilities": "0000000000000000",
     }
     assert (workspace / "result.txt").read_text() == "isolated"
-    assert sandbox.containers(run_id) == []
+    assert sandbox.containers(run_id, **sandbox_context.binding) == []
 
 
-def test_timeout_kills_and_removes_container(tmp_path):
+@pytest.mark.postgres
+def test_timeout_kills_and_removes_container(tmp_path, sandbox_context):
     sandbox = Sandbox()
-    run_id = uuid.uuid4().hex
-    result = sandbox.run(tmp_path, "sleep 30", 0.4, run_id)
+    run_id = sandbox_context.run_id
+    result = sandbox.run(tmp_path, "sleep 30", 0.4, run_id, **sandbox_context.binding)
     assert result["timed_out"]
     assert result["exit_code"] != 0
     assert not result["cleanup_error"]
-    assert sandbox.containers(run_id) == []
+    assert sandbox.containers(run_id, **sandbox_context.binding) == []
 
 
-def test_cancel_stops_current_and_future_action(tmp_path):
+@pytest.mark.postgres
+def test_cancel_stops_current_and_future_action(tmp_path, sandbox_context):
     sandbox = Sandbox()
-    run_id = uuid.uuid4().hex
+    run_id = sandbox_context.run_id
     deadline = time.monotonic() + 0.6
     result = sandbox.run(
-        tmp_path, "sleep 30", 10, run_id, lambda: time.monotonic() > deadline
+        tmp_path,
+        "sleep 30",
+        10,
+        run_id,
+        lambda: time.monotonic() > deadline,
+        **sandbox_context.binding,
     )
     assert result["cancelled"]
-    assert sandbox.containers(run_id) == []
-    result = sandbox.run(tmp_path, "touch forbidden", 10, run_id, lambda: True)
+    assert sandbox.containers(run_id, **sandbox_context.binding) == []
+    result = sandbox.run(
+        tmp_path, "touch forbidden", 10, run_id, lambda: True, **sandbox_context.binding
+    )
     assert result["cancelled"] and result["container_id"] is None
     assert not (tmp_path / "forbidden").exists()
 
 
-def test_recovery_can_find_and_stop_labeled_container(tmp_path):
+@pytest.mark.postgres
+def test_recovery_can_find_and_stop_labeled_container(tmp_path, sandbox_context):
     sandbox = Sandbox()
-    run_id = uuid.uuid4().hex
+    run_id = sandbox_context.run_id
+    # Test-owned fixture setup deliberately does not call a product bypass.
     identifier = (
-        sandbox._docker(
-            "create",
-            "--network",
-            "none",
-            "--label",
-            "doonex.run_id=" + run_id,
-            sandbox.image,
-            "sleep",
-            "30",
+        subprocess.run(
+            [
+                sandbox.docker,
+                "create",
+                "--network",
+                "none",
+                "--label",
+                "doonex.run_id=" + run_id,
+                sandbox.image,
+                "sleep",
+                "30",
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            timeout=10,
         )
         .stdout.decode()
         .strip()
     )
     try:
-        sandbox._docker("start", identifier)
-        assert identifier in sandbox.containers(run_id)
-        stopped = sandbox.stop_run(run_id)
+        subprocess.run([sandbox.docker, "start", identifier], check=True, timeout=10)
+        assert identifier in sandbox.containers(run_id, **sandbox_context.binding)
+        stopped = sandbox.stop_run(run_id, **sandbox_context.binding)
         assert identifier in stopped["stopped"]
         assert stopped["remaining"] == [] and stopped["errors"] == []
     finally:
-        sandbox._docker("rm", "-f", identifier, check=False)
+        subprocess.run(
+            [sandbox.docker, "rm", "-f", identifier], check=False, timeout=10
+        )
 
 
 def test_no_unpinned_image_or_invalid_scope():
