@@ -124,10 +124,10 @@ def install_index_load(store, day, project_id):
             SELECT md5('scale-arena-'||n)::uuid,'complete',jsonb_build_object(
               'id',md5('scale-arena-'||n)::uuid,'state','complete',
               'created_at','2026-01-01T00:00:00+00:00',
-              'scale_index_load',%s,
+              'scale_index_load',%s::text,
               'background',jsonb_build_object(
                 'authorization_id',md5('scale-grant-'||n)::uuid,
-                'reservation_id',md5('scale-allocation-'||n)::uuid,'date',%s))
+                'reservation_id',md5('scale-allocation-'||n)::uuid,'date',%s::text))
             FROM generate_series(1,%s) AS n""",
             (LOAD_MARKER, day, HISTORY_PARENTS),
         )
@@ -135,8 +135,8 @@ def install_index_load(store, day, project_id):
             """INSERT INTO background_authorizations(id,state,data)
             SELECT md5('scale-grant-'||n)::uuid,'consumed',jsonb_build_object(
               'id',md5('scale-grant-'||n)::uuid,'state','consumed',
-              'created_at','2026-01-01T00:00:00+00:00','date',%s,
-              'evaluation_id',md5('scale-arena-'||n)::uuid,'scale_index_load',%s)
+              'created_at','2026-01-01T00:00:00+00:00','date',%s::text,
+              'evaluation_id',md5('scale-arena-'||n)::uuid,'scale_index_load',%s::text)
             FROM generate_series(1,%s) AS n""",
             (day, LOAD_MARKER, HISTORY_PARENTS),
         )
@@ -149,7 +149,7 @@ def install_index_load(store, day, project_id):
                 'id',md5('scale-allocation-'||n)::uuid,
                 'authorization_id',md5('scale-grant-'||n)::uuid,
                 'evaluation_id',md5('scale-arena-'||n)::uuid,
-                'date',%s,'state','settled','scale_index_load',%s,
+                'date',%s::text,'state','settled','scale_index_load',%s::text,
                 'actual',jsonb_build_object('calls',0,'tokens',0,'seconds',0,
                   'cost_usd',NULL),
                 'reserved',jsonb_build_object('calls',0,'tokens',0,'seconds',0,
@@ -163,8 +163,8 @@ def install_index_load(store, day, project_id):
               jsonb_build_object(
                 'id',md5('scale-run-'||n)::uuid,'state','completed_unverified',
                 'created_at','2026-01-01T00:00:00+00:00',
-                'scale_index_load',%s,
-                'request',jsonb_build_object('project_id',%s,
+                'scale_index_load',%s::text,
+                'request',jsonb_build_object('project_id',%s::text,
                   'arena',jsonb_build_object('evaluation_id',
                     md5('scale-arena-'||((n-1) %% %s+1))::uuid),
                   'background',jsonb_build_object('authorization_id',
@@ -178,7 +178,7 @@ def install_index_load(store, day, project_id):
               'model','completed',jsonb_build_object(
                 'id',md5('scale-action-'||n)::uuid,
                 'run_id',md5('scale-run-'||n)::uuid,
-                'kind','model','status','completed','scale_index_load',%s)
+                'kind','model','status','completed','scale_index_load',%s::text)
             FROM generate_series(1,%s) AS n""",
             (LOAD_MARKER, HISTORY_RUNS),
         )
