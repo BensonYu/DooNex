@@ -299,3 +299,46 @@ PYTHONPATH=apps/server:tests .venv/bin/python scripts/test_local.py \
 近容量会话首两轮尚未通过：`capacity-small01` 在最终 close 次数断言失败；`capacity-small02` 在三次 receipt 必须全相同的断言失败。两轮实际 Worker 最后均完成，但不因此改写测试退出 1。第二轮后停止追加补丁，审计真实 SDK 初始化、发送消息、恢复验证、再次让出、保存回执、最终 pending 动作和 close 全链。审计确认旧 fixture 在 SDK 正常初始 SystemPrompt 之前插入 1000 事件，导致冷恢复合法追加相同的 SystemPrompt 与 Pause；原事件是完整相同前缀、原两项 Action 身份与结算记录保持，最终 Observation 各一次。应将合成历史插入移至真实初始化之后，并精确核对 R0 验证 → R1 保存 → R1 验证，不能简单允许任意摘要变化。
 
 close 原解释同时更正：先前口头称“finish 关闭后 finally 再关闭”未经源码支持；源码核对为 `run_session` 的 finally 和 `LocalConversation.__del__` 的幂等 close，后续观察器须保留真实 caller 与所有清理完成证据。原工件审计 `m4-worker-session-capacity/LIFECYCLE_AUDIT_001.json` SHA256 `455185f887d86c2a6cc74b83bed77f493f34c3900b158da6403ba5a0de27ce0c`；small02 收据 SHA256 `6cce417774cf3dcd262a6d63bb07a40bb6696f77c8840a5b48f3b966302a07b1`，日志 SHA256 `061f9e678e47e7bcc6cbc4f169d217ff8ce178b9c6a19545af777bdc705bf8d9`。原 PG/Run 库存成功查询为空，watchdog 未触发；修正后的行为仍待。
+
+
+### 完整容量矩阵与会话故障复核（2026-11-14，最终整合仍待）
+
+Git/yielded 容量源码 `f72735e`、`9c12044` 已分别整合为 `bcdf7bb`、`57c7f84`；产品应用源码仍与 `e868ad3` 相同。私有 `m4-worker-wait-faults/capacity-matrix-00/RECEIPT.json` 记录 **13 passed / exit 0**，外层 165.533 秒，196 个输入与 Git blobs 前后匹配，watchdog 未触发，pytest 已 reap/EOF、一次性 PG 已精确回收，两种标签库存为空。父已独立核对原日志 SHA、收据、应用源码和资源终态。
+
+五种正常配置从实际入队提交到首次 Ledger 准入提交的区间上界分别为：16 个真实独立 SDK yielded 检查点 2.352210 秒；原始 Git 树 19,999 项 1.740155 秒；原始树字节 16,776,454 处 2.065464 秒；保留 9,999 项 3.798053 秒；保留 104,856,576 字节 1.991486 秒。17 个 yielded、尾部残留及五种 Git 超限分别拒绝，前置前台队列单列，原账目保持。容量分别构造，不外推组合满额或冷机。收据 SHA256 `054ad318c92384dee9a93003112f1e2eb01b6f0ed3b21fee692817b867979b5c`，日志 `91a62e7dcafe7f1c6bb69635541587e220b7c374f3a4d89556e5b46138aaed19`。
+
+会话容量夹具在 `e65a647` 保留 SDK 原生 bootstrap 后，`capacity-small03` **1 passed / exit 0**，外层 25.07 秒；原收据 R0 验证→新增一条原生 Pause 的 R1 保存→R1 验证，以及 pending 工具各一次完成均通过，原事件前缀、账目、首次启动时钟保持。原生 `run_session` finally 执行首次 close，SDK `__del__` 可幂等重复，全部调用记录保留。收据 SHA256 `3591e0e74578afe8d84ab93b6a57134c546896bdaff31784b90f9105687af4f3`，日志 `58db46a5e4919d85d8c5b4b8d1ffc477013c8b5560c0f5d540ad0f13f4dad4a8`。
+
+随后同一冻结源码的 `capacity-matrix01` 是 **3 passed / 1 failed / exit 1**，外层 68.114 秒，首错后 4 项未执行，不能称只剩一项。small/bytes 两个正常恢复场景及输入 token 拒绝通过；第 4 项预期 `source capacity` 对外透传，实际为 `Session persistence failed`。源码显示 `SessionFileStore._operation` 在容量异常后锁存该错误，后续 `check_ok` 使用锁存原因；仍需以内部真实 source guard 观测证明正确限额在预留前触发，不能仅放宽字符串断言。此问题与此前 bootstrap 生命周期夹具缺陷不同。收据 SHA256 `1ac7b62ed049a311e1dd404d0209709bdce9b226bdc9adb375b842577b785f47`，日志 `03f57c899dbe83687363d030b21630948650c8d45f2a9b42206fa46e2103aeda`；输入不变、watchdog 未触发、PG/子进程及容器清点完成。旧失败全部保留。
+
+正常等待按[最终检查前冻结的 90 秒目标](M4_WAIT_ACCEPTANCE.md)核对；以上仍是专项，不能替代最终固定源码全量及独立时间线后验。本轮没有真实模型调用、生产数据修改或常驻服务升级。
+
+
+### 历史规模的实际 Worker 等待专项
+
+新测试 `e4a3a3d` 首轮 `scale-cold-01` 在合成负载构造阶段退出 1（外层 15.264 秒）：`jsonb_build_object` 的文本占位参数缺显式类型，PostgreSQL 报 `IndeterminateDatatype`，负载事务回滚，目标入队计时尚未开始，warm 未执行。修复 `5dc8da5` 仅为八处占位显式增加 `::text`，不减少样本或修改产品。失败收据 SHA256 `5fa13c690c1c5ec9b2b1cc5d7bb4fdbdb819425626810ef6f9700ca4a8d19232` 保留。
+
+修复后 `scale-cold-02` 与 `scale-warm-01` 均独立 **1 passed / exit 0**，外层分别 21.419、22.996 秒。实际完整等待区间分别为 `[0.752428, 0.762523]` 与 `[0.413982, 0.422654]` 秒；前者包含新 Worker 初始化、锁及恢复核查，后者同一 Worker 在 warmup 完成后执行真实 `next_enabled → prepare → enqueue → admission`。宿主、daemon 和缓存仍已热，不称冷机。
+
+负载为明确标记的 100,000 条终态 Run、100,000 条终态 Action，及各 10,000 条历史 Arena/授权/分配，是索引负载而不是已完成真实任务的证据；64 份授权实际经过 create/enable，64 只是样本数。真实构造的 unknown 4,824 token 预留、yielded 回执、原首次启动时钟、父/分配/日账与历史行指纹保持。两轮 195 输入前后相同、watchdog 未触发、进程 reap/EOF、PG 精确回收及独立容器清点通过。父逐项核对收据、日志和应用源码后整合为 `440e0c4`、`5c7b068`；最终全量仍待。
+
+私有目录 `m4-worker-wait-scale/` 的 cold 收据 SHA256 `50c4183bbc52720a572b0b47d01f91bb3737b38b626a2e867ccf0a58d30a54b9`，日志 `3db938e614378aa52bdb6bba72a24b14564f1ecb897ee373d33a32ee8e69048d`；warm 收据 `6ca902fbea6e98cd3c03bb57232944c90c30388f988ccd447bd1d77fcc124548`，日志 `d6a5a6d2cc7cc269be5708a0d54bc0318120d1204c4bfd30e1deefb0fd46c94c`。没有真实模型调用。
+
+
+独立时间线审计补充了 long55 的精确源码归属：`worker-long-inflight-01.json` 记录的 HEAD 是 `1e7ada2`，运行时 `tests/test_worker_wait_matrix.py` 尚未提交，其实际捕获 SHA256 为 `cf23026a98e8313fa380d66458bb4f28a4e9783eaa0acedea269ff0172fe5c9d`，与随后提交 `cb13165` 的该文件逐字节一致；其余 170 个输入匹配原 HEAD。因此这轮绑定是“原 HEAD 加捕获的 fixture”，不能写成原 HEAD 干净运行。原收据不改，后验逐文件注明此补绑定；应用源码未变，最终整合仍将实际重验两个 55 秒场景。
+
+
+会话尾部 `capacity-tail01`（候选 `4bac8e4`）为 **4 passed / 1 failed / exit 1**，外层 54.983 秒，最后 bytes 正常场景未执行。原 source 容量异常的内部 observer 与三项 cap+1 拒绝通过；unknown 场景仍注入原 `TimeoutError`，SDK 将其转为 `ModelCallError`／`ConversationRunError`，实际 Run 是 `failed`，测试错误地期待 `interrupted`。因与上一轮同属未核实异常包装／外部状态合同，已暂停局部修补并重新审查全部八场景的异常、用量、恢复和后续派发链。
+
+既有 `test_provider_failure_classification.py` 已明确普通供应商异常为 `failed`，用量未知与生命周期状态分开。原八表显示 Run/executor 均 `failed`、一条 model action 为 unknown、`reservation_retained=true`、73,686 token 预留及父账相同，allocation/day 仍预留；没有证据支持改成 `interrupted` 或改注入故障。后续将保留超时、精确核对失败分类、原账/首次钟及重启不重放，不能只改为接受两个状态。原收据 `9de91287934e7a63a279a9f2e7024ab9f5029b9cbcff6bcf9a76bcd37be3ccb6` 与日志 `0843745d27f5a044fe9acda26fa33c4cce4ae795a8b0ac057d93de38ab1d9830` 保留；输入不变、watchdog 未触发、进程 reap/EOF、PG 与容器已精确清点。
+
+
+### Session 最终专项与全量前环境核对
+
+最终会话测试 `406ab38` 已整合至父 `0d83336`，文件 SHA256 为 `b02c2e737ad70fdd8a8580f0eaf8ac5654ee108ca250061a7697e00cf8252771`；产品代码仍与 `e868ad3` 相同。`capacity-final02` **2 passed / exit 0**，pytest 41.38 秒、外层 46.400835 秒。原 TimeoutError 精确传播为 failed，unknown action、73,686 token 预留、完整 Run、首次启动时钟、文件和父账在新 Worker 后保持，无同 Run 会话或传输重放。failed 不进入启动 reconcile，本样本不声称验证该路径。bytes 正向含 1000 active events、65,899,453 bytes，warm／startup／restore-arrival 等待上界为 **3.140930／0.699143／7.068546 秒**；原 pending shell 与 finish 各完成一次，额外模型调用零。
+
+196 个冻结输入不变、watchdog 未触发、进程 reap/EOF、PG 精确删除及两类 Docker 标签库存清点通过。私有 `m4-worker-session-capacity/capacity-final02/` 收据 SHA256 `1562569c8239d2ccb86e9d987148ba83e9d03dc398498db4690351b65cc6bd75`，日志 `e14f7bd858d39891b4216e3e1dac2d14f586780f523600fed532526faa78bdda`。全链合同审计 `CAPACITY_CONTRACT_AUDIT_002.json` 为 `409b38c840fdebccdd89aee1a1f3a42f21daa38e53911a7116336f9b5f85d583`。八项完整整合仍待，不合并分轮数字冒充整轮通过。
+
+全量前系统 Data 卷曾仅余 142 MiB，是环境容量阻塞。仅将四个已结束且有精确收据的 fixture 根目录逐文件复制、核对字节／模式／链接 manifest 后归档到私有 `/Volumes/T7/doonex-private-verification-20261114/fixture-archive/`，原路径保留符号链接；49,249 项、652,507,225 逻辑字节全部核对，未删除历史失败、生产数据或未知预留。归档收据 `ARCHIVE_RECEIPT.json` SHA256 `f6e5c666183429e9a1e96f985e72f44f5ada2f0b261607e9c6f372df9bd0b512`。之后实际系统盘可用 2.1 GiB、T7 734 GiB。最终整合将显式使用同一私有 T7 根的 `scratch` 作为 TMPDIR；这是测试存储条件，不是产品模型、预算或架构变更。
+
+独立专项时间线目前覆盖冻结的 43 种正常配置，均有实际准入 upper≤90 秒；最终观测尚未执行。下一步固定源码，依次运行 Ruff、前端构建及带原始 nodeid／时间线输出的完整 `scripts/test_local.py -s -vv`，再独立配对 43 份最终观测与专项。
