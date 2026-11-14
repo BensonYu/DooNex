@@ -224,3 +224,53 @@ PYTHONPATH=apps/server:tests .venv/bin/python scripts/test_local.py \
 本次全范围 Ruff `controller-preflight-ruff-03` exit 0；不把它或上述 107 项与之前 396 项相加作为当前完整回归。Community 的 36 项与 Generation 的 113 项独立组件通过且原提交绑定，尚未整合；yielded candidate003 与 Worker SIGKILL 两模块只有静态证据，未运行行为验收。精确工作区、提交和收据见[交接恢复点](DEVELOPMENT_HANDOFF.md#2026-11-14-持续目标清除后的恢复点)。
 
 上述检查是健康本地操作之间的协作期限；Arena.stop/settle 内部仍有只在前后检查的区间，数据库 commit、阻塞系统调用不能由局部检查中断。有限 yielded 集合、跨 execute/角色/批次的进程内 monotonic 不续期映射和完整 Worker.run 等待矩阵仍待，不能称完整维护或前台等待已通过。
+
+
+## M4 收尾：共同期限与完整调度候选（2026-11-14，继续中）
+
+当前应用候选为 `e868ad3`，父分支仍 `codex/responses-transport`。已纳入 Community/Generation/Worker SIGKILL 的生产 actor fixture 迁移、yielded 同一期限、Arena 有限维护、ExecutionClock 和 Background 时钟接线；不改模型、凭据、单 Run/批次/日额度或历史未知。本节不是最终退出结论，完整 Worker.run 等待矩阵和最终全量仍待。
+
+调用链修正：Worker、Scheduler、Background 共享一次进程生命周期 clock；Run 原首次启动、批次、allocation、窗口和 UTC 日截止只收紧，退出/让出后不重新计算出更晚期限；SDK store 和 Responses binding 同步收紧当前 bound。启动恢复和每轮准备复用各自的 30 秒协作期限；必要清理仍有独立 15 秒窗口，不等于整段 startup 的硬上界。reconcile 在提交 intent 后、开始外部 cleanup 前复检期限；如已过期，intent 保留，下次真实启动先阻止恢复/派发，不补造清理成功。yielded 探测前后均校验旧 owner/request，不能借新归属继续派发。
+
+候选工作量边界为 16 个 yielded、64 个 active/interrupted 恢复记录、64 个启动活动批次；cap+1 拒绝完整集合，保留原记录。64 个恢复记录包含历史 interrupted，积累过多会保守拒绝，不能声称任意历史规模可直接启动。批次计划复用已有 1–400 个唯一 Run 的有限核验。Background 全日 allocation 汇总仍依赖原数据库查询和健康规模条件，前后 deadline 检查不构成 SQL 工作量硬界。
+
+### 当前失败分类与复验
+
+| 私有收据前缀 | 实际结果 | 结论与后续 |
+| --- | --- | --- |
+| `clock-control-integration-01` | 15 passed / 1 failed，exit 1，首错停止 | 新测试误将 pending cleanup intent 直接等同通用 execution_fenced 查询；真正合同是本 Run 阻止及下一 Worker.run 的先行恢复核查。已改为真实重启与零派发、原 intent/unknown/首次钟保留断言；后续未执行 |
+| `clock-control-integration-02` | 39 passed / 1 failed，exit 1，首错停止 | 前述重启用例通过；新探测测试错误地把已核实 terminal receipt 填入未知库存并要求保留。两轮同类失败后重新检查完整 merge/registry 链，未发现历史删除；改为原 controller 行逐行保留、库存仅含新未知，并保留 prior-unknown 在探测前拒绝的独立用例。后续未执行 |
+| `clock-control-tail-01` | 19 passed / 1 failed，exit 1，首错停止 | 原初始化 fixture 将所有带 deadline 的 Library 构造视作 Run 内构造；新增 startup 也使用准备期限。测试拆分 startup 到期零启动时钟与 Run 内到期保留已提交首次时钟，不改变产品安全要求；后续未执行 |
+| `clock-control-boundary-fixes-01` | 6 passed / 40 deselected，exit 0，18.13 秒 | 以上初始化两边界、旧未知零探测、新探测未知与并发取消/terminal 原历史保留的针对性复验通过；不是最终专项或完整等待验收 |
+
+日志与收据位于私有 `verification/resume-20261113/`，上述每轮非 Markdown 输入前后相同。对应日志 SHA256 顺序为 `e8350c388754adaf05a3fb421be8cb8192e92a9fd977183c16b73f0c194a992a`、`c6fe25ff21c5824775cda0c8bb3e7c9d567aeebd462c31e8c10ad75e521e451d`、`721f6c718afdc9ee251f5782ea8236b9e35621aad9f3274c22e3e3d4b09ca591`、`3afeb8e944f18ba8980eb584457dd5a9f834ae9599362cd03eca269d45d8e4f0`。这些 dirty 候选的输入清单是源码绑定依据，HEAD 单独不能代表当时全部改动。
+
+下一步先完成剩余期限/维护专项，再运行真实 Worker.run 的四个在途阶段 × 三类前台，以及原计划的容量、锁/持久化/容器/数据库/期限和重启故障。仅合成响应，不重放已经成功的后台授权。最终固定源码才进行完整回归、Ruff、前端构建与文档一致性核对，再按既有条件推进 main 和固定版本服务升级。
+
+补充：`clock-control-tail-02` 在 `e868ad3` 上为 **27 passed / 1 failed / exit 1**（首错停止，后续未执行），日志 SHA256 `ae5f973cdc2be1d185964dddfed4a26829eea6a747e1d08073375550d4c682b4`。旧 delivery fixture 仍通过替换 `worker.elapsed` 模拟墙钟前跳，而新共同期限读取共享 ExecutionClock 的 wall source；已将候选测试改为控制该实际 source，保留至少收紧 4 秒、原账本和零新增交付的断言，行为复验待执行。产品代码未因此修改。
+
+`e868ad3` 的独立静态审查确认有限批次计划、reconcile 提交后复检和会话字段三项接线修复，收据 `m4-wait-control-review-20261114/worker-clock-integration-03/REVIEW_RECEIPT.json` SHA256 `646058bd63b02b1881c15005cf2d5a1da9e4a8f423696975d06ec85f30340498`；静态审查不代替行为测试。
+
+
+`delivery-clock-fixture-01` 在后续测试候选上 **4 passed / 21 deselected / exit 0**，5.57 秒，非 Markdown 输入不变；日志 SHA256 `98e5ed3233809c229af603bb424d7ce506c4967fbe450945e9993dd1037b4c99`。该测试适配已提交 `0ea2f46`，产品源码仍等同 `e868ad3`。
+
+后续 `clock-control-tail-03` 为 **173 passed / 1 failed / exit 1**，202.05 秒，输入不变，日志 SHA256 `9b37d1f3f133b100d18b12291daf53de5298322968a42de8f8bb2eaf2576c1e0`。首错为原 allocation fixture 要求 `_refresh_day` 未接收 deadline；新合同要求 metadata 和 allocation 均收到相同 caller 截止值。断言候选更新为两者均 `101.0`，仍保留授权、日账、分配/Run/action 完整回滚核对；后续未执行，不是联合通过。
+
+实际 Worker.run 小型正常矩阵首轮 `m4-worker-wait-matrix/matrix-00` 为 **6 passed / 1 failed / exit 1**，后 5 场景未执行。首错“后台 verifier → Arena 前台”的真实检查日志为 `Synthetic fixture gate expired`：共享 checker 对前台错误启用后台专属 gate；无容器超时或清理未知，已核实各进程 reap/EOF。修正候选仅由后台 marker 开启 gate，双方仍需执行原答案检查，并将 SDK close observer 绑定实际 Run。当前该修正版行为待复验；首轮结果不能计为完整等待通过。
+
+
+共享后台时钟的真实 PG 补测已提交 `e5876cb`，整合为 `b6093db`（仅新增测试，产品源码不变）。**25 passed / 92.30 秒 / exit 0**，170 个非 Markdown 输入前后及提交 blob 一致；真实 claim/create/attach/start、Ledger 最后准入、grant/day 行锁等待、allocation/window 到期、原日账绑定、10 类归属/冻结变更、attach 事务回滚、墙钟回拨后的完整时长结算，以及真实 400 子运行/401 和畸形计划拒绝均通过。未知预留及首次启动时钟保持。两类坏绑定仍为 `BackgroundConflict`，此处只验证拒绝新派发，不声称批次状态已统一转为停止。
+
+该轮没有模型调用或 Worker.run 完整等待测试。测试 PG 与 Run-label 容器清点为空；原始 `m4-execution-clock/background-pg-001.json/.log`、`BACKGROUND_PG_RECEIPT.json` 保存，汇总收据 SHA256 `c2a129cbe12851d94d55a14b019d38684e75693ef599e7c4d84c4a44144438a5`，日志 SHA256 `bd662dc842ab7a7c7f08538a2bbbcc24fb78bbdb4000a25eb35bdfe8224b52f8`。
+
+`scheduling-limits-tail-01` 已对尾部模块完成 **20 passed / 2 warnings / 74.36 秒 / exit 0**，输入前后相同；日志 SHA256 `1c9377694ece67dd90567cec230f2e3e1fb1e04f5cd0be2ab62ed66c0f3b12df`。上述 allocation 断言适配提交为 `47b28d7`，保留到期时完整事务回滚与停止新准入的核对；产品源码没有因此变化。测试进程已结束，PG 测试容器和 Run-label 容器均成功查询为空。该轮关闭已知专项断言失败，不代替最终全量。
+
+正常矩阵的 verifier 夹具修正版 `repair-00` 已通过单例，收据 SHA256 `7285fe71b516a10af7b92f2dddb7443f31cc240af4179f567697b5e7acab8674`。随后 `matrix-01` 为 **8 passed / 1 failed / exit 1**，后 3 场景未执行：generation-model 在 Worker 启动前被 `generation_parent_file_mode_unsupported` 拒绝。调用链核对为私有 runner 的 `umask 0077` 使两个合成父文件为 `0600`，Library 如实冻结该模式，而既有生成合同只接受 `0644/0755`。最小测试修正 `f0b0a63` 仅显式设置两份合成材料为 `0644` 并核对冻结模式，不改产品模式校验或全局 umask；此修正行为仍待执行。原失败收据 SHA256 `8fb08897617b118d69c49ea3d93505b1f0bdb8e78c3f65024a3314b05a97148f`，日志 SHA256 `b54e751ac0495d68372e33799567157540838cc5798041f1b5bf4ac6130af00f`。这些合成场景不消费真实模型授权。
+
+后续 `repair-01` 的生成单例通过，`matrix-02` 已完成 **12 passed / 2 warnings / 100.56 秒 / exit 0**（外层 104.649 秒）。它使用真实 Worker.run、一次性 PostgreSQL、真实 Docker 和 SDK，只有 Chat 模型响应为合成数据，覆盖 model/shell/verifier/preparation × 普通/Arena/generation 前台。每例核对事务提交后的首次模型准入、在途结算、让出回执和关闭、零新增后台动作与兄弟工具、原账目及首次时钟。源码 138 项前后不变；父已将测试整合至 `1e7ada2`，45 个应用/直接 fixture/锁文件与原收据逐哈希相同。
+
+该小容量、无前置前台、入队提交后立即解除合成在途 gate 的样本，提交到首次准入区间总体落在 **1.149526–1.838920 秒**。这是实测范围，不是 60 秒请求配置、近容量或服务 SLA；Responses、较长在途剩余、容量、故障及重启仍为独立待验收项。测试进程退出，PG 与 Run-label 库存成功查询为空。`matrix-02.json` SHA256 `795c3101ddbbc5cc4583dc83fe0110fe5efd4c38c252eb82276546145cab5732`，日志 SHA256 `beac6412cf34f692646731b99bf666ab70b53acd2f8a30e4465c78e5fb1bf712`；逐例原 monotonic 时间线及汇总保存在 `m4-worker-wait-matrix/`，汇总 SHA256 `336b121f53e4c791902b53a51efbcdf6143b38169d392272c68f41d66d0bab65`。
+
+父 `worker-recovery-integration-01` 在 `1e7ada2` 对 `tests/test_worker_process.py`、`tests/test_m3_api.py` 的整合检查为 **25 passed / 1 warning / 91.76 秒 / exit 0**（外层 96.260 秒），全部非 Markdown 输入相同。实际硬中断保留未决 controller 阻止及 API 恢复入口通过；日志 SHA256 `2ff4df9f0a91d599333c9467ad5dfcedc8a4d199a9291997b75730bdc376be44`。PG 与 Run-label 容器成功查询为空。该结果关闭原迁移后的两个模块复验，不能替代新 checkpoint/cleanup 故障矩阵或完整全量。
+
+父 `worker-long-inflight-01` 的两项实际容器等待检查 **2 passed / 2 warnings / 132.01 秒 / exit 0**（外层 136.911 秒），输入前后不变；独立进程组 watchdog 为 360 秒且未触发。前台入队提交后，shell/verifier 容器分别继续真实工作 55 秒，实际 Sandbox 收到原 60 秒动作上限；完整结算、清理、回执/close 和首次前台准入继续走同一 Worker.run。入队提交到首次准入区间分别为 **56.755135–56.767005 秒**、**56.610749–56.624138 秒**，后台没有新增动作或兄弟工具，原已结算账目与首次时钟保持。测试修正与新场景已提交 `cb13165`，只增加合成 gate 的默认零延迟参数，不更改产品配置或期限。日志 SHA256 `56f206c627dccdfe6c8e825dffee6c8a2cf6dfbcbe4a327706152f9f449e9ab0`，PG/Run-label 库存成功查询为空。该实测仍是小容量和无前置前台，不能代替近容量、隔离 Responses 或异常路径验收。

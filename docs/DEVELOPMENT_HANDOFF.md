@@ -2,6 +2,18 @@
 
 更新：2026-11-14；用户于 2026-11-13 恢复开发，最新验收收据为 **UTC 2026-11-14**。用户已明确结束暂停；本页是当前启动入口。原暂停快照保存在 Git 提交 `6a0a227`，不要照其中“尚未执行”的命令重放本轮已执行动作。完整经过、失败和证据见[续接记录](M4_RESUMPTION_20261113.md)。
 
+## 2026-11-14 当前继续点（M4 收尾进行中）
+
+用户随后明确继续 M4 收尾，下面“持续目标清除”一节保留为历史快照，不是当前停止指令。当前只处理执行控制/清理恢复、共同期限、真实 Worker.run 完整等待矩阵和最终验证；不扩展权限、远程访问、App 或云调度，不修改产品模型、凭据或预算。
+
+父工作区和分支不变。已整合 Community、Generation、Worker SIGKILL fixtures、yielded 共同期限、进程生命周期 ExecutionClock、Arena 有限维护及 Background 时钟接线；候选已提交为 `e868ad3`，含 Worker/Scheduler、SDK 动态期限及有限调度 census，尚未完成整合验证。旧 2126 项全量和历史 396/107 项首错轮均不能作为当前源码验收。
+
+当前关闭条件：专项证明原 Run/批次/分配/窗口/UTC 日期限只收紧、旧 owner 不能派发、cleanup 在锁外且到期不开始新操作；再以实际 Worker.run、一次性 PostgreSQL、真实 Docker 和本地合成模型测量入队提交到首次实际准入，覆盖原计划全部容量和故障维度；最后固定源码重跑完整回归、Ruff、前端构建和文档检查。有限 census 候选为 yielded 16、启动 active/interrupted 64、启动活动 Arena 64；超限拒绝完整集合而非截取前缀。这些候选容量尚不能称发布验收通过。
+
+最新针对性结果：分配期限尾部 20 项、Worker 硬中断/M3 入口 25 项、小容量正常 Worker.run 矩阵 12 场景及原 60 秒限制内的 55 秒真实 shell/verifier 剩余等待两场景已通过。测试已整合至 `cb13165`，产品源码仍为 `e868ad3`；全部原失败保留，具体收据和适用条件见续接记录。Responses、近容量、checkpoint/cleanup 故障及最终完整回归仍未完成，不能合并 main。行为测试使用独占一次性 PG/Docker，先核对当前持有者与进程再启动。
+
+原遗留停止容器已从原始测试日志核实归属后精确回收，私有收据 `resume-20261113/legacy-fixture-container-recovery-01.json`（SHA256 `ddf42b48b50dfd158f40e50457d5fb4e2197812b2f940470e4bc23ec05f84369`）；没有清空产品账本或历史未知。当前检查与收据统一保存在 `verification/resume-20261113/`，先核对进程及收据再续接，不重复启动仍在运行的检查。
+
 ## 2026-11-14 持续目标清除后的恢复点
 
 本轮持续目标已被用户清除，已停止派发新开发/测试切片；正在执行的父检查只做收尾。下次明确继续时先核对本节，不新建重复整合分支，也不按旧计划重放真实模型验收。`main` 的剩余退出条件没有变化。
@@ -22,7 +34,7 @@
 
 私有证据相对 `~/Library/Application Support/DooNex/verification/`：Community 与 Generation 分别为 `m4-community-evidence-actors/`、`m4-generation-evidence-actors/` 的 `pg_001.json/.log`、`HANDOFF.md`、`FINAL_RECEIPT.json`；yielded 为 `m4-yielded-shared-deadline/static-3.json`，SHA256 `1585c14fa6deba16312dc63c6b185dda03b405cd1166cec0675cd67e1aa7f68d`；硬中断为 `m4-worker-kill-actors/STATIC_RECEIPT_002.json`，SHA256 `39bfd0d258c41d9378023b7809d8aa05f1ad0b53eaec48784501b9533d8c285d`。各片独立审查位于 `m4-wait-control-review-20261114/`。这里只保存脱敏事实，原始材料不进入产品 Git。
 
-## 当前状态与源码
+## 上次保存时的状态与源码（历史快照）
 
 | 对象 | 当前事实 |
 | --- | --- |

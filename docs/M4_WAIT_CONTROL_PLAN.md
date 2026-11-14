@@ -66,3 +66,12 @@ schema 初始化 DDL 仍在 worker 全局执行锁之前；单个数据库等待
 ## 证据入口
 
 当前整合与真实结果见[续接记录](M4_RESUMPTION_20261113.md)，当前下一步见[交接](DEVELOPMENT_HANDOFF.md)。私有 `verification/m4-next-wait-design/REPORT.md` 保存原始完整路径审计，`m4-helper-reservation-implementation/HANDOFF.md`、`m4-database-maintenance-implementation/HANDOFF.md` 保存原切片组件证据；其中“未整合”是当时事实，已由本轮整合记录更新。历史组件测试数不相加代替最终全量回归。
+
+
+## 当前收尾候选（2026-11-14，未完成最终验收）
+
+共同期限与调度候选 `e868ad3` 已接通 Worker/Scheduler/Background 的共享进程 clock、SDK store/Responses binding 动态收紧、完整有限 yielded census、Arena 内部维护期限及恢复 intent 提交后的复检。历史 396/107 项首错、2126 项全量均仍只适用原源码；当前具体失败分类和收据见[续接记录](M4_RESUMPTION_20261113.md#m4-收尾共同期限与完整调度候选2026-11-14继续中)。
+
+候选 census 为 yielded 16、active/interrupted 恢复 64、启动活动批次 64；超限完整拒绝，包含历史 interrupted 的恢复集合不会被静默截断。原批次计划限制 400；单 Worker 的进程 clock 最多保留 4096 个 scope，满额拒绝新 scope，不通过淘汰原时钟续期。准备 deadline 不刷新；已经准入的必要清理仍有独立 15 秒回收窗口，不能将 30 秒准备参数当作冷启动绝对上界。日 allocation 汇总保持原查询合同，实际规模与健康依赖必须在最终等待报告中明确。
+
+完整 Worker.run 正常场景、近容量和故障/重启分片继续使用实际 PG/Docker，只有模型响应为本地合成。当前正在逐项验证；测量 observer 必须在真实外层事务退出后标记 commit，SDK close 按实际 Run 归属记录。此前小样例与静态接线不关闭本计划的完整矩阵退出条件。
