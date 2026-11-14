@@ -2,11 +2,11 @@
 
 更新：2026-11-14；用户于 2026-11-13 恢复开发，最新验收收据为 **UTC 2026-11-14**。用户已明确结束暂停；本页是当前启动入口。原暂停快照保存在 Git 提交 `6a0a227`，不要照其中“尚未执行”的命令重放本轮已执行动作。完整经过、失败和证据见[续接记录](M4_RESUMPTION_20261113.md)。
 
-## 当前继续点（有限后台首片受控验收收尾）
+## 当前继续点（有限后台首片收尾已完成）
 
 用户随后明确继续 M4 收尾，下面“持续目标清除”一节保留为历史快照，不是当前停止指令。当前只处理执行控制/清理恢复、共同期限、真实 Worker.run 完整等待矩阵和最终验证；不扩展权限、远程访问、App 或云调度，不修改产品模型、凭据或预算。
 
-父工作区 `/Users/benson/.codex/worktrees/doonex-delivery-docs/doonex`，最终行为验收非 Markdown 源码 `25c221e3f9cca942341cc3c3678a08bc3d94af26`，176 项输入已与提交逐项绑定。收尾文档仅修改 Markdown，提交前后须核对非 Markdown 字节仍匹配验收源码；当前分支及 main/远程状态见本页末尾的实际核对。
+父工作区 `/Users/benson/.codex/worktrees/doonex-delivery-docs/doonex`，最终行为验收非 Markdown 源码 `25c221e3f9cca942341cc3c3678a08bc3d94af26`，176 项输入已与提交逐项绑定。收尾文档仅修改 Markdown，提交前后已核对非 Markdown 字节仍匹配验收源码；当前分支及 main/远程状态见本页末尾的实际核对。
 
 `m4-normal43-specialized-05` 与 `m4-closure-full-06` 均已完整结束且退出0；具体通过数、警告、跳过、耗时、输入清单及日志SHA见[最终收尾记录](M4_RESUMPTION_20261113.md#m4-final-closure)。冻结v3独立审计核对43配置/39个唯一实际PASSED节点、两轮同源码与原90秒目标，invalid/pending均为空；151精确节点覆盖、故障/超限/重启、实际资源终态、Ruff06与构建06另有核对。不得用专项或局部通过替代这些门槛。
 
@@ -96,7 +96,7 @@ PYTHONPATH=apps/server:tests .venv/bin/python -c 'import doonex; print(doonex.__
 
 1. 续接先核对Git、真实进程与终态收据；不要重启已完成检查。普通gateway、后台run_once及原prepare/finish/finalize intent均已消费，不重放真实模型授权或清理脚本。
 2. 核对文档提交的非Markdown输入与 `25c221e` 一致，并保留全部原失败、冻结v3/151节点后验、Ruff/构建和资源终态收据。
-3. 实际main尚未推进时，按已有授权正常推进并同步GitHub、核对本地/远程SHA；若已完成，则只核对实际SHA，不重复制造整合。不能force或删除历史分支/worktree。
+3. main已正常快进并同步GitHub，见页末核对点；下次只核对实际本地/远程SHA和新增变化，不重复制造整合。不能force或删除历史分支/worktree。
 4. 常驻服务升级作为单独固定源码操作处理：先核对配置、未决记录、worker锁与回退路径，不能启动仍指向旧M5的worker。权限/App/云调度/公开上线和收费不在本轮范围；后续开发按路线图明确切片。
 
 历史 `b462502` 真实后台矩阵保持原源码证据；本轮恢复界面有API和构建验证，没有新的浏览器点击验收。
@@ -131,6 +131,8 @@ PYTHONPATH=apps/server:tests .venv/bin/python -c 'import doonex; print(doonex.__
 
 分支多主要来自 M1–M5 的隔离实现与审查，cherry-pick 后原提交未必是当前祖先；不能只靠 branch --merged 判断是否交付。暂停时的详细分类见 `verification/pause-branch-audit-20261106/BRANCHES.md`。两片当时未整合的代码现已纳入当前入口，没有为了本轮再开重复分支。
 
-**有限后台首片的等待和最终整合验收阻塞已解除；main尚待实际推进与远程核对。** 文档与非Markdown输入核对完成后，按已有授权正常推进；若main是祖先可fast-forward，否则先整合远程新提交并重验，不force。无需逐个合并历史子分支。
+**有限后台首片的等待和最终整合验收阻塞已解除，main已正常快进并同步GitHub。** 2026-11-14 的实际核对点为 `204b842baa2e3c980c22f4068aacc22b38e50e7d`：本地main、`codex/responses-transport`及GitHub两条同名分支完全一致。main从 `a965d7faaf83f6f70f22971da21ab5aa03e27257` 快进，原远端整合分支为 `78d893d6e53e48276f04879ebfad82b90e740e21`；原子推送exit0，没有force或覆盖远端新增历史。私有 `resume-20261113/m4-main-sync-evidence-01.json` SHA256 `e8c42cd96a8eb121c7114c7ef8856f90e7810c03c2edd3a72d103fb9c554c464` 保存该核对。
+
+该核对点之后仅补记本页同步事实和README的main安装命令，再正常快进/同步文档提交；最新完整SHA以Git及私有 `resume-20261113/m4-main-sync-final-02.json` 为准，避免在提交内引用自身SHA。文档更新前后176项非Markdown输入继续绑定 `25c221e`，不重复运行已通过且源码未变的行为检查。无需逐个合并历史子分支；服务未升级。
 
 本轮不删除分支或 worktree。之后先区分已纳入成果、独立未整合改动、脏/忽略文件、服务或固定验收引用；managed worktree 用应用归档保留恢复快照。共享 venv/node_modules 的 M1 依赖和仍被引用的固定目录须先处理，不直接清理。

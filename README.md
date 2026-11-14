@@ -48,10 +48,10 @@ M5 面向自托管单站点，范围与实际检查见 [M5 记录](docs/M5_IMPLE
 
 首个验证环境为 Apple Silicon Mac mini、macOS、Docker 与 Python 3.12。系统 Python 3.9 不用于应用运行；`uv` 根据项目约束创建 Python 3.12 环境。还需可用的 Git、Node.js 和 `pnpm`，前端包管理器锁定为 `pnpm@11.1.1`。这些命令供本机开发使用，不代表已验证其他硬件或公网部署。
 
-已验收的非 Markdown 源码固定为 `25c221e3f9cca942341cc3c3678a08bc3d94af26`：共同执行期限、持久 controller、锁外清理、有限调度集合及恢复路径已整合，43 正常配置的同源码专项/无筛选全量和独立时间线审计通过；条件、实际测试结果与全部失败见[等待验收](docs/M4_WAIT_ACCEPTANCE.md)及[续接记录](docs/M4_RESUMPTION_20261113.md#m4-final-closure)。这只关闭有限后台首片的受控等待与最终整合条件。当前 Git 分支、main 与远程 SHA 以[交接](docs/DEVELOPMENT_HANDOFF.md)的实际核对为准。当前 API/worker 未加载，保留 plist 仍指向旧 M5 `f7a1161`，常驻服务未升级；以下安装命令的分支须在实际 main 推进并核对远程后再切换。
+已验收的非 Markdown 源码固定为 `25c221e3f9cca942341cc3c3678a08bc3d94af26`：共同执行期限、持久 controller、锁外清理、有限调度集合及恢复路径已整合，43 正常配置的同源码专项/无筛选全量和独立时间线审计通过；条件、实际测试结果与全部失败见[等待验收](docs/M4_WAIT_ACCEPTANCE.md)及[续接记录](docs/M4_RESUMPTION_20261113.md#m4-final-closure)。这只关闭有限后台首片的受控等待与最终整合条件。当前 Git 分支、main 与远程 SHA 以[交接](docs/DEVELOPMENT_HANDOFF.md)的实际核对为准。当前 API/worker 未加载，保留 plist 仍指向旧 M5 `f7a1161`，常驻服务未升级。main 已正常快进并同步 GitHub，以下安装命令检出 main；源码证据绑定不因文档提交变化。
 
 ```bash
-git clone --branch codex/responses-transport git@github.com:BensonYu/DooNex.git doonex
+git clone --branch main git@github.com:BensonYu/DooNex.git doonex
 cd doonex
 python3 -m venv .bootstrap
 .bootstrap/bin/pip install uv==0.13.7
