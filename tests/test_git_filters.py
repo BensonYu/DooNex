@@ -6,11 +6,14 @@ import subprocess
 import sys
 import time
 
+import controller_test_support
 import pytest
 from doonex.api import create_app
 from doonex.api import git as api_git
 from doonex.workspace import Workspace, WorkspaceError, _git
 from fastapi.testclient import TestClient
+
+controller_registry = controller_test_support.controller_registry
 
 
 def git(repository, *arguments):
@@ -22,7 +25,7 @@ def git(repository, *arguments):
 
 
 @pytest.fixture
-def repository(tmp_path):
+def repository(tmp_path, controller_registry):
     root = tmp_path / "repository"
     root.mkdir()
     git(root, "init", "-q", "-b", "main")
@@ -158,8 +161,18 @@ def test_config_key_output_limit_fails_closed(repository, probe, monkeypatch):
     git(repository, "config", "filter.Probe.Driver.clean", command)
     (repository / "sample.txt").write_text("altered fixture\n")
     monkeypatch.setattr(module, "MAX_GIT_CONFIG_BYTES", 8)
-    with pytest.raises(WorkspaceError, match="configuration key limit"):
-        _git(repository, "status", "--porcelain=v1", check=False)
+    deadline = time.monotonic() + module.GIT_OPERATION_TIMEOUT
+    # Keep this case focused on real configuration output: the public _git
+    # intent's separate byte limit uses the same deliberately reduced constant.
+    with (
+        pytest.raises(WorkspaceError, match="configuration key limit"),
+        module._controller_group(
+            repository, "git_api_read", deadline, intent=()
+        ) as controller,
+    ):
+        module._GitOperation(repository, deadline, controller=controller).run(
+            "status", "--porcelain=v1", check=False
+        )
     assert not marker.exists()
 
 
