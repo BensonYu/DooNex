@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .deadline import check_deadline
 from .skills import (
     MAX_SKILL_ENTRIES,
     MAX_SKILL_FILE_BYTES,
@@ -34,6 +35,7 @@ from .workspace import (
     Workspace,
     WorkspaceError,
     _allowed_path,
+    _json_digest,
     manifest,
     read_files,
     validate_repository,
@@ -196,16 +198,18 @@ def _check_location(path: Path, home: Path, *, project: bool = False) -> None:
 
 
 def _tree(
-    path: Path, *, limit: int, depth: int, private: bool
+    path: Path, *, limit: int, depth: int, private: bool, deadline: float | None = None
 ) -> tuple[list[str], list[str]]:
     directories, files = [], []
     count = 0
 
     def walk(descriptor: int, prefix=""):
         nonlocal count
+        check_deadline(deadline)
         if private and stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o700:
             raise TaskSetError("Task set directories must remain private (0700)")
         for name in sorted(os.listdir(descriptor)):
+            check_deadline(deadline)
             count += 1
             if count > limit:
                 raise TaskSetError("Task set entry limit exceeded")
@@ -250,12 +254,14 @@ def _tree(
         walk(descriptor)
     finally:
         os.close(descriptor)
+    check_deadline(deadline)
     return sorted(directories), sorted(files)
 
 
 def _snapshot(
-    path: Path, kind: str, *, private=False
+    path: Path, kind: str, *, private=False, deadline: float | None = None
 ) -> tuple[dict, dict[str, FileContent]]:
+    check_deadline(deadline)
     limit = MAX_FILES if kind == "source" else MAX_SKILL_ENTRIES
     max_file = MAX_FILE_BYTES if kind == "source" else MAX_SKILL_FILE_BYTES
     max_total = MAX_TOTAL_BYTES if kind == "source" else MAX_SKILL_TOTAL_BYTES
@@ -267,14 +273,17 @@ def _snapshot(
         max_file_bytes=max_file,
         max_total_bytes=max_total,
         max_depth=depth,
+        deadline=deadline,
     )
-    directories, names = _tree(path, limit=limit, depth=depth, private=private)
+    directories, names = _tree(
+        path, limit=limit, depth=depth, private=private, deadline=deadline
+    )
     if names != sorted(files):
         raise TaskSetError("Task set files changed while reading")
-    entries = manifest(files)
+    entries = manifest(files, deadline=deadline)
     data = {"files": entries, "directories": directories}
     return {
-        f"{kind}_digest": _sha(_json(data)),
+        f"{kind}_digest": _json_digest(data, deadline=deadline),
         f"{kind}_files": entries,
         f"{kind}_directories": directories,
     }, files
