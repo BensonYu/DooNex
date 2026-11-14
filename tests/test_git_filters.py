@@ -1,13 +1,16 @@
 """Host Git operations never execute a registered project's content commands."""
 
+import errno
 import os
 import shlex
 import subprocess
 import sys
+import threading
 import time
 
 import controller_test_support
 import pytest
+from doonex import controller_operations as co
 from doonex.api import create_app
 from doonex.api import git as api_git
 from doonex.workspace import Workspace, WorkspaceError, _git
@@ -188,17 +191,78 @@ def test_filter_override_limits_fail_closed(repository, probe, monkeypatch, limi
     assert not marker.exists()
 
 
-def test_config_include_timeout_fails_closed(repository, tmp_path, monkeypatch):
+def test_config_include_timeout_fails_closed(
+    repository, tmp_path, monkeypatch, controller_registry
+):
     import doonex.workspace as module
 
     fifo = tmp_path / "blocking-config"
     os.mkfifo(fifo)
     git(repository, "config", "include.path", str(fifo))
-    monkeypatch.setattr(module, "GIT_CONFIG_TIMEOUT", 0.1)
-    started = time.monotonic()
-    with pytest.raises(WorkspaceError, match="configuration inspection timed out"):
-        _git(repository, "status", "--porcelain=v1", check=False)
-    assert time.monotonic() - started < 2
+    # Observe Git opening the include, instead of assuming PG admission and
+    # Git startup finish in 100ms. Hold its writer open without providing data.
+    monkeypatch.setattr(module, "GIT_CONFIG_TIMEOUT", 3)
+    stop = threading.Event()
+    opened, failures, commands, processes = [], [], [], []
+    original_run, original_popen = module._run_git_command, module.subprocess.Popen
+
+    def hold_writer():
+        descriptor = None
+        try:
+            while not stop.is_set():
+                try:
+                    descriptor = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+                    opened.append(time.monotonic())
+                    stop.wait(10)
+                    return
+                except OSError as error:
+                    if error.errno != errno.ENXIO:
+                        raise
+                    stop.wait(0.01)
+        except OSError as error:
+            failures.append(error)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def observe_run(command, *args, **kwargs):
+        commands.append((command, kwargs["deadline"]))
+        return original_run(command, *args, **kwargs)
+
+    def observe_popen(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(module, "_run_git_command", observe_run)
+    monkeypatch.setattr(module.subprocess, "Popen", observe_popen)
+    writer = threading.Thread(target=hold_writer, daemon=True)
+    writer.start()
+    try:
+        with pytest.raises(WorkspaceError, match="configuration inspection timed out"):
+            _git(repository, "status", "--porcelain=v1", check=False)
+        assert len(commands) == len(processes) == 1
+        assert "config" in commands[0][0] and "status" not in commands[0][0]
+        assert len(opened) == 1 and opened[0] < commands[0][1]
+        assert processes[0].returncode == -9
+        assert processes[0].stdout.closed and processes[0].stderr.closed
+        with controller_registry.store.connect() as connection:
+            record = connection.execute(
+                "SELECT data FROM controller_operations"
+            ).fetchone()["data"]
+            assert not co.fenced(connection)
+        assert record["state"] == "terminal"
+        assert record["terminal_evidence"]["outcome"] == "failed"
+        assert (
+            commands[0][1] <= record["business_deadline_monotonic_ns"] / 1_000_000_000
+        )
+        assert len(record["processes"]) == 1
+        assert record["processes"][0]["pid"] == processes[0].pid
+        assert record["processes"][0]["reaped"] and record["processes"][0]["pipe_eof"]
+    finally:
+        stop.set()
+        writer.join(timeout=2)
+    assert not writer.is_alive() and failures == []
 
 
 def test_config_failure_does_not_print_values(repository, tmp_path):

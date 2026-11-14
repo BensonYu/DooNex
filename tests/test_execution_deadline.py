@@ -48,14 +48,31 @@ def test_canonical_hash_checks_during_bounded_encoding():
     assert len(calls) == 5
 
 
-def test_actual_sdk_lock_uses_the_same_deadline_and_leaves_no_callbacks(tmp_path):
+def test_actual_sdk_lock_uses_the_same_deadline_and_leaves_no_callbacks(
+    tmp_path, monkeypatch
+):
     kwargs, reservations, settlements, commands, events = harness(tmp_path)
-    kwargs["persistence_deadline"] = time.monotonic() + 0.2
-    with sdk._RUN_LOCK:
-        start = time.monotonic()
+    deadline = time.monotonic() + 3
+    kwargs["persistence_deadline"] = deadline
+    lock, attempts = sdk._RUN_LOCK, []
+
+    def acquire(*, timeout):
+        entered = time.monotonic()
+        result = lock.acquire(timeout=timeout)
+        attempts.append((entered, timeout, result))
+        return result
+
+    with lock:
+        monkeypatch.setattr(
+            sdk, "_RUN_LOCK", SimpleNamespace(acquire=acquire, release=lock.release)
+        )
         with pytest.raises(SessionStorageError) as raised:
             sdk.run_session(**kwargs)
-        assert time.monotonic() - start < 1
+        assert len(attempts) == 1
+        entered, timeout, acquired = attempts[0]
+        assert entered < deadline and acquired is False
+        assert abs(entered + timeout - deadline) < 0.05
+        assert deadline <= time.monotonic() < deadline + 1
     assert exception_cause(raised.value, ExecutionDeadlineExceeded)
     assert not reservations and not settlements and not commands and not events
     assert not sdk._CALLBACKS and not sdk._SCHEDULING and not sdk._SESSION_STORES

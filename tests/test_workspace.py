@@ -7,6 +7,7 @@ import time
 
 import controller_test_support
 import pytest
+from doonex import controller_operations as co
 from doonex.deadline import ExecutionDeadlineExceeded
 from doonex.workspace import Workspace, WorkspaceError, read_files
 
@@ -451,7 +452,16 @@ def test_git_timeout_reaps_child_and_preserves_outer_marker(
         return process
 
     monkeypatch.setattr(module.subprocess, "Popen", observe)
-    deadline = time.monotonic() + 0.1
+    # The allowance starts before real PG admission. Prove the child reached
+    # its blocking phase; pre-Popen expiry is a separate registry contract.
+    deadline = time.monotonic() + 3
+    ready = bytearray()
+    ready_at = []
+
+    def consume(chunk):
+        ready.extend(chunk)
+        ready_at.append(time.monotonic())
+
     expected = ExecutionDeadlineExceeded if outer else WorkspaceError
     with (
         pytest.raises(expected),
@@ -460,15 +470,34 @@ def test_git_timeout_reaps_child_and_preserves_outer_marker(
         ) as controller,
     ):
         module._run_git_command(
-            [sys.executable, "-c", "import time; time.sleep(30)"],
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                "import time; print('ready', flush=True); time.sleep(30)",
+            ],
             os.environ.copy(),
             deadline=deadline,
             stdout_limit=32,
             outer_deadline=deadline if outer else None,
+            consume=consume,
             controller=controller,
         )
-    assert processes[0].returncode is not None
+    assert ready == b"ready\n" and max(ready_at) < deadline
+    assert len(processes) == 1 and processes[0].returncode == -9
     assert processes[0].stdout.closed and processes[0].stderr.closed
+    with controller_registry.store.connect() as connection:
+        record = connection.execute(
+            "SELECT data FROM controller_operations"
+        ).fetchone()["data"]
+        assert not co.fenced(connection)
+    assert record["business_deadline_monotonic_ns"] == int(deadline * 1_000_000_000)
+    assert record["state"] == "terminal"
+    assert record["terminal_evidence"]["reason"] == "deadline"
+    assert len(record["processes"]) == 1
+    assert record["processes"][0]["pid"] == processes[0].pid
+    assert record["processes"][0]["reaped"] and record["processes"][0]["pipe_eof"]
 
 
 def test_reaped_git_leader_is_not_signaled_again(monkeypatch):
@@ -506,7 +535,10 @@ def test_pipe_eof_unknown_records_reaped_child(
         child_ids.extend(int(value) for value in chunk.split())
 
     try:
-        deadline = time.monotonic() + 0.2
+        # Include real persistent admission without assuming it takes <200ms.
+        # The receipt below must prove the leader exited and the child holds
+        # the pipe; an earlier launch rejection cannot pass this test.
+        deadline = time.monotonic() + 3
         with (
             pytest.raises(module.WorkspaceProcessUnknown) as captured,
             module._controller_group(
@@ -528,9 +560,21 @@ def test_pipe_eof_unknown_records_reaped_child(
                 controller=controller,
             )
         evidence = captured.value.cleanup_evidence
+        assert len(child_ids) == 1
         assert evidence["local_process_unknown"] is True
         assert evidence["processes"][0]["reaped"] is True
         assert evidence["processes"][0]["pipe_eof"] is False
+        with controller_registry.store.connect() as connection:
+            record = connection.execute(
+                "SELECT data FROM controller_operations"
+            ).fetchone()["data"]
+            assert co.fenced(connection)
+        assert record["business_deadline_monotonic_ns"] == int(deadline * 1_000_000_000)
+        assert record["state"] == "unknown"
+        assert len(record["processes"]) == 1
+        assert record["processes"][0]["exit_code"] == 0
+        assert record["processes"][0]["reaped"] is True
+        assert record["processes"][0]["pipe_eof"] is False
     finally:
         for child_id in child_ids:
             try:

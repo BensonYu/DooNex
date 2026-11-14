@@ -625,20 +625,30 @@ def test_unrecognized_context_cannot_override_actor_or_kind(repository, fake_reg
 def test_real_timeout_reaps_and_observes_both_eof_before_failed_terminal(
     repository, fake_registry
 ):
-    cutoff = time.monotonic() + 0.15
+    cutoff = time.monotonic() + 3
+    ready = bytearray()
     with (
         pytest.raises(ExecutionDeadlineExceeded),
         ws._controller_group(repository, "git_api_read", cutoff) as controller,
     ):
         ws._run_git_command(
-            [sys.executable, "-I", "-S", "-c", "import time;time.sleep(30)"],
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                "import time;print('ready',flush=True);time.sleep(30)",
+            ],
             os.environ.copy(),
             deadline=cutoff,
             outer_deadline=cutoff,
             stdout_limit=32,
+            consume=ready.extend,
             controller=controller,
         )
     operation = fake_registry.operations[0]
+    assert ready == b"ready\n"
+    assert operation.arguments["deadline_monotonic_ns"] == int(cutoff * 1_000_000_000)
     assert operation.state == "terminal" and operation.evidence["reason"] == "deadline"
     assert (
         operation.capability.processes[0]["reaped"]
@@ -656,17 +666,16 @@ def test_real_inherited_pipe_unknown_remains_false_after_finally_close(
     def consume(chunk):
         child_ids.extend(int(value) for value in chunk.split())
 
+    cutoff = time.monotonic() + 3
     try:
         with (
             pytest.raises(ws.WorkspaceProcessUnknown) as captured,
-            ws._controller_group(
-                repository, "git_api_read", time.monotonic() + 1
-            ) as controller,
+            ws._controller_group(repository, "git_api_read", cutoff) as controller,
         ):
             ws._run_git_command(
                 [sys.executable, "-c", code],
                 os.environ.copy(),
-                deadline=time.monotonic() + 0.2,
+                deadline=cutoff,
                 stdout_limit=128,
                 consume=consume,
                 controller=controller,
@@ -674,6 +683,11 @@ def test_real_inherited_pipe_unknown_remains_false_after_finally_close(
         process = captured.value.cleanup_evidence["processes"][0]
         assert process["reaped"] is True and process["pipe_eof"] is False
         operation = fake_registry.operations[0]
+        assert len(child_ids) == 1
+        assert operation.arguments["deadline_monotonic_ns"] == int(
+            cutoff * 1_000_000_000
+        )
+        assert operation.capability.processes[0]["exit_code"] == 0
         assert operation.state == "unknown"
         assert operation.capability.processes[0]["pipe_eof"] is False
     finally:
@@ -855,11 +869,13 @@ def test_pg_run_and_action_context_are_persisted_and_new_owner_blocks_next_git(
         assert co.fenced(connection)
 
 
-def test_pg_expiry_while_before_process_waits_starts_no_popen(
-    repository, pg_registry, monkeypatch
+@pytest.mark.parametrize("stage", ["launch", "before_process"])
+def test_pg_expiry_while_admission_waits_starts_no_popen(
+    repository, pg_registry, monkeypatch, stage
 ):
     store, _ = pg_registry
     clock = [time.monotonic()]
+    deadline = clock[0] + 10
     monkeypatch.setattr(ws.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(co.time, "monotonic_ns", lambda: int(clock[0] * 1_000_000_000))
     real_locked, count = co.Operation._locked, [0]
@@ -867,7 +883,7 @@ def test_pg_expiry_while_before_process_waits_starts_no_popen(
     def delayed(self, connection):
         result = real_locked(self, connection)
         count[0] += 1
-        if count[0] == 2:
+        if count[0] == (1 if stage == "launch" else 2):
             clock[0] = self.record["business_deadline_monotonic_ns"] / 1_000_000_000 + 1
         return result
 
@@ -875,9 +891,14 @@ def test_pg_expiry_while_before_process_waits_starts_no_popen(
     calls = []
     monkeypatch.setattr(ws.subprocess, "Popen", lambda *a, **k: calls.append(a))
     with pytest.raises(co.RegistryError, match="deadline"):
-        ws.validate_repository(repository)
+        ws.validate_repository(repository, deadline=deadline)
     assert calls == []
-    assert pg_rows(store)[0]["data"]["state"] == "unknown"
+    record = pg_rows(store)[0]["data"]
+    assert record["state"] == ("launching" if stage == "launch" else "unknown")
+    assert record["business_deadline_monotonic_ns"] == int(deadline * 1_000_000_000)
+    assert record["attempted_processes"] == 0 and record["processes"] == []
+    with store.connect() as connection:
+        assert co.fenced(connection)
 
 
 def test_pg_owner_expiry_after_gate_starts_no_popen(

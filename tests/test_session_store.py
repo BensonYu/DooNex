@@ -171,20 +171,33 @@ def test_partial_write_leaves_evidence_and_blocks_future_writes(tmp_path, monkey
         SessionFileStore(tmp_path)
 
 
-def test_lock_uses_remaining_deadline_and_keeps_inode(tmp_path):
-    store = SessionFileStore(tmp_path, deadline=time.monotonic() + 0.2)
+def test_lock_uses_remaining_deadline_and_keeps_inode(tmp_path, monkeypatch):
+    deadline = time.monotonic() + 3
+    store = SessionFileStore(tmp_path, deadline=deadline)
     store.write("events/.eventlog.lock", "")
     path = tmp_path / "events/.eventlog.lock"
     inode = path.stat().st_ino
     with path.open("r+") as held:
         fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        start = time.monotonic()
+        original = fcntl.flock
+        blocked = []
+
+        def observe(descriptor, operation):
+            try:
+                return original(descriptor, operation)
+            except BlockingIOError:
+                blocked.append(time.monotonic())
+                raise
+
+        monkeypatch.setattr(fcntl, "flock", observe)
         with (
             pytest.raises(SessionStorageError),
             store.lock("events/.eventlog.lock", timeout=30),
         ):
             pytest.fail("held lock admitted")
-        assert time.monotonic() - start < 1
+        assert blocked and blocked[0] < deadline
+        assert deadline <= time.monotonic() < deadline + 1
+        assert store.deadline == deadline
     assert path.stat().st_ino == inode
     store.close()
 
