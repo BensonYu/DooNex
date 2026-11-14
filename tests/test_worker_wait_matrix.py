@@ -37,6 +37,20 @@ tuning = tuning_fixture
 pytestmark = [pytest.mark.postgres, pytest.mark.docker]
 
 
+def bounded_file_gate(stage):
+    """A real container waits for submission to commit, with a finite fallback."""
+    return (
+        "from pathlib import Path\nimport time\n"
+        f"Path('/workspace/{stage}-entered').write_text('entered')\n"
+        f"release = Path('/workspace/release-{stage}')\n"
+        "limit = time.monotonic() + 30\n"
+        "while not release.exists() and time.monotonic() < limit:\n"
+        "    time.sleep(0.02)\n"
+        "assert release.exists(), 'Synthetic fixture gate expired'\n"
+        f"Path('/workspace/{stage}-finished').write_text('finished')\n"
+    )
+
+
 @pytest.mark.parametrize(
     "background_stage", ["model", "shell", "verifier", "preparation"]
 )
@@ -55,12 +69,9 @@ def test_actual_worker_wait_timeline(
     if background_stage == "verifier":
         source, _, _, checker, _ = taskset_source
         (checker / "verify.py").write_text(
-            "from pathlib import Path\nimport sys, time\n"
-            "Path('/workspace/verifier-entered').write_text('entered')\n"
-            "time.sleep(3)\n"
+            bounded_file_gate("verifier") + "import sys\n"
             "sys.path.insert(0, '/workspace')\nfrom main import answer\n"
             "assert answer == 42\n"
-            "Path('/workspace/verifier-finished').write_text('finished')\n"
         )
         taskset = background.library.import_taskset(source)
         background_body["taskset_id"] = taskset["id"]
@@ -177,33 +188,35 @@ def test_actual_worker_wait_timeline(
     original_reserve = Ledger.reserve
     original_settle = Ledger.settle
     original_intent = Ledger.tool_intent
-    original_finish_action = Store.finish_action
     original_sandbox = Sandbox.run
     original_digest = Workspace.execution_digest
     original_save = Scheduler.save_yield
     original_close = sdk._M1Conversation.close
     original_store_close = SessionFileStore.close
+    original_maintain = Scheduler.maintain
+    original_session = sdk.run_session
+    original_workspace_create = Workspace.create
 
     @contextmanager
     def locked(current_store, run_id, *args, **kwargs):
         with original_locked(current_store, run_id, *args, **kwargs) as value:
             connection, current = value
             prior_state = current["state"]
-            prior_checks = {
-                str(row["id"])
+            prior_actions = {
+                str(row["id"]): row
                 for row in connection.execute(
-                    "SELECT id FROM actions WHERE run_id=%s AND kind='verification'",
+                    "SELECT id,kind,status FROM actions WHERE run_id=%s",
                     (run_id,),
                 )
             }
             yield value
-            new_checks = {
-                str(row["id"])
+            latest_actions = {
+                str(row["id"]): row
                 for row in connection.execute(
-                    "SELECT id FROM actions WHERE run_id=%s AND kind='verification'",
+                    "SELECT id,kind,status FROM actions WHERE run_id=%s",
                     (run_id,),
                 )
-            } - prior_checks
+            }
         # The actual Store context has now exited and committed. An event
         # insert or Store.action return inside it is not a commit timestamp.
         if prior_state == "queued" and current["state"] == "running":
@@ -213,10 +226,24 @@ def test_actual_worker_wait_timeline(
                 run_id,
                 first_started_at=current["first_started_at"],
             )
-        for identifier in sorted(new_checks):
-            observe(
-                "verification_admission_commit_confirmed", run_id, action_id=identifier
-            )
+        for identifier, row in latest_actions.items():
+            if identifier not in prior_actions and row["kind"] == "verification":
+                observe(
+                    "verification_admission_commit_confirmed",
+                    run_id,
+                    action_id=identifier,
+                )
+            if row["status"] == "completed" and (
+                identifier not in prior_actions
+                or prior_actions[identifier]["status"] != "completed"
+            ):
+                observe(
+                    "action_settlement_commit_confirmed",
+                    run_id,
+                    action_id=identifier,
+                    action_kind=row["kind"],
+                    status=row["status"],
+                )
 
     def reserve(ledger, *args, **kwargs):
         value = original_reserve(ledger, *args, **kwargs)
@@ -240,21 +267,6 @@ def test_actual_worker_wait_timeline(
         observe("shell_admission_commit_confirmed", ledger.run_id, action_id=value)
         return value
 
-    def finish_action(current_store, action_id, *args, **kwargs):
-        value = original_finish_action(current_store, action_id, *args, **kwargs)
-        with current_store.connect() as connection:
-            action = connection.execute(
-                "SELECT run_id,kind,status FROM actions WHERE id=%s", (action_id,)
-            ).fetchone()
-        observe(
-            "action_settlement_commit_confirmed",
-            str(action["run_id"]),
-            action_id=action_id,
-            action_kind=action["kind"],
-            status=action["status"],
-        )
-        return value
-
     def sandbox_run(sandbox, path, command, timeout, run_id, *args, **kwargs):
         if run_id == background_id:
             stage = "verifier" if kwargs.get("verifier_path") else "shell"
@@ -273,7 +285,9 @@ def test_actual_worker_wait_timeline(
         return value
 
     def digest(path, **kwargs):
+        observe("workspace_digest_enter", active[0] if active else None)
         value = original_digest(path, **kwargs)
+        observe("workspace_digest_returned", active[0] if active else None)
         if (
             background_stage == "preparation"
             and path == workspace_path
@@ -286,6 +300,7 @@ def test_actual_worker_wait_timeline(
 
     def save(scheduler, run_id, *args, **kwargs):
         before = time.monotonic()
+        observe("yield_receipt_enter", run_id)
         value = original_save(scheduler, run_id, *args, **kwargs)
         saved = store.get(run_id)
         assert saved["state"] == "yielded"
@@ -298,9 +313,30 @@ def test_actual_worker_wait_timeline(
         return value
 
     def close(conversation, *args, **kwargs):
+        if active:
+            observe("sdk_close_enter", active[0])
         value = original_close(conversation, *args, **kwargs)
         if active:
             observe("sdk_close_returned", active[0])
+        return value
+
+    def maintain(scheduler, *args, **kwargs):
+        observe("maintenance_slice_enter")
+        value = original_maintain(scheduler, *args, **kwargs)
+        observe("maintenance_slice_returned")
+        return value
+
+    def session(**kwargs):
+        observe("sdk_session_enter", kwargs["run_id"], resume=kwargs.get("resume"))
+        value = original_session(**kwargs)
+        observe("sdk_session_returned", kwargs["run_id"])
+        return value
+
+    def create_workspace(*args, **kwargs):
+        identifier = active[0] if active else None
+        observe("git_export_copy_enter", identifier)
+        value = original_workspace_create(*args, **kwargs)
+        observe("git_export_copy_returned", identifier)
         return value
 
     def close_store(session_store, *args, **kwargs):
@@ -350,9 +386,13 @@ def test_actual_worker_wait_timeline(
             if background_stage == "model":
                 command = "touch must-not-run"
             if background_stage == "shell":
+                import shlex
+
                 command = (
-                    "printf entered > shell-entered; sleep 3; "
-                    "printf finished > shell-finished; " + command
+                    "python -c "
+                    + shlex.quote(bounded_file_gate("shell"))
+                    + "; "
+                    + command
                 )
             first = response("doonex_shell", {"command": command}, 0)
             if background_stage == "shell":
@@ -403,12 +443,14 @@ def test_actual_worker_wait_timeline(
     monkeypatch.setattr(Ledger, "reserve", reserve)
     monkeypatch.setattr(Ledger, "settle", settle)
     monkeypatch.setattr(Ledger, "tool_intent", intent)
-    monkeypatch.setattr(Store, "finish_action", finish_action)
     monkeypatch.setattr(Sandbox, "run", sandbox_run)
     monkeypatch.setattr(Workspace, "execution_digest", staticmethod(digest))
     monkeypatch.setattr(Scheduler, "save_yield", save)
     monkeypatch.setattr(sdk._M1Conversation, "close", close)
     monkeypatch.setattr(SessionFileStore, "close", close_store)
+    monkeypatch.setattr(Scheduler, "maintain", maintain)
+    monkeypatch.setattr(sdk, "run_session", session)
+    monkeypatch.setattr(Workspace, "create", staticmethod(create_workspace))
     monkeypatch.setattr(worker, "execute", execute)
     monkeypatch.setattr(sdk.GuardedLLM, "_transport_call", transport)
     thread = threading.Thread(target=run)
@@ -437,10 +479,18 @@ def test_actual_worker_wait_timeline(
         for item in foreground:
             assert store.get(item["id"])["request"].get("background") is None
             observe("enqueue_commit_confirmed", item["id"])
+        if background_stage in {"shell", "verifier"}:
+            path = container_workspaces[background_stage]
+            assert not (path / (background_stage + "-finished")).exists()
+            observe("real_inflight_after_enqueue_commit", background_id)
+            (path / ("release-" + background_stage)).write_text("committed")
         release.set()
         assert finished.wait(45), "Worker did not finish the selected foreground"
     finally:
         release.set()
+        for stage, path in container_workspaces.items():
+            if path.exists():
+                (path / ("release-" + stage)).write_text("fixture-finally")
         worker.stopping = True
         thread.join(timeout=20)
         print(
