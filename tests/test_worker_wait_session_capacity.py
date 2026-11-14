@@ -374,6 +374,136 @@ def _yielded(store):
     return value
 
 
+def _foreground_body(request_data, tmp_path, name):
+    source = tmp_path / name
+    source.mkdir()
+    repo, git = repository(source)
+    body = deepcopy(request_data)
+    body.update(
+        repo_path=str(repo),
+        base_commit=git("rev-parse", "HEAD"),
+        checks=["python -c 'assert True'"],
+    )
+    body["model"]["model_id"] = "gpt-4.1-mini"
+    return body
+
+
+def _cold_foreground_timeline(settings, store, paused, root, body, monkeypatch):
+    """Queue during actual cold restoration, then run the real dispatcher."""
+    entered, release, finished = (threading.Event() for _ in range(3))
+    errors, order, observations, foreground, admission = ([] for _ in range(5))
+    worker = Worker(settings)
+    original_init = SessionFileStore.__init__
+    original_execute = worker.execute
+    original_reserve = Ledger.reserve
+
+    def observe(kind, **details):
+        observations.append({"kind": kind, "monotonic": time.monotonic(), **details})
+
+    def initialize(current, current_root, *args, **kwargs):
+        is_background = Path(current_root) == root
+        if is_background:
+            assert not entered.is_set()
+            observe("cold_inventory_enter")
+            entered.set()
+            assert release.wait(20), "Foreground did not release cold restore gate"
+        value = original_init(current, current_root, *args, **kwargs)
+        if is_background:
+            observe("cold_full_inventory_returned")
+        return value
+
+    def reserve(ledger, *args, **kwargs):
+        assert foreground and ledger.run_id == foreground[0]["id"]
+        value = original_reserve(ledger, *args, **kwargs)
+        admission.append(time.monotonic())
+        observe("cold_foreground_model_admission_commit_confirmed")
+        return value
+
+    def transport(llm, *args, **kwargs):
+        assert Path(llm._session_store.root) != root, (
+            "Cold background dispatched a model after foreground enqueue"
+        )
+        return response("finish", {"message": "Synthetic cold foreground finish"}, 60)
+
+    def execute(identifier):
+        order.append(identifier)
+        try:
+            original_execute(identifier)
+            if identifier == paused["id"]:
+                current = store.get(identifier)
+                assert current["state"] == "yielded", current["reason"]
+                assert current["usage"] == paused["usage"]
+                assert current["first_started_at"] == paused["first_started_at"]
+                observe("cold_background_yield_commit_confirmed")
+            else:
+                assert foreground and identifier == foreground[0]["id"]
+                worker.stopping = True
+        except BaseException:
+            worker.stopping = True
+            raise
+
+    def run():
+        try:
+            worker.run()
+        except BaseException as error:  # noqa: BLE001 - keep actual thread failures
+            errors.append(error)
+        finally:
+            finished.set()
+
+    with monkeypatch.context() as cold:
+        cold.setattr(SessionFileStore, "__init__", initialize)
+        cold.setattr(Ledger, "reserve", reserve)
+        cold.setattr(sdk.GuardedLLM, "_transport_call", transport)
+        cold.setattr(worker, "execute", execute)
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            assert entered.wait(20), "Fresh Worker did not enter cold SessionFileStore"
+            before = time.monotonic()
+            foreground.append(store.create_run(body))
+            after = time.monotonic()
+            observe("cold_foreground_enqueue_commit_confirmed")
+            release.set()
+            assert finished.wait(60), "Cold capacity fixture did not finish foreground"
+        finally:
+            release.set()
+            worker.stopping = True
+            thread.join(timeout=20)
+            print(
+                "worker_capacity_cold_partial="
+                + json.dumps(
+                    {
+                        "thread_alive": thread.is_alive(),
+                        "error_types": [type(error).__name__ for error in errors],
+                        "observations": observations,
+                    }
+                )
+            )
+        assert not thread.is_alive() and not errors, errors
+    assert order == [paused["id"], foreground[0]["id"]]
+    assert store.get(foreground[0]["id"])["state"] == "completed_verified"
+    assert len(admission) == 1 and before <= after <= admission[0]
+    moments = {item["kind"]: item["monotonic"] for item in observations}
+    assert (
+        moments["cold_inventory_enter"]
+        <= before
+        <= after
+        <= moments["cold_full_inventory_returned"]
+        <= moments["cold_background_yield_commit_confirmed"]
+        <= admission[0]
+    )
+    return {
+        "foreground_id": foreground[0]["id"],
+        "enqueue_commit_bracket_monotonic": [before, after],
+        "first_model_admission_commit_confirmed_monotonic": admission[0],
+        "submit_to_first_admission_seconds": {
+            "lower": admission[0] - after,
+            "upper": admission[0] - before,
+        },
+        "observations": observations,
+    }
+
+
 @pytest.mark.parametrize("shape", ["small", "bytes"])
 def test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore(
     tuning,
@@ -460,6 +590,16 @@ def test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore(
     monkeypatch.setattr(sdk, "run_session", session)
     monkeypatch.setattr(sdk.GuardedLLM, "_transport_call", forbidden)
     with _watchdog():
+        cold_wait = _cold_foreground_timeline(
+            wide[0],
+            store,
+            paused,
+            root,
+            _foreground_body(request_data, tmp_path, "cold-foreground"),
+            monkeypatch,
+        )
+    assert _accounting(store, evaluation_id) == parent_before
+    with _watchdog():
         Worker(wide[0]).run(once=True)
     final = store.get(paused["id"])
     assert final["state"] == "completed_verified", final["reason"]
@@ -467,9 +607,13 @@ def test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore(
     assert final["request"] == paused["request"]
     assert final["usage"] == paused["usage"]
     assert _accounting(store, evaluation_id) == parent_before
-    assert sessions == [(paused["id"], True)]
-    assert closes == [paused["id"]]
-    assert receipts == [paused["scheduling"]["receipt"]]
+    assert sessions == [
+        (paused["id"], True),
+        (cold_wait["foreground_id"], False),
+        (paused["id"], True),
+    ]
+    assert closes == [paused["id"], cold_wait["foreground_id"], paused["id"]]
+    assert receipts == [paused["scheduling"]["receipt"]] * 3
     assert set(original_files.items()).issubset(set(reads))
     final_files = _files(root)
     assert all(final_files[name] == digest for name, digest in original_events.items())
@@ -495,6 +639,7 @@ def test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore(
                 "cold_all_original_files_read_and_hashed": True,
                 "cold_original_event_count": len(original_events),
                 "cold_final_directory_entries": final_entries,
+                "cold_foreground_wait": cold_wait,
                 "original_usage_and_parent_ledgers_preserved": True,
                 "additional_model_calls": 0,
                 "transport": "synthetic",
