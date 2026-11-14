@@ -74,7 +74,12 @@ open('/workspace/result.txt', 'w').write('isolated')
 def test_timeout_kills_and_removes_container(tmp_path, sandbox_context):
     sandbox = Sandbox()
     run_id = sandbox_context.run_id
-    result = sandbox.run(tmp_path, "sleep 30", 0.4, run_id, **sandbox_context.binding)
+    # The total allowance includes durable registration and Docker create.
+    # Reach the actual sleeping container before exercising execution timeout.
+    result = sandbox.run(
+        tmp_path, "printf started; sleep 30", 3, run_id, **sandbox_context.binding
+    )
+    assert result["container_id"] and result["output"] == "started"
     assert result["timed_out"]
     assert result["exit_code"] != 0
     assert not result["cleanup_error"]

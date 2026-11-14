@@ -388,7 +388,7 @@ class Scheduler:
             return False
         except BatchHalt:
             raise
-        except (ValueError, OSError, SandboxError) as error:
+        except (Halt, ValueError, OSError, SandboxError) as error:
             from doonex.cleanup import controller_cleanup_unknown, merge_cleanup
 
             probe_error = isinstance(error, SandboxError)

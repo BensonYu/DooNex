@@ -379,19 +379,23 @@ def test_export_deadline_includes_copy_and_preserves_local_limit(
     import doonex.workspace as module
 
     original = module.write_files
+    copy_entries = []
 
     def expire_before_copy(files, destination, *, deadline):
-        # Cross the existing allowance after real Git export, then let the
-        # actual copy admission enforce it before creating a destination.
+        # Reach real Git export first; the controller has its own earlier
+        # expiry tests. Cross this same allowance at the intended copy gate.
+        copy_entries.append((time.monotonic(), deadline))
+        assert copy_entries[-1][0] < deadline
         time.sleep(max(deadline - time.monotonic(), 0) + 0.01)
         return original(files, destination, deadline=deadline)
 
     monkeypatch.setattr(module, "write_files", expire_before_copy)
-    monkeypatch.setattr(module, "GIT_OPERATION_TIMEOUT", 0.2 if not outer else 30)
-    deadline = time.monotonic() + (0.2 if outer else 30)
+    monkeypatch.setattr(module, "GIT_OPERATION_TIMEOUT", 3 if not outer else 30)
+    deadline = time.monotonic() + (3 if outer else 30)
     expected = ExecutionDeadlineExceeded if outer else WorkspaceError
     with pytest.raises(expected):
         Workspace.create(repository, "HEAD", tmp_path / "task", deadline=deadline)
+    assert len(copy_entries) == 1
     assert not (tmp_path / "task").exists()
 
 

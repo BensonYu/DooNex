@@ -43,6 +43,12 @@ if operation == 'create':
             os.close(1)
             os.close(2)
             time.sleep(settings['late_create_delay'])
+            if settings.get('late_create_gate'):
+                until = time.monotonic() + 15
+                while not (root / 'late-create-release').exists():
+                    if time.monotonic() >= until:
+                        os._exit(2)
+                    time.sleep(0.01)
             state.write_text(name)
             os._exit(0)
     else:
@@ -202,11 +208,11 @@ def test_create_ack_loss_is_cleaned_by_preselected_name(fake_docker, tmp_path):
 
 @pytest.mark.postgres
 def test_late_daemon_create_cannot_be_cleared_by_current_empty_ps(
-    fake_docker, tmp_path
+    fake_docker, tmp_path, monkeypatch
 ):
     control, configure, context = fake_docker
-    sandbox = configure(create_delay=30, late_create_delay=0.7)
-    result = sandbox.run(tmp_path, "true", 0.35, context.run_id, **context.binding)
+    sandbox = configure(create_delay=30, late_create_delay=0.01, late_create_gate=True)
+    result = sandbox.run(tmp_path, "true", 3, context.run_id, **context.binding)
     evidence = result["cleanup_evidence"]
     assert result["timed_out"] and result["cleanup_unknown"]
     assert evidence["daemon_request_unknown"]
@@ -214,6 +220,10 @@ def test_late_daemon_create_cannot_be_cleared_by_current_empty_ps(
     assert evidence["container_absence_confirmed"] is False
     assert not evidence["local_process_unknown"]
     assert_reaped_and_eof(evidence)
+    assert (control / "daemon.pid").exists()
+    assert not (control / "container").exists()
+    # Materialize only after the real empty ps, independent of startup latency.
+    (control / "late-create-release").touch()
     wait_until = time.monotonic() + 1.5
     while not (control / "container").exists() and time.monotonic() < wait_until:
         time.sleep(0.02)
@@ -221,6 +231,8 @@ def test_late_daemon_create_cannot_be_cleared_by_current_empty_ps(
         "Synthetic daemon did not finish the late create"
     )
     original = context.records()[0]
+    # Repair has its own allowance; the original unknown record stays fenced.
+    monkeypatch.setattr(implementation, "CLEANUP_SECONDS", 3)
     with pytest.raises(co.RegistryError, match="fenced"):
         sandbox.stop_run(context.run_id, **context.binding)
     assert (
@@ -380,12 +392,14 @@ def test_exited_cli_with_inherited_pipe_is_not_completed(fake_docker, tmp_path):
 
 
 @pytest.mark.postgres
-def test_escaped_pipe_stays_unknown_despite_empty_container_list(fake_docker, tmp_path):
+def test_escaped_pipe_stays_unknown_despite_empty_container_list(
+    fake_docker, tmp_path, monkeypatch
+):
     control, configure, context = fake_docker
     sandbox = configure(pipe_child=True, escaped_child=True)
     entered = time.monotonic()
-    result = sandbox.run(tmp_path, "true", 0.45, context.run_id, **context.binding)
-    assert time.monotonic() - entered < 1.1
+    result = sandbox.run(tmp_path, "true", 3, context.run_id, **context.binding)
+    assert time.monotonic() - entered < 3 + 0.35 + 0.3
     assert result["timed_out"] and result["cleanup_unknown"]
     assert result["cleanup_error"]
     evidence = result["cleanup_evidence"]
@@ -398,6 +412,8 @@ def test_escaped_pipe_stays_unknown_despite_empty_container_list(fake_docker, tm
     # A later successful container-only reconciliation cannot repair this evidence.
     (control / "scenario.json").write_text(json.dumps({"ps_output": ""}))
     original = context.records()[0]
+    # Repair has its own allowance; the original unknown record stays fenced.
+    monkeypatch.setattr(implementation, "CLEANUP_SECONDS", 3)
     with pytest.raises(co.RegistryError, match="fenced"):
         sandbox.stop_run(context.run_id, **context.binding)
     assert (

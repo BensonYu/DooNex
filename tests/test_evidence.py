@@ -83,12 +83,15 @@ def test_failed_timeout_and_missing_checks_cannot_verify(workspace, tmp_path):
     timeout = Evidence.capture(
         workspace,
         tmp_path / "timeout",
-        ["sleep 30"],
+        ["printf started; sleep 30"],
         Sandbox(),
-        0.4,
+        3,
         workspace.operation_context["run_id"],
     )
     assert not timeout["verified"] and timeout["checks"][0]["timed_out"]
+    assert timeout["checks"][0]["container_id"]
+    assert (tmp_path / "timeout/evidence/check-1.log").read_text() == "started"
+    assert not timeout["checks"][0]["cleanup_unknown"]
     unchecked = Evidence.capture(
         workspace,
         tmp_path / "unchecked",

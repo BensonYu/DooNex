@@ -342,3 +342,30 @@ Git/yielded 容量源码 `f72735e`、`9c12044` 已分别整合为 `bcdf7bb`、`5
 全量前系统 Data 卷曾仅余 142 MiB，是环境容量阻塞。仅将四个已结束且有精确收据的 fixture 根目录逐文件复制、核对字节／模式／链接 manifest 后归档到私有 `/Volumes/T7/doonex-private-verification-20261114/fixture-archive/`，原路径保留符号链接；49,249 项、652,507,225 逻辑字节全部核对，未删除历史失败、生产数据或未知预留。归档收据 `ARCHIVE_RECEIPT.json` SHA256 `f6e5c666183429e9a1e96f985e72f44f5ada2f0b261607e9c6f372df9bd0b512`。之后实际系统盘可用 2.1 GiB、T7 734 GiB。最终整合将显式使用同一私有 T7 根的 `scratch` 作为 TMPDIR；这是测试存储条件，不是产品模型、预算或架构变更。
 
 独立专项时间线目前覆盖冻结的 43 种正常配置，均有实际准入 upper≤90 秒；最终观测尚未执行。下一步固定源码，依次运行 Ruff、前端构建及带原始 nodeid／时间线输出的完整 `scripts/test_local.py -s -vv`，再独立配对 43 份最终观测与专项。
+
+### 最终全量首轮：运行环境中断，原结果保留
+
+最终源码冻结为 `a375ed492e1420da361472b14f1efedfdb251210`；Ruff 与前端构建均 exit 0，全部非 Markdown 输入前后不变。`m4-closure-full-01` 在该源码执行完整 `scripts/test_local.py -s -vv`，未首错停止；结果为 **1927 passed / 14 failed / 667 errors / 1 skipped / exit 1**，pytest 676.40 秒、外层 680.374 秒，watchdog 未触发。日志 SHA256 `47ab482d21e80d400f7801e68f78115e0a38986057771a9506dfe6de57ed374e`；不能计作最终通过。
+
+完整错误分类与运行时日志定位到 UTC 2026-11-14 11:50（纽约 06:50）的 OrbStack 停止请求和 Docker 关闭。首个失败的原 SDK `ConversationErrorEvent` 记录 `terminating connection due to administrator command`；其 teardown 及其后 13 个失败、667 个错误均为同一临时 PG 的 shutdown／连接断开或拒绝。未推断停止请求来自谁；没有据此修改产品或测试。目标 Worker 等待矩阵未成功执行，不能把未执行场景视为通过。私有 `m4-closure-full-01-environment-audit.json` 保存脱敏逐类统计、原事件摘要、运行时停止日志和结束后空 Run/test 容器库存，SHA256 `0ed7a3d29d697d5dd1ba16355c8320955c41f33355dd5f5872b4e0b15f9b6718`。
+
+T7 区分大小写，原 `test_case_alias_cannot_hide_verifier_repository_overlap` 按已有前提跳过。环境恢复后，在系统盘以相同源码、原断言补验此项，并复验首个受中断影响的历史合成后台夹具：`m4-closure-environment-tail-01` **2 passed / 0 skipped / exit 0**，72.21 秒、外层 86.829 秒，输入不变、无 watchdog，日志 SHA256 `b850ba7e1e8aa87a66ef43000f719eb8c6c0319f0861bd1a8706d0d3f5871241`。这只是环境诊断与平台补验，不替代整轮回归。原失败、跳过和全部工件保留。
+
+随后确认 Run/test 容器库存为空，以同一 `a375ed4` 唯一启动 `m4-closure-full-02`，TMPDIR 仍为已记录的 T7 scratch，命令追加 `-rs` 显示跳过原因；没有修改源码、缩减正常配置或重放真实模型授权。最终结果待实际收据。
+
+### 最终全量第二轮：八项失败的完整链复核
+
+同一 `a375ed4` 的 `m4-closure-full-02` 已完成全部检查，**2599 passed / 8 failed / 1 skipped / exit 1**，pytest 4138.92 秒、外层 4152.802421 秒；176 个非 Markdown 源码输入未变，watchdog 未触发。日志 SHA256 `e37d06bb5a49026649759f50ba6f9c533a633542701a883dc66afa35a2ef3de6`。大小写平台跳过仍引用前述系统盘原断言补验。不能因正常等待场景通过就把整轮写为完成。
+
+随后仅重现八个失败节点，`m4-closure-failures-reproduce-01` **3 passed / 5 failed / exit 1**，pytest 17.23 秒、外层 31.214498 秒，输入不变、无 watchdog。私有只读 pytest observer 在 teardown 前记录实际 controller 行；日志 SHA256 `c945b2d0cf1fc99f6c47b19b2776fca028ae8e514a17826dcfe1dc7e9a3d0648`。按完整调用链分类如下，不统一归为测试问题：
+
+- **产品整合缺陷：恢复报告顺序。** recovery GET 先调用容器探测、后读取 helper fence，真实 registry 正确拒绝，接口却返回 409，原报告合同要求 200 与明确阻止原因。修复应在任何 Review/Git/文件扫描/Docker 操作前只读报告已有阻止，未核查字段不能伪装为空；POST 及 registry 的全局阻止保留。
+- **产品整合缺陷：Run 时钟停止传播。** `Worker.run → resume_yielded → validate_receipt → preflight → execution_bound` 的 Run 级 `Halt` 未被恢复路径接住，逸出主循环；没有观察到额外模型/工具派发，但状态仍未持久停止。最小修复将其接入已有 `interrupted / scheduling_resume_refused` 分支；批次级 `BatchHalt` 仍单独向外传播。须验证首次时钟、原用量、SDK 回执、动作及再次启动不重放。
+- **测试前提缺陷：真实容器 timeout 两项。** 0.4 秒总窗口包括持久登记、mount 与 Docker create；原始行证明 create 被 SIGKILL、未获 ACK，`daemon_unknown` 正确保留。原测试预期已启动 shell 后安全超时，实际未到该阶段。夹具改为入口一次性 3 秒，增加真实命令输出标记、container ID 和清理断言；不修改产品期限，不接受 unknown 为成功。
+- **测试注入/修复窗口缺陷：迟到 create 与逃逸管道。** full02 的迟到 create 初次未知检查已通过，后续仅 0.35 秒 repair 未完成；复现该项通过。escaped 样本 full02 在 start permit 前到期，复现虽启动 CLI，但在创建逃逸子进程前结束，真实 reap/EOF 完整。夹具须明确到达故障：迟到 daemon 在实际空 ps 后通过有限 release gate 才创建；escaped 保留真实子进程身份与非 EOF 断言。入口 3 秒一次性期限和后续独立 3 秒 repair 不刷新原操作，修复后原 unknown/fence 必须逐项保持。
+- **测试前提缺陷：Git copy local/outer 两项。** 0.2 秒窗口在 export 的 registry DB 复检已到期，原 `RegistryError(deadline)` 与 unknown 正是既有 `test_pg_expiry_while_before_process_waits_starts_no_popen` 合同；复现两项通过。保留生产拒绝类型，copy 夹具改为入口 3 秒并严格断言实际进入 copy 时尚未到期，再等待同一期限验证零目标目录。不能用接受任意异常替代 copy 覆盖。
+
+full02 遗留一个、八项复现遗留两个 Created 容器，均按实际 inspect、测试挂载路径、命令和原 controller 行确认唯一归属，保存后精确删除，未按标签批量清理。两份收据 `m4-closure-full-02-residual-recovery.json`、`m4-closure-failures-reproduce-01-resource-recovery.json` 的 SHA256 分别为 `fde20124c3a845bbf3de6a5d652d1801428f1fb74d975da48b0d93b7f01a2fed`、`08536245a165eada9a0061c61323c0f0964fcec62e6984c1fb6e0c2f95a0a774`；最终 Run/test 库存成功查询为空，原失败和未知记录没有删除或改为已解决。修改后的针对性与最终整合验收仍待，不能合并 main。
+
+
+上述父修复的 `m4-closure-fix-target-01` 已完成 **7 passed / exit 0**，pytest 37.97 秒、外层 52.241600 秒，176 个实际捕获输入前后不变、watchdog 未触发。日志 SHA256 `b036e99bcb9fcee5883b44f75ea3c29e8a68950d12b4fa2489d65fb2347b6857`。运行时 HEAD 仍为 `a375ed4`，含收据逐文件绑定的未提交 scheduling 与五份测试修改，不能写成干净旧 HEAD 通过；恢复 GET 不在这七项中。相关模块整合与最终全量仍待。

@@ -367,6 +367,8 @@ def test_no_automatic_resume_for_drift_missing_receipt_unknown_or_expired_clock(
                 current["assignments"]["executor"]["id"] = "changed-assignment"
             else:
                 store.action(run_id, "shell", {"command": "unknown effect"}, c)
+    dormant = store.get(run_id)
+    dormant_actions = action_rows(store, run_id)
     Worker(settings).run(once=True)
     after = store.get(run_id)
     assert after["state"] in {"interrupted", "cancelled", "budget_exceeded"}, after[
@@ -374,7 +376,26 @@ def test_no_automatic_resume_for_drift_missing_receipt_unknown_or_expired_clock(
     ]
     assert len(calls) == 1
     assert not (directory / "workspace" / "executed.txt").exists()
-    if tamper != "clock":
+    if tamper == "clock":
+        # Run-level clock refusal must persist without killing the scheduler.
+        # BatchHalt still follows the separate batch-stop path.
+        assert after["state"] == "interrupted"
+        assert "deadline_expired" in after["reason"]
+        assert after["first_started_at"] == dormant["first_started_at"]
+        assert after["usage"] == dormant["usage"]
+        assert after["assignments"] == dormant["assignments"]
+        assert after["scheduling"] == dormant["scheduling"]
+        assert action_rows(store, run_id) == dormant_actions
+        assert any(
+            event["kind"] == "scheduling_resume_refused"
+            for event in store.events(run_id)["events"]
+        )
+        Worker(settings).run(once=True)
+        assert len(calls) == 1
+        assert not (directory / "workspace" / "executed.txt").exists()
+        assert store.get(run_id)["first_started_at"] == dormant["first_started_at"]
+        assert store.get(run_id)["usage"] == dormant["usage"]
+    else:
         assert background.day(grant["date"])["reserved"]["calls"] == 20
 
 
