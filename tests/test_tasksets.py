@@ -4,8 +4,11 @@ import stat
 import subprocess
 from pathlib import Path
 
+import controller_test_support
 import pytest
 from doonex.tasksets import TaskSetError, TaskSetRegistry
+
+controller_registry = controller_test_support.controller_registry
 
 
 @pytest.fixture
@@ -70,7 +73,7 @@ def write_config(source, config):
 
 
 def test_import_freezes_git_objects_independent_verifiers_and_provenance(
-    taskset_source, registry
+    taskset_source, registry, controller_registry
 ):
     source, _, repository, checker, commit = taskset_source
     (repository / "main.py").write_text("dirty user contents\n")
@@ -79,6 +82,19 @@ def test_import_freezes_git_objects_independent_verifiers_and_provenance(
         ["git", "-C", str(repository), "status", "--porcelain"]
     )
     record = registry.import_local(source)
+    with controller_registry.store.connect() as connection:
+        operations = [
+            row["data"]
+            for row in connection.execute("SELECT data FROM controller_operations")
+        ]
+    assert operations
+    for operation in operations:
+        assert operation["actor"] == controller_registry.actor.data()
+        assert operation["state"] == "terminal"
+        assert operation["run_id"] is None
+        assert operation["parent_action_id"] is None
+        assert operation["expected_run_owner"] is None
+        assert operation["scope"]["repository_digest"] is not None
     assert record["minimum_pass_rate"] == 0.8
     assert record["visibility"] == "private"
     assert record["split"] == "heldout"
@@ -117,7 +133,7 @@ def test_import_freezes_git_objects_independent_verifiers_and_provenance(
 
 
 def test_reimport_ignores_path_aliases_timestamps_and_keeps_first_provenance(
-    taskset_source, registry
+    taskset_source, registry, controller_registry
 ):
     source, config, repository, checker, commit = taskset_source
     first = registry.import_local(source)
@@ -148,7 +164,9 @@ def test_reimport_ignores_path_aliases_timestamps_and_keeps_first_provenance(
         "directory",
     ],
 )
-def test_changes_create_new_taskset_versions(taskset_source, registry, change):
+def test_changes_create_new_taskset_versions(
+    taskset_source, registry, change, controller_registry
+):
     source, config, repository, checker, _ = taskset_source
     first = registry.import_local(source)
     if change == "prompt":
@@ -199,7 +217,7 @@ def test_changes_create_new_taskset_versions(taskset_source, registry, change):
     ],
 )
 def test_exact_context_and_report_changes_are_rejected(
-    taskset_source, registry, tmp_path, tamper
+    taskset_source, registry, tmp_path, tamper, controller_registry
 ):
     source, _, _, _, _ = taskset_source
     record = registry.import_local(source)
@@ -263,7 +281,7 @@ def test_exact_context_and_report_changes_are_rejected(
 
 
 def test_import_never_executes_git_hooks_source_or_verifier(
-    taskset_source, registry, tmp_path
+    taskset_source, registry, tmp_path, controller_registry
 ):
     source, config, repository, checker, _ = taskset_source
     marker = tmp_path / "must-not-exist"
@@ -301,7 +319,11 @@ def test_import_never_executes_git_hooks_source_or_verifier(
         "missing_prompt",
     ],
 )
-def test_input_contract_rejects_invalid_configuration(taskset_source, registry, case):
+def test_input_contract_rejects_invalid_configuration(
+    taskset_source, registry, case, request
+):
+    if case in {"duplicate", "bad_ref"}:
+        request.getfixturevalue("controller_registry")
     source, config, _, _, _ = taskset_source
     if case == "few":
         config["tasks"].pop()
@@ -352,8 +374,10 @@ def test_input_contract_rejects_invalid_configuration(taskset_source, registry, 
     ],
 )
 def test_paths_links_special_files_and_secret_inputs_are_rejected(
-    taskset_source, registry, tmp_path, case
+    taskset_source, registry, tmp_path, case, request
 ):
+    if case not in {"source_symlink", "config_symlink"}:
+        request.getfixturevalue("controller_registry")
     source, config, repository, checker, _ = taskset_source
     if case == "inside_repository":
         checker = repository / "checker"
@@ -399,10 +423,12 @@ def test_paths_links_special_files_and_secret_inputs_are_rejected(
     ],
 )
 def test_resource_bounds_fail_without_partial_publication(
-    taskset_source, registry, monkeypatch, limit
+    taskset_source, registry, monkeypatch, limit, request
 ):
     from doonex import tasksets
 
+    if limit != "MAX_CONFIG_BYTES":
+        request.getfixturevalue("controller_registry")
     source, _, _, _, _ = taskset_source
     monkeypatch.setattr(tasksets, limit, 1)
     with pytest.raises(TaskSetError):
@@ -411,7 +437,7 @@ def test_resource_bounds_fail_without_partial_publication(
 
 
 def test_report_binding_unknown_task_and_invalid_ids_fail_closed(
-    taskset_source, registry
+    taskset_source, registry, controller_registry
 ):
     source, _, _, _, _ = taskset_source
     record = registry.import_local(source)
@@ -424,7 +450,7 @@ def test_report_binding_unknown_task_and_invalid_ids_fail_closed(
 
 
 def test_explicit_git_project_in_managed_worktree_is_allowed(
-    taskset_source, registry, tmp_path, monkeypatch
+    taskset_source, registry, tmp_path, monkeypatch, controller_registry
 ):
     source, config, repository, _, _ = taskset_source
     fake_home = tmp_path / "user-home"
@@ -441,7 +467,7 @@ def test_explicit_git_project_in_managed_worktree_is_allowed(
 
 
 def test_codex_management_folder_is_not_a_verifier_source(
-    taskset_source, registry, tmp_path, monkeypatch
+    taskset_source, registry, tmp_path, monkeypatch, controller_registry
 ):
     source, config, _, checker, _ = taskset_source
     fake_home = tmp_path / "user-home"
@@ -455,7 +481,9 @@ def test_codex_management_folder_is_not_a_verifier_source(
         registry.import_local(source)
 
 
-def test_management_directory_inside_verifier_is_rejected(taskset_source, registry):
+def test_management_directory_inside_verifier_is_rejected(
+    taskset_source, registry, controller_registry
+):
     source, _, _, checker, _ = taskset_source
     (checker / ".codex").mkdir()
     (checker / ".codex/auth.json").write_text('{"synthetic": "private-fixture"}')
@@ -463,11 +491,14 @@ def test_management_directory_inside_verifier_is_rejected(taskset_source, regist
         registry.import_local(source)
 
 
-def test_case_alias_cannot_hide_verifier_repository_overlap(taskset_source, registry):
+def test_case_alias_cannot_hide_verifier_repository_overlap(
+    taskset_source, registry, request
+):
     source, config, repository, _, _ = taskset_source
     alias = repository.with_name(repository.name.upper())
     if not alias.exists() or not alias.samefile(repository):
         pytest.skip("Filesystem is case-sensitive")
+    request.getfixturevalue("controller_registry")
     nested = repository / "hidden-checker"
     nested.mkdir()
     (nested / "verify.py").write_text("pass")
