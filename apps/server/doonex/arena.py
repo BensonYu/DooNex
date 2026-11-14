@@ -19,7 +19,7 @@ from doonex.library import Library
 from doonex.model_registry import ModelRegistry
 from doonex.models import Budget, StrictModel
 from doonex.sandbox import TASK_IMAGE
-from doonex.store import dispatch_lock, now
+from doonex.store import RUN_STATES, dispatch_lock, now
 from doonex.workspace import _json_digest
 
 TERMINAL_RUNS = {
@@ -30,6 +30,13 @@ TERMINAL_RUNS = {
     "budget_exceeded",
 }
 ACTIVE_BATCHES = {"queued", "running", "cancelling"}
+BATCH_STATES = ACTIVE_BATCHES | {
+    "complete",
+    "cancelled",
+    "failed",
+    "interrupted",
+    "budget_exceeded",
+}
 MAX_PLANNED_ATTEMPTS = 400  # 10 tasks, baseline + 3 Skills, 10 repeats.
 MAX_CONTROLLER_BYTES = 4 * 1024 * 1024
 
@@ -78,6 +85,7 @@ def environment(*, deadline: float | None = None):
                 "cleanup.py",
                 "controller_operations.py",
                 "deadline.py",
+                "execution_clock.py",
                 "evidence.py",
                 "arena.py",
                 "arena_metrics.py",
@@ -134,6 +142,47 @@ def _uuid(identifier):
     return str(UUID(identifier))
 
 
+def _evaluation_data(row, *, states=None):
+    value = row["data"]
+    if (
+        not isinstance(value, dict)
+        or value.get("id") != str(row["id"])
+        or value.get("state") != row["state"]
+        or row["state"] not in BATCH_STATES
+        or (states is not None and row["state"] not in states)
+    ):
+        raise ValueError("评测标识或状态绑定无效")
+    return value
+
+
+def _planned_run_ids(value, *, deadline=None):
+    check_deadline(deadline)
+    attempts = value.get("attempts") if isinstance(value, dict) else None
+    if not isinstance(attempts, list) or not 1 <= len(attempts) <= MAX_PLANNED_ATTEMPTS:
+        raise ValueError("评测子运行计划数量无效")
+    run_ids = []
+    for attempt in attempts:
+        check_deadline(deadline)
+        try:
+            run_ids.append(_uuid(attempt["run_id"]))
+        except (KeyError, TypeError, AttributeError, ValueError):
+            raise ValueError("评测子运行计划标识无效") from None
+    if len(set(run_ids)) != len(run_ids):
+        raise ValueError("评测子运行计划包含重复运行")
+    check_deadline(deadline)
+    return run_ids
+
+
+def _child_binding(row, identifier):
+    if (
+        row["run_id"] != str(row["id"])
+        or row["run_state"] != row["state"]
+        or row["state"] not in RUN_STATES
+        or row["evaluation_id"] != identifier
+    ):
+        raise ValueError("评测子运行归属或状态绑定无效")
+
+
 def seconds(start, end):
     if not start or not end:
         return None
@@ -163,18 +212,14 @@ class Arena:
             raise KeyError("找不到评测")
         return row["data"]
 
-    def list(self, *, states=None):
+    def list(self, *, states=None, capacity=None, deadline=None):
+        check_deadline(deadline)
+        if capacity is not None and (type(capacity) is not int or capacity < 1):
+            raise ValueError("评测集合容量必须为正整数或 None")
         condition = ""
         if states is not None:
-            allowed = ACTIVE_BATCHES | {
-                "complete",
-                "cancelled",
-                "failed",
-                "interrupted",
-                "budget_exceeded",
-            }
             if not isinstance(states, (list, tuple, set, frozenset)) or any(
-                type(state) is not str or state not in allowed for state in states
+                type(state) is not str or state not in BATCH_STATES for state in states
             ):
                 raise ValueError("评测状态筛选无效")
             if not states:
@@ -187,31 +232,49 @@ class Arena:
                 + ")"
             )
         with self.store.connect() as c:
-            return [
-                r["data"]
-                for r in c.execute(
-                    "SELECT data FROM arena_evaluations"
-                    + condition
-                    + " ORDER BY data->>'created_at' DESC,id"
-                )
-            ]
+            check_deadline(deadline)
+            query = (
+                "SELECT id,state,data FROM arena_evaluations"
+                + condition
+                + " ORDER BY data->>'created_at' DESC,id"
+            )
+            parameters = ()
+            if capacity is not None:
+                query += " LIMIT %s"
+                parameters = (capacity + 1,)
+            cursor = c.execute(query, parameters)
+            check_deadline(deadline)
+            values = []
+            for row in cursor:
+                check_deadline(deadline)
+                values.append(_evaluation_data(row, states=states))
+                if capacity is not None and len(values) > capacity:
+                    raise ValueError("评测集合超过维护容量；拒绝不完整清点")
+            check_deadline(deadline)
+        check_deadline(deadline)
+        return values
 
     @contextmanager
-    def locked(self, identifier):
+    def locked(self, identifier, *, deadline=None):
+        check_deadline(deadline)
         with self.store.connect() as c:
+            check_deadline(deadline)
             row = c.execute(
-                "SELECT data FROM arena_evaluations WHERE id=%s FOR UPDATE",
+                "SELECT id,state,data FROM arena_evaluations WHERE id=%s FOR UPDATE",
                 (_uuid(identifier),),
             ).fetchone()
+            check_deadline(deadline)
             if not row:
                 raise KeyError("找不到评测")
-            value = row["data"]
+            value = _evaluation_data(row)
             yield c, value
+            check_deadline(deadline)
             value["updated_at"] = now()
             c.execute(
                 "UPDATE arena_evaluations SET state=%s,data=%s WHERE id=%s",
                 (value["state"], Jsonb(value), value["id"]),
             )
+            check_deadline(deadline)
 
     def prepare(self, body, *, deadline: float | None = None):
         check_deadline(deadline)
@@ -440,10 +503,15 @@ class Arena:
         value = self.get(identifier, deadline=deadline)
         integrity = self.integrity(value, deadline=deadline)
         if not integrity["valid"]:
-            self.stop(identifier, "interrupted", "; ".join(integrity["errors"]))
+            self.stop(
+                identifier,
+                "interrupted",
+                "; ".join(integrity["errors"]),
+                deadline=deadline,
+            )
             return False
         check_deadline(deadline)
-        with self.locked(identifier) as (_, value):
+        with self.locked(identifier, deadline=deadline) as (_, value):
             check_deadline(deadline)
             if value["state"] not in {"queued", "running"}:
                 return False
@@ -460,17 +528,34 @@ class Arena:
             or elapsed(value) >= value["batch_budget"]["max_seconds"]
         )
 
-    def stop(self, identifier, state, reason):
+    def stop(self, identifier, state, reason, *, deadline=None):
+        check_deadline(deadline)
+        identifier = _uuid(identifier)
         # Never acquire child Run locks while retaining the parent row lock:
         # request reservations consistently lock Run -> parent.
-        with self.locked(identifier) as (_, value):
+        with self.locked(identifier, deadline=deadline) as (_, value):
             if value["state"] in {"complete", "cancelled", "budget_exceeded"}:
                 return
+            run_ids = _planned_run_ids(value, deadline=deadline)
             value["state"], value["reason"] = state, reason
-            children = list(value["attempts"])
+        check_deadline(deadline)
         if state in {"cancelling", "budget_exceeded"}:
-            for attempt in children:
-                with self.store.locked(attempt["run_id"]) as (c, run):
+            for run_id in run_ids:
+                check_deadline(deadline)
+                with self.store.connect() as c:
+                    check_deadline(deadline)
+                    row = c.execute(
+                        "SELECT id,state,data,data->>'id' AS run_id,"
+                        "data->>'state' AS run_state,"
+                        "data->'request'->'arena'->>'evaluation_id' AS evaluation_id "
+                        "FROM runs WHERE id=%s FOR UPDATE",
+                        (run_id,),
+                    ).fetchone()
+                    check_deadline(deadline)
+                    if not row:
+                        raise ValueError("评测子运行计划存在缺失运行")
+                    _child_binding(row, identifier)
+                    run = row["data"]
                     if run["state"] in {"queued", "yielded"}:
                         run.update(
                             state="cancelled",
@@ -483,28 +568,28 @@ class Arena:
                             },
                         )
                         self.store.event(run["id"], "cancelled", {"reason": reason}, c)
+                        check_deadline(deadline)
                     elif run["state"] in {"running", "verifying", "pausing"}:
                         run["requested_action"] = (
                             "cancel" if state == "cancelling" else "batch_stop"
                         )
-        self.sync(identifier)
+                    check_deadline(deadline)
+                    run["updated_at"] = now()
+                    c.execute(
+                        "UPDATE runs SET state=%s,data=%s WHERE id=%s",
+                        (run["state"], Jsonb(run), run_id),
+                    )
+                    check_deadline(deadline)
+                check_deadline(deadline)
+        self.sync(identifier, deadline=deadline)
 
-    def sync(self, identifier):
+    def sync(self, identifier, *, deadline=None):
+        check_deadline(deadline)
         identifier = _uuid(identifier)
-        value = self.get(identifier)
-        attempts = value.get("attempts")
-        if (
-            not isinstance(attempts, list)
-            or not 1 <= len(attempts) <= MAX_PLANNED_ATTEMPTS
-        ):
-            raise ValueError("评测子运行计划数量无效")
-        try:
-            run_ids = [_uuid(attempt["run_id"]) for attempt in attempts]
-        except (KeyError, TypeError, AttributeError, ValueError):
-            raise ValueError("评测子运行计划标识无效") from None
-        if len(set(run_ids)) != len(run_ids):
-            raise ValueError("评测子运行计划包含重复运行")
-        with self.locked(identifier) as (c, current):
+        value = self.get(identifier, deadline=deadline)
+        run_ids = _planned_run_ids(value, deadline=deadline)
+        attempts = value["attempts"]
+        with self.locked(identifier, deadline=deadline) as (c, current):
             if current.get("attempts") != attempts or current.get("id") != identifier:
                 raise ValueError("评测子运行计划已变化")
             # Read only this finite frozen plan in one statement. Do not acquire
@@ -515,17 +600,14 @@ class Arena:
                 "FROM runs WHERE id=ANY(%s::uuid[])",
                 (run_ids,),
             ).fetchall()
+            check_deadline(deadline)
             if {str(row["id"]) for row in rows} != set(run_ids) or len(rows) != len(
                 run_ids
             ):
                 raise ValueError("评测子运行计划存在缺失运行")
-            if any(
-                row["run_id"] != str(row["id"])
-                or row["run_state"] != row["state"]
-                or row["evaluation_id"] != identifier
-                for row in rows
-            ):
-                raise ValueError("评测子运行归属或状态绑定无效")
+            for row in rows:
+                check_deadline(deadline)
+                _child_binding(row, identifier)
             states = {row["state"] for row in rows}
             if current["state"] == "cancelling":
                 if states <= TERMINAL_RUNS | {"paused", "interrupted"}:
@@ -543,6 +625,7 @@ class Arena:
                         state="complete",
                         reason="计划尝试已结束；质量与推荐以实际指标为准",
                     )
+            check_deadline(deadline)
 
     def resume(self, identifier, acknowledge_unknown):
         from doonex.cleanup import (
