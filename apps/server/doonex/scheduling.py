@@ -103,11 +103,15 @@ class Scheduler:
         if waiting:
             raise SchedulerYield("前台任务等待；已停止新后台派发")
 
-    def should_yield(self, run_id):
+    def should_yield(self, run_id, *, deadline: float | None = None):
         # This is an advisory early yield. Actual admission uses the same
         # transaction lock as foreground enqueue in Ledger/pre-verification.
+        check_deadline(deadline)
         with self.store.connect() as c:
-            return foreground_waiting(c)
+            check_deadline(deadline)
+            waiting = foreground_waiting(c)
+            check_deadline(deadline)
+            return waiting
 
     def save_yield(self, run_id, owner, receipt, workspace, *, deadline=None):
         from doonex.sandbox import Sandbox
@@ -165,11 +169,13 @@ class Scheduler:
 
         check_deadline(deadline)
         workspace_digest = Workspace.execution_digest(workspace.path, deadline=deadline)
+        check_deadline(deadline)
         with self.store.locked(run_id, dispatch=True) as (c, run):
             check_deadline(deadline)
             # Resume authorization itself does not dispatch. A foreground task
             # arriving now is handled by the next atomic model/tool admission.
-            self.preflight(c, run, yield_foreground=False)
+            self.preflight(c, run, yield_foreground=False, deadline=deadline)
+            check_deadline(deadline)
             saved = run.get("scheduling") or {}
             if (
                 saved.get("receipt") != receipt
@@ -179,14 +185,17 @@ class Scheduler:
                 return False
             if run["usage"]["reserved_tokens"] or run["usage"]["unknown_calls"]:
                 return False
-            return not c.execute(
+            pending = c.execute(
                 "SELECT 1 FROM actions WHERE run_id=%s AND status IN ('pending','unknown') LIMIT 1",
                 (run_id,),
             ).fetchone()
+            check_deadline(deadline)
+            return not pending
 
-    def resume_yielded(self, run, workspace):
+    def resume_yielded(self, run, workspace, *, deadline: float | None = None):
         from doonex.sandbox import Sandbox, SandboxError
 
+        check_deadline(deadline)
         if cleanup_intent_unresolved(run):
             self.cleanup_blocked = True
             return False
@@ -196,25 +205,47 @@ class Scheduler:
         # Unknown containers block resume; no cleanup or side effects are
         # assumed merely because the durable state says yielded.
         try:
-            if Sandbox().containers(run["id"], **sandbox_context(run)):
+            if Sandbox().containers(
+                run["id"], deadline=deadline, **sandbox_context(run)
+            ):
                 self.cleanup_blocked = True
                 raise ValueError("后台仍有容器，不能自动续接")
-            if self.should_yield(run["id"]):
+            check_deadline(deadline)
+            waiting = self.should_yield(run["id"], deadline=deadline)
+            check_deadline(deadline)
+            if waiting:
                 return False
             saved = run.get("scheduling") or {}
-            if saved.get("workspace_digest") != Workspace.execution_digest(
-                workspace.path
-            ):
+            workspace_digest = Workspace.execution_digest(
+                workspace.path, deadline=deadline
+            )
+            check_deadline(deadline)
+            waiting = self.should_yield(run["id"], deadline=deadline)
+            check_deadline(deadline)
+            if waiting:
+                return False
+            if saved.get("workspace_digest") != workspace_digest:
                 raise ValueError("后台检查点已变化，须人工核查")
             if run.get("phase") != "verification" and not saved.get("receipt"):
                 raise ValueError("缺少 SDK 调度回执，不能自动续接")
-            if not self.validate_receipt(run["id"], saved.get("receipt"), workspace):
+            valid = self.validate_receipt(
+                run["id"], saved.get("receipt"), workspace, deadline=deadline
+            )
+            check_deadline(deadline)
+            waiting = self.should_yield(run["id"], deadline=deadline)
+            check_deadline(deadline)
+            if waiting:
+                return False
+            if not valid:
                 raise ValueError("后台自动续接证明无效")
             with self.store.locked(run["id"], dispatch=True) as (c, current):
                 from doonex.budget import _locked_batch
 
+                check_deadline(deadline)
                 _locked_batch(c, current, dispatch=True)
-                self.preflight(c, current)
+                check_deadline(deadline)
+                self.preflight(c, current, deadline=deadline)
+                check_deadline(deadline)
                 if current["state"] != "yielded" or current.get("scheduling") != saved:
                     return False
                 if saved.get("ledger") != ledger_checkpoint(current):
@@ -224,31 +255,44 @@ class Scheduler:
                         "原后台运行时长已达上限",
                         current["request"]["arena"]["evaluation_id"],
                     )
+                check_deadline(deadline)
                 current.update(state="queued", reason="调度条件恢复，沿用会话与原预算")
                 self.store.event(run["id"], "scheduling_resumed", {}, c)
+                check_deadline(deadline)
             return True
         except SchedulerYield:
             return False
         except BatchHalt:
             raise
         except (ValueError, OSError, SandboxError) as error:
-            if isinstance(error, SandboxError):
+            from doonex.cleanup import controller_cleanup_unknown, merge_cleanup
+
+            probe_error = isinstance(error, SandboxError)
+            observed = merge_cleanup({}, error=error)
+            if probe_error or controller_cleanup_unknown(observed):
                 self.cleanup_blocked = True
             with self.store.locked(run["id"]) as (c, current):
+                # A concurrent cancel cannot discard this probe's uncertainty.
+                previous = current.get("recovery")
+                recovery = deepcopy(previous or {})
+                if probe_error:
+                    for key, item in (
+                        ("remaining", "unknown"),
+                        ("errors", type(error).__name__),
+                    ):
+                        if item not in recovery.setdefault(key, []):
+                            recovery[key].append(item)
+                    recovery.setdefault("stopped", [])
+                recovery = merge_cleanup(
+                    recovery,
+                    previous=previous,
+                    error=error,
+                )
+                if probe_error or controller_cleanup_unknown(recovery):
+                    self.cleanup_blocked = True
+                    current["recovery"] = recovery
                 if current["state"] != "yielded":
                     return False
-                if isinstance(error, SandboxError):
-                    from doonex.cleanup import merge_cleanup
-
-                    current["recovery"] = merge_cleanup(
-                        {
-                            "remaining": ["unknown"],
-                            "stopped": [],
-                            "errors": [type(error).__name__],
-                        },
-                        previous=current.get("recovery"),
-                        error=error,
-                    )
                 current.update(state="interrupted", reason=str(error))
                 self.store.event(
                     run["id"], "scheduling_resume_refused", {"reason": str(error)}, c
