@@ -10,7 +10,7 @@ from doonex.workspace import Workspace
 from test_m3_pipeline import prepare
 from test_worker import response
 
-pytestmark = pytest.mark.docker
+pytestmark = [pytest.mark.docker, pytest.mark.postgres]
 
 
 @pytest.fixture
@@ -19,8 +19,8 @@ def evaluation(settings, store, tmp_path):
         update={"model_id": "gpt-4.1-mini", "max_input_tokens": 16384}
     )
     settings = Settings(settings.home, settings.database_url, settings.token, model)
-    arena, batch, _ = prepare(settings, store, tmp_path)
-    return settings, arena, batch, batch["attempts"][0]["run_id"]
+    with prepare(settings, store, tmp_path) as (arena, batch, _):
+        yield settings, arena, batch, batch["attempts"][0]["run_id"]
 
 
 def interrupt_model(monkeypatch):
@@ -299,9 +299,10 @@ def test_observed_check_failure_survives_interruption_and_later_assistance(
     assert before["evidence"]["checks"][0]["timed_out"] == (failure_kind == "timeout")
     if failure_kind == "timeout":
         check_log = before["evidence"]["checks"][0]["log"]
-        assert "verifier-entered" in (
-            run_directory(settings, run_id) / "evidence" / check_log
-        ).read_text()
+        assert (
+            "verifier-entered"
+            in (run_directory(settings, run_id) / "evidence" / check_log).read_text()
+        )
     assert before["assignments"]["executor"]["state"] == "completed"
     monkeypatch.setattr(Evidence, "inspect", original_inspect)
     monkeypatch.setattr(Sandbox, "run", original_run)
