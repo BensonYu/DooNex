@@ -76,6 +76,7 @@ def environment(*, deadline: float | None = None):
                 "worker.py",
                 "budget.py",
                 "cleanup.py",
+                "controller_operations.py",
                 "deadline.py",
                 "evidence.py",
                 "arena.py",
@@ -544,13 +545,17 @@ class Arena:
                     )
 
     def resume(self, identifier, acknowledge_unknown):
-        from doonex.cleanup import controller_cleanup_unknown
-        from doonex.responses_registry import helper_fenced
+        from doonex.cleanup import (
+            cleanup_intent_unresolved,
+            controller_cleanup_unknown,
+            sandbox_context,
+        )
         from doonex.sandbox import Sandbox, SandboxError
+        from doonex.store import execution_fenced
         from doonex.worker import get_workspace, record_probe_failure, run_directory
 
         with self.store.connect() as connection:
-            if helper_fenced(connection):
+            if execution_fenced(connection):
                 raise ValueError("模型传输进程尚未完成独立核查；禁止恢复批次")
         value = self.get(identifier)
         if value["state"] != "interrupted" or not acknowledge_unknown:
@@ -564,13 +569,15 @@ class Arena:
         assistance = {}
         for run in children:
             if run["state"] in {"paused", "interrupted"}:
+                if cleanup_intent_unresolved(run):
+                    raise ValueError("子运行清理意图尚未核实；禁止恢复批次")
                 if controller_cleanup_unknown(run.get("recovery")):
                     raise ValueError(
                         "控制进程或 Docker 请求尚未完成独立核查；禁止恢复批次"
                     )
                 directory = run_directory(self.settings, run["id"])
                 try:
-                    containers = Sandbox().containers(run["id"])
+                    containers = Sandbox().containers(run["id"], **sandbox_context(run))
                 except SandboxError as error:
                     record_probe_failure(self.store, run["id"], error)
                     raise ValueError("无法核查子运行容器，禁止恢复批次") from error
@@ -602,7 +609,9 @@ class Arena:
             with self.store.locked(run["id"], dispatch=True) as (c, current):
                 if current["state"] not in {"paused", "interrupted"}:
                     raise ValueError("子运行状态已变化，请重新核查")
-                if helper_fenced(c):
+                if cleanup_intent_unresolved(current):
+                    raise ValueError("子运行清理意图尚未核实；禁止恢复批次")
+                if execution_fenced(c):
                     raise ValueError("模型传输进程尚未完成独立核查；禁止恢复批次")
                 if controller_cleanup_unknown(current.get("recovery")):
                     raise ValueError(

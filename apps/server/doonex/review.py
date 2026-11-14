@@ -132,7 +132,12 @@ class Review:
         context = root / "context"
         before = workspace.base_files(deadline=deadline)
         after = read_files(workspace.path, deadline=deadline)
-        patch = build_patch(before, after, deadline=deadline)
+        patch = build_patch(
+            before,
+            after,
+            deadline=deadline,
+            operation_context=workspace.operation_context,
+        )
         if len(patch) > MAX_PATCH_BYTES:
             raise ReviewError("Review patch exceeds the bounded context size")
         handoff = {

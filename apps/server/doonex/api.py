@@ -11,7 +11,16 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from doonex.budget import elapsed
+from doonex.cleanup import (
+    begin_cleanup_intent,
+    cleanup_intent_matches,
+    cleanup_intent_unresolved,
+    finish_cleanup_intent,
+    merge_cleanup,
+    sandbox_context,
+)
 from doonex.config import Settings, redact
+from doonex.controller_operations import RegistryError
 from doonex.models import Budget, ModelProfileInput, ProjectInput, ResumeInput, RunInput
 from doonex.store import Store, now
 from doonex.worker import get_workspace, run_directory
@@ -70,7 +79,22 @@ def create_app(settings=None):
             "http://localhost:5173",
         }:
             return JSONResponse({"detail": "来源未获授权"}, status_code=403)
-        response = await call_next(request)
+        from doonex.controller_operations import (
+            ControllerRegistry,
+            bind_registry,
+            fresh_actor,
+        )
+        from doonex.store import external_execution_fenced
+
+        actor = fresh_actor("api")
+        controller = ControllerRegistry(
+            store,
+            actor=actor,
+            check_owner=actor.check_live,
+            check_other_fences=external_execution_fenced,
+        )
+        with bind_registry(controller):
+            response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
@@ -117,6 +141,16 @@ def create_app(settings=None):
                 )
             },
             status_code=400,
+        )
+
+    @app.exception_handler(RegistryError)
+    async def controller_unavailable(request, exc):
+        return JSONResponse(
+            {
+                "detail": "本机控制操作尚未完成核查；请核对记录后继续",
+                "controller_operation_id": exc.operation_id,
+            },
+            status_code=409,
         )
 
     @app.exception_handler(KeyError)
@@ -406,8 +440,15 @@ def create_app(settings=None):
         return store.events(run["id"], max(0, after))
 
     def control(run_id, action):
-        run = load_run(run_id)
-        with store.locked(run["id"]) as (c, current):
+        from doonex.controller_operations import current_registry
+        from doonex.sandbox import Sandbox
+        from doonex.worker import stop_containers
+
+        # Authentication already checked the project. Stop must not depend on
+        # Review/Evidence inspections that can themselves require blocked Git.
+        run = store.get(identifier(run_id))
+        intent = None
+        with store.locked(run["id"], dispatch=True) as (c, current):
             if current["state"] not in {
                 "queued",
                 "running",
@@ -418,44 +459,88 @@ def create_app(settings=None):
                 "yielded",
             }:
                 raise ValueError("该运行已经结束")
+            action = "cancel" if current.get("requested_action") == "cancel" else action
+            current["requested_action"] = action
             immediate = current["state"] in {
                 "queued",
                 "paused",
                 "interrupted",
                 "yielded",
             }
-            if immediate and current["first_started_at"]:
-                from doonex.sandbox import Sandbox
-                from doonex.worker import stop_containers
-
-                cleanup = stop_containers(
-                    Sandbox(), run["id"], previous=current.get("recovery")
+            existing = current.get("cleanup_intent")
+            if type(existing) is dict and existing.get("state") == "pending":
+                # A duplicate request only updates cancel precedence. The owner
+                # of the original intent is the only process doing cleanup.
+                current.update(
+                    state="pausing", reason="停止请求已保存；原清理意图仍在处理中"
                 )
-                current["recovery"] = cleanup
-                store.mark_pending_unknown(run["id"], c, current)
-                if cleanup["remaining"] or cleanup["errors"]:
+            elif cleanup_intent_unresolved(current):
+                current.update(
+                    state="interrupted" if immediate else "pausing",
+                    reason="原清理意图未核实；停止请求已保存，不能重放清理",
+                )
+            elif immediate and current["first_started_at"]:
+                if (
+                    type(existing) is dict
+                    and existing.get("state") == "complete"
+                    and current["state"] == "paused"
+                    and action == "pause"
+                ):
+                    current["reason"] = "已暂停，保留工作区与会话"
+                else:
                     current.update(
-                        state="interrupted",
-                        requested_action=action,
-                        reason="无法确认任务容器已终止；保留中断状态",
+                        state="pausing", reason="已记录停止请求；等待容器清理"
                     )
-                    store.event(run["id"], "termination_unknown", cleanup, c)
-                    return current
-            current.update(
-                state=("cancelled" if action == "cancel" else "paused")
-                if immediate
-                else "pausing",
-                requested_action=action,
-                reason="已记录停止请求；等待在途动作终止"
-                if not immediate
-                else "已停止",
-            )
+                    store.mark_pending_unknown(run["id"], c, current)
+                    intent = begin_cleanup_intent(
+                        current, source="api", actor=current_registry().actor
+                    )
+                    previous = current.get("recovery")
+                    context = sandbox_context(current)
+            else:
+                current.update(
+                    state=("cancelled" if action == "cancel" else "paused")
+                    if immediate
+                    else "pausing",
+                    reason="已停止"
+                    if immediate
+                    else "已记录停止请求；等待在途动作终止",
+                )
             store.event(
                 run["id"],
                 "control_requested",
-                {"action": action, "in_flight": not immediate},
+                {
+                    "action": action,
+                    "in_flight": not immediate,
+                    "cleanup_intent": intent,
+                },
                 c,
             )
+        if intent is not None:
+            cleanup = stop_containers(
+                Sandbox(), run["id"], context=context, previous=previous
+            )
+            with store.locked(run["id"]) as (c, current):
+                if not cleanup_intent_matches(current, intent):
+                    return current
+                cleanup = merge_cleanup(cleanup, previous=current.get("recovery"))
+                finish_cleanup_intent(current, intent, cleanup)
+                current["recovery"] = cleanup
+                store.mark_pending_unknown(run["id"], c, current)
+                if cleanup.get("remaining") or cleanup.get("errors"):
+                    current.update(
+                        state="interrupted",
+                        reason="无法确认任务容器已终止；保留中断状态",
+                    )
+                    store.event(run["id"], "termination_unknown", cleanup, c)
+                else:
+                    current.update(
+                        state="cancelled"
+                        if current.get("requested_action") == "cancel"
+                        else "paused",
+                        reason="已停止",
+                    )
+                store.event(run["id"], "cleanup", cleanup, c)
         return store.get(run["id"])
 
     @app.post("/api/runs/{run_id}/pause", dependencies=auth)
@@ -477,7 +562,9 @@ def create_app(settings=None):
             controller_process_unknown,
         )
 
-        controller_blocked = controller_cleanup_unknown(run.get("recovery"))
+        controller_blocked = controller_cleanup_unknown(
+            run.get("recovery")
+        ) or cleanup_intent_unresolved(run)
         workspace_ok = not run["first_started_at"]
         notes = []
         try:
@@ -513,7 +600,7 @@ def create_app(settings=None):
         from doonex.worker import record_probe_failure
 
         try:
-            containers = Sandbox().containers(run["id"])
+            containers = Sandbox().containers(run["id"], **sandbox_context(run))
         except SandboxError as error:
             record_probe_failure(store, run["id"], error)
             raise ValueError("无法核查 Docker 状态，禁止恢复") from error
@@ -542,6 +629,7 @@ def create_app(settings=None):
                 run.get("recovery")
             ),
             "controller_cleanup_blocked": controller_blocked,
+            "cleanup_intent_blocked": cleanup_intent_unresolved(run),
         }
 
     @app.post("/api/runs/{run_id}/resume", dependencies=auth)
@@ -553,6 +641,8 @@ def create_app(settings=None):
             )
         if run["state"] not in {"paused", "interrupted"}:
             raise ValueError("仅暂停或中断的运行可以续接")
+        if cleanup_intent_unresolved(run):
+            raise ValueError("原清理意图尚未核实；不能续接或重放")
         report = recovery(run_id)
         if report["controller_cleanup_blocked"]:
             raise ValueError(
@@ -576,9 +666,11 @@ def create_app(settings=None):
         with store.locked(run["id"], dispatch=True) as (c, current):
             if current["state"] not in {"paused", "interrupted"}:
                 raise ValueError("运行状态已变化")
-            from doonex.responses_registry import helper_fenced
+            if cleanup_intent_unresolved(current):
+                raise ValueError("原清理意图尚未核实；不能续接或重放")
+            from doonex.store import execution_fenced
 
-            if helper_fenced(c):
+            if execution_fenced(c):
                 raise ValueError("模型传输进程尚未完成独立核查；普通续接不能解除阻止")
             from doonex.cleanup import controller_cleanup_unknown
 

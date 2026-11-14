@@ -2,11 +2,21 @@
 
 import signal
 import time
+from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
 from doonex.budget import Halt, Ledger, elapsed, guard
-from doonex.cleanup import merge_cleanup
+from doonex.cleanup import (
+    begin_cleanup_intent,
+    cleanup_intent_matches,
+    cleanup_intent_unresolved,
+    finish_cleanup_intent,
+    merge_cleanup,
+    operation_context,
+    sandbox_context,
+)
 from doonex.config import Settings, redact
 from doonex.deadline import ExecutionDeadlineExceeded, check_deadline, remaining_time
 from doonex.models import model_for_role, run_roles
@@ -35,9 +45,22 @@ def exception_cause(error, expected):
     return None
 
 
-def stop_containers(sandbox, run_id, *, previous=None, error=None):
+def stop_containers(sandbox, run_id, *, context, previous=None, error=None):
     try:
-        result = sandbox.stop_run(run_id)
+        from doonex.controller_operations import current_registry
+        from doonex.store import execution_fenced
+
+        registry = current_registry()
+        with registry.store.connect() as connection:
+            blocked = execution_fenced(connection)
+        if blocked:
+            result = {
+                "remaining": ["unknown"],
+                "stopped": [],
+                "errors": ["execution_fenced"],
+            }
+        else:
+            result = sandbox.stop_run(run_id, **context)
     except Exception as cleanup_error:  # noqa: BLE001 - preserve unknown termination state
         result = {
             "remaining": ["unknown"],
@@ -82,6 +105,7 @@ def get_workspace(run, directory):
         base_commit=run["request"]["base_commit"],
         baseline_path=directory / "baseline" if run.get("baseline_digest") else None,
         baseline_digest=run.get("baseline_digest"),
+        operation_context=operation_context(run),
     )
 
 
@@ -100,9 +124,24 @@ class Worker:
         if self.lock_connection is None:
             raise OwnershipLost("执行连接已失效")
         try:
-            self.lock_connection.execute("SELECT 1")
+            held = self.lock_connection.execute(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory' "
+                "AND pid=pg_backend_pid() AND classid=%s AND objid=%s "
+                "AND objsubid=1 AND granted) AS held",
+                (WORKER_LOCK >> 32, WORKER_LOCK & 0xFFFFFFFF),
+            ).fetchone()
+            if not held["held"]:
+                raise OwnershipLost("worker 执行锁已释放")
         except Exception as error:
             raise OwnershipLost("执行连接已失效") from error
+
+    def operation_context(self, run, *, parent_action_id=None, sandbox=False):
+        self.lease()
+        if run.get("owner") != self.owner:
+            raise OwnershipLost("执行权已移交，旧 worker 不得借用新 owner")
+        return (sandbox_context if sandbox else operation_context)(
+            run, parent_action_id=parent_action_id
+        )
 
     def fence(self):
         if self.lock_connection is None or self.stopping:
@@ -126,35 +165,122 @@ class Worker:
             or batch_stopped
         )
 
-    def reconcile(self):
-        from doonex.sandbox import Sandbox
+    @contextmanager
+    def controller_actor(self):
+        from doonex.controller_operations import (
+            ControllerRegistry,
+            bind_registry,
+            fresh_actor,
+        )
+        from doonex.store import external_execution_fenced
 
-        sandbox = Sandbox()
-        for run in self.store.list_runs(limit=None, states=ACTIVE | {"interrupted"}):
-            with self.store.locked(run["id"]) as (c, current):
-                self.lease()
+        self.lease()
+        registry = ControllerRegistry(
+            self.store,
+            actor=fresh_actor("worker"),
+            check_owner=self.lease,
+            check_other_fences=external_execution_fenced,
+        )
+        with bind_registry(registry):
+            yield registry
+
+    def reconcile(self):
+        from doonex.controller_operations import current_registry
+        from doonex.sandbox import Sandbox
+        from doonex.store import execution_fenced
+
+        with self.controller_actor():
+            sandbox = Sandbox()
+            for run in self.store.list_runs(
+                limit=None, states=ACTIVE | {"interrupted"}
+            ):
+                with self.store.locked(run["id"], dispatch=True) as (c, current):
+                    self.lease()
+                    blocked = execution_fenced(c)
+                    pending_intent = cleanup_intent_unresolved(current)
+                    self.store.mark_pending_unknown(run["id"], c, current)
+                    current.update(
+                        state="interrupted",
+                        owner=self.owner,
+                        reason="执行服务中断；已保留变更，恢复前须核对未决动作",
+                    )
+                    assignment = current.get("assignments", {}).get(
+                        current.get("active_assignment")
+                    )
+                    if assignment and assignment["state"] != "completed":
+                        assignment["state"] = "interrupted"
+                    if blocked or pending_intent:
+                        current["recovery"] = merge_cleanup(
+                            {
+                                "remaining": ["unknown"],
+                                "stopped": [],
+                                "errors": [
+                                    "execution_fenced"
+                                    if blocked
+                                    else "cleanup_intent_unresolved"
+                                ],
+                            },
+                            previous=current.get("recovery"),
+                        )
+                        intent = None
+                        self.cleanup_blocked = True
+                    else:
+                        intent = begin_cleanup_intent(
+                            current, source="reconcile", actor=current_registry().actor
+                        )
+                        previous = current.get("recovery")
+                    self.store.event(
+                        run["id"], "interrupted", {"cleanup_intent": intent}, c
+                    )
+                if intent is None:
+                    continue
                 result = stop_containers(
-                    sandbox, run["id"], previous=current.get("recovery")
+                    sandbox,
+                    run["id"],
+                    context=self.operation_context(current, sandbox=True),
+                    previous=previous,
                 )
-                if result.get("remaining") or result.get("errors"):
-                    self.cleanup_blocked = True
-                self.store.mark_pending_unknown(run["id"], c, current)
-                current.update(
-                    state="interrupted",
-                    owner=self.owner,
-                    reason="执行服务中断；已保留变更，恢复前须核对未决动作",
-                    recovery=result,
-                )
-                assignment = current.get("assignments", {}).get(
-                    current.get("active_assignment")
-                )
-                if assignment and assignment["state"] != "completed":
-                    assignment["state"] = "interrupted"
-                self.store.event(
-                    run["id"], "interrupted", {"container_reconciliation": result}, c
-                )
+                with self.store.locked(run["id"], self.owner) as (c, latest):
+                    self.lease()
+                    if not cleanup_intent_matches(latest, intent):
+                        self.cleanup_blocked = True
+                        continue
+                    result = merge_cleanup(result, previous=latest.get("recovery"))
+                    finish_cleanup_intent(latest, intent, result)
+                    latest["recovery"] = result
+                    if result.get("remaining") or result.get("errors"):
+                        self.cleanup_blocked = True
+                        latest.update(
+                            state="interrupted", reason="任务容器终态未核实；须核查"
+                        )
+                    elif latest.get("requested_action") in {"cancel", "pause"}:
+                        latest.update(
+                            state="cancelled"
+                            if latest["requested_action"] == "cancel"
+                            else "paused",
+                            reason="已取消"
+                            if latest["requested_action"] == "cancel"
+                            else "已暂停，保留工作区与会话",
+                        )
+                        if latest["state"] == "cancelled":
+                            latest["ended_at"] = now()
+                    else:
+                        latest.update(
+                            state="interrupted",
+                            reason="执行服务中断；恢复前须核对未决动作",
+                        )
+                    assignment = latest.get("assignments", {}).get(
+                        latest.get("active_assignment")
+                    )
+                    if assignment and assignment["state"] != "completed":
+                        assignment["state"] = latest["state"]
+                    self.store.event(run["id"], "cleanup", result, c)
 
     def execute(self, run_id):
+        with self.controller_actor():
+            return self._execute(run_id)
+
+    def _execute(self, run_id):
         from doonex.evidence import Evidence
         from doonex.review import Review
         from doonex.sandbox import Sandbox, SandboxError
@@ -190,6 +316,13 @@ class Worker:
         try:
             with self.store.locked(run_id, dispatch=True) as (c, current):
                 if current["state"] != "queued":
+                    return
+                if cleanup_intent_unresolved(current):
+                    current.update(
+                        state="interrupted", reason="原清理意图尚未核实；禁止领取"
+                    )
+                    self.cleanup_blocked = True
+                    self.store.event(run_id, "cleanup_intent_unresolved", {}, c)
                     return
                 from doonex.store import execution_fenced
 
@@ -342,6 +475,9 @@ class Worker:
                         directory / "workspace",
                         baseline_path=directory / "baseline",
                         deadline=execution_deadline,
+                        operation_context=self.operation_context(
+                            self.store.get(run_id)
+                        ),
                     )
                 checkpoint_digest = (
                     Workspace.execution_digest(
@@ -359,6 +495,11 @@ class Worker:
                 Workspace.scan(workspace.path, deadline=execution_deadline)
                 if run.get("assignments") and workspace.baseline_digest is None:
                     raise ValueError("持久化基线尚未绑定，须核对后重新创建任务")
+
+            workspace = replace(
+                workspace,
+                operation_context=self.operation_context(self.store.get(run_id)),
+            )
 
             def execute_role(role, shell_path, *, read_only=False):
                 remaining_execution()
@@ -519,6 +660,11 @@ class Worker:
                             run_id,
                             should_stop=role_stop,
                             deadline=execution_deadline,
+                            **self.operation_context(
+                                self.store.get(run_id),
+                                parent_action_id=action_id,
+                                sandbox=True,
+                            ),
                             **options,
                         )
                         result = redact(result, secrets)
@@ -981,6 +1127,13 @@ class Worker:
                         raise Yielded() from None
                     try:
                         kwargs["deadline"] = execution_deadline
+                        kwargs.update(
+                            self.operation_context(
+                                self.store.get(run_id),
+                                parent_action_id=action,
+                                sandbox=True,
+                            )
+                        )
                         result = sandbox.run(*args, **kwargs)
                         check_sandbox_cleanup(result)
                         self.lease()
@@ -1153,10 +1306,31 @@ class Worker:
         except BaseException as exc:  # noqa: BLE001 - record shutdown and clean task containers
             # A new lock holder owns cleanup after a connection loss.
             self.lease()
-            with self.store.locked(run_id, self.owner) as (c, current):
-                cleanup = stop_containers(
-                    sandbox, run_id, previous=current.get("recovery"), error=exc
+            from doonex.controller_operations import current_registry
+
+            with self.store.locked(run_id, self.owner, dispatch=True) as (c, current):
+                # A committed pausing state prevents new work while cleanup runs
+                # without this row lock. Cancellation can still commit meanwhile.
+                current.update(state="pausing", reason="等待任务容器清理")
+                self.store.mark_pending_unknown(run_id, c, current)
+                intent = begin_cleanup_intent(
+                    current, source="worker", actor=current_registry().actor
                 )
+                previous = current.get("recovery")
+                context = self.operation_context(current, sandbox=True)
+                self.store.event(run_id, "cleanup_requested", {"intent": intent}, c)
+            cleanup = stop_containers(
+                sandbox, run_id, context=context, previous=previous, error=exc
+            )
+            with self.store.locked(run_id, self.owner) as (c, current):
+                self.lease()
+                if not cleanup_intent_matches(current, intent):
+                    self.cleanup_blocked = True
+                    return
+                cleanup = merge_cleanup(
+                    cleanup, previous=current.get("recovery"), error=exc
+                )
+                finish_cleanup_intent(current, intent, cleanup)
                 reason = str(redact(str(exc), secrets))[:1500]
                 if cleanup.get("remaining") or cleanup.get("errors"):
                     self.cleanup_blocked = True
@@ -1279,50 +1453,55 @@ class Worker:
             ).fetchone()["acquired"]:
                 raise RuntimeError("已有 worker 持有执行权")
             self.lock_connection = connection
-            self.reconcile()
-            from doonex.arena import Arena
+            try:
+                with self.controller_actor():
+                    self._run_ready(once)
+            finally:
+                self.lock_connection = None
 
-            arena = Arena(self.settings, self.store)
-            for batch in arena.list(states={"running", "cancelling"}):
-                arena.sync(batch["id"])
-            while not self.stopping:
-                self.fence()
-                from doonex.store import execution_fenced
+    def _run_ready(self, once):
+        self.reconcile()
+        from doonex.arena import Arena
 
-                with self.store.connect() as c:
-                    blocked = execution_fenced(c)
-                if self.cleanup_blocked or self.scheduler.cleanup_blocked or blocked:
-                    raise RuntimeError(
-                        "容器或模型传输进程终止状态不明；执行服务阻止后续任务，须核查"
+        arena = Arena(self.settings, self.store)
+        for batch in arena.list(states={"running", "cancelling"}):
+            arena.sync(batch["id"])
+        while not self.stopping:
+            self.fence()
+            from doonex.store import execution_fenced
+
+            with self.store.connect() as c:
+                blocked = execution_fenced(c)
+            if self.cleanup_blocked or self.scheduler.cleanup_blocked or blocked:
+                raise RuntimeError(
+                    "容器或模型传输进程终止状态不明；执行服务阻止后续任务，须核查"
+                )
+            self.scheduler.maintain()
+            from doonex.budget import BatchHalt
+
+            for run in self.store.list_runs(limit=None, states={"yielded"}):
+                try:
+                    self.scheduler.resume_yielded(
+                        run,
+                        get_workspace(run, run_directory(self.settings, run["id"])),
                     )
-                self.scheduler.maintain()
-                from doonex.budget import BatchHalt
-
-                for run in self.store.list_runs(limit=None, states={"yielded"}):
-                    try:
-                        self.scheduler.resume_yielded(
-                            run,
-                            get_workspace(run, run_directory(self.settings, run["id"])),
-                        )
-                        arena.sync(run["request"]["arena"]["evaluation_id"])
-                    except BatchHalt as error:
-                        arena.stop(
-                            run["request"]["arena"]["evaluation_id"],
-                            "budget_exceeded",
-                            str(error),
-                        )
-                    if self.scheduler.cleanup_blocked:
-                        raise RuntimeError(
-                            "后台检查点存在残留或未知容器；须核查后恢复服务"
-                        )
-                self.scheduler.claim_next()
-                queued = self.store.next_queued_run()
-                if queued:
-                    self.execute(queued["id"])
-                self.scheduler.maintain()
-                if once:
-                    break
-                time.sleep(0.5)
+                    arena.sync(run["request"]["arena"]["evaluation_id"])
+                except BatchHalt as error:
+                    arena.stop(
+                        run["request"]["arena"]["evaluation_id"],
+                        "budget_exceeded",
+                        str(error),
+                    )
+                if self.scheduler.cleanup_blocked:
+                    raise RuntimeError("后台检查点存在残留或未知容器；须核查后恢复服务")
+            self.scheduler.claim_next()
+            queued = self.store.next_queued_run()
+            if queued:
+                self.execute(queued["id"])
+            self.scheduler.maintain()
+            if once:
+                break
+            time.sleep(0.5)
 
 
 def main():

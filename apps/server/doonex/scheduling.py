@@ -4,6 +4,7 @@ import time
 from copy import deepcopy
 
 from doonex.budget import BatchHalt, elapsed
+from doonex.cleanup import cleanup_intent_unresolved, sandbox_context
 from doonex.deadline import check_deadline
 from doonex.store import dispatch_lock, execution_fenced, now
 
@@ -64,6 +65,11 @@ class Scheduler:
         from doonex.background import BackgroundStopped
         from doonex.sdk import SchedulerYield
 
+        if cleanup_intent_unresolved(run):
+            raise BatchHalt(
+                "原清理意图尚未核实；禁止派发",
+                run["request"].get("arena", {}).get("evaluation_id"),
+            )
         binding = run["request"].get("background")
         if not binding:
             return
@@ -92,7 +98,9 @@ class Scheduler:
         from doonex.workspace import Workspace
 
         check_deadline(deadline)
-        if Sandbox().containers(run_id, deadline=deadline):
+        if Sandbox().containers(
+            run_id, deadline=deadline, **sandbox_context(self.store.get(run_id))
+        ):
             self.cleanup_blocked = True
             raise ValueError("后台仍有容器，不能保存安全让出检查点")
         workspace_digest = Workspace.execution_digest(workspace.path, deadline=deadline)
@@ -162,13 +170,17 @@ class Scheduler:
 
     def resume_yielded(self, run, workspace):
         from doonex.sandbox import Sandbox, SandboxError
+
+        if cleanup_intent_unresolved(run):
+            self.cleanup_blocked = True
+            return False
         from doonex.sdk import SchedulerYield
         from doonex.workspace import Workspace
 
         # Unknown containers block resume; no cleanup or side effects are
         # assumed merely because the durable state says yielded.
         try:
-            if Sandbox().containers(run["id"]):
+            if Sandbox().containers(run["id"], **sandbox_context(run)):
                 self.cleanup_blocked = True
                 raise ValueError("后台仍有容器，不能自动续接")
             if self.should_yield(run["id"]):

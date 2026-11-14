@@ -215,6 +215,7 @@ def build_patch(
     after: dict[str, FileContent],
     *,
     deadline: float | None = None,
+    operation_context: dict | None = None,
 ) -> bytes:
     """Generate the binary-capable patch from two already bounded file sets."""
     check_deadline(deadline)
@@ -236,6 +237,7 @@ def build_patch(
             check=False,
             deadline=deadline,
             stdout_limit=MAX_ARTIFACT_BYTES,
+            operation_context=operation_context,
         )
         if diff.returncode not in (0, 1):
             raise EvidenceError("Could not generate delivery diff")
@@ -336,7 +338,10 @@ class Evidence:
         _write_artifact(
             root / "diff.patch",
             build_patch(
-                workspace.base_files(deadline=deadline), files, deadline=deadline
+                workspace.base_files(deadline=deadline),
+                files,
+                deadline=deadline,
+                operation_context=workspace.operation_context,
             ),
             deadline=deadline,
         )
@@ -353,9 +358,10 @@ class Evidence:
                 temporary_root = Path(temporary).resolve(strict=True)
                 check_path = temporary_root / "workspace"
                 write_files(files, check_path, deadline=deadline)
-                execution_options = (
-                    {"deadline": deadline} if deadline is not None else {}
-                )
+                execution_options = dict(workspace.operation_context or {})
+                execution_options.pop("run_id", None)
+                if deadline is not None:
+                    execution_options["deadline"] = deadline
                 if verifier_info is None:
                     result = sandbox.run(
                         check_path,
