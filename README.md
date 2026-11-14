@@ -48,7 +48,7 @@ M5 面向自托管单站点，范围与实际检查见 [M5 记录](docs/M5_IMPLE
 
 首个验证环境为 Apple Silicon Mac mini、macOS、Docker 与 Python 3.12。系统 Python 3.9 不用于应用运行；`uv` 根据项目约束创建 Python 3.12 环境。还需可用的 Git、Node.js 和 `pnpm`，前端包管理器锁定为 `pnpm@11.1.1`。这些命令供本机开发使用，不代表已验证其他硬件或公网部署。
 
-当前整合成果位于 `codex/responses-transport` 分支，`main` 暂保留 M3，等待 M4 剩余退出条件通过。本轮已整合原子 helper 身份、有限数据库维护及 [SDK 会话容量](docs/M4_SESSION_CAPACITY.md)，真实验收源码 `b462502` 通过 **1826 项本机测试**、Ruff 和前端构建。后续已整合有限 Git/export、Sandbox 清理和部分共同期限接线，当前专项、未完成全链接线及证据见[续接记录](docs/M4_RESUMPTION_20261113.md#下一步与合并条件)与[等待控制计划](docs/M4_WAIT_CONTROL_PLAN.md)；旧全量不代表新源码通过。当前 API/worker 未加载，保留的 plist 仍指向旧 M5 版本；常驻服务尚未升级。以下命令检出当前整合分支。
+当前整合成果位于 `codex/responses-transport` 分支，`main` 暂保留 M3，等待 M4 剩余退出条件通过。本轮已整合原子 helper 身份、有限数据库维护及 [SDK 会话容量](docs/M4_SESSION_CAPACITY.md)，真实验收源码 `b462502` 通过 **1826 项本机测试**、Ruff 和前端构建。后续已整合有限 Git/export、Sandbox 清理、内容/交付及逐次 SDK 请求的共同期限，`f271bfb` 联合专项 390 项通过。初始化、凭据及后台领取期限已提交为 `61a9dd3`，完整回归 **2126 项通过**，同一源码的 Ruff 和前端构建通过。控制操作登记组件已有证据，生产入口尚未启用；未完成接线及证据见[续接记录](docs/M4_RESUMPTION_20261113.md#下一步与合并条件)与[等待控制计划](docs/M4_WAIT_CONTROL_PLAN.md)。后续源码变化仍须重新验证。当前 API/worker 未加载，保留的 plist 仍指向旧 M5 版本；常驻服务尚未升级。以下命令检出当前整合分支。
 
 ```bash
 git clone --branch codex/responses-transport git@github.com:BensonYu/DooNex.git doonex

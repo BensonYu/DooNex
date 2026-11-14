@@ -21,7 +21,7 @@ helper 的启动、传输和 IPC 使用一个绝对 monotonic deadline；所有�
 
 ## 共同期限与容器回收的当前切片
 
-已整合有限 Git/export（`d42a8ff`）和 Sandbox（`1140aed`、`cc4d89e`）。父接线为一次 Run 首次时钟映射一个 monotonic 剩余期限，两个角色共用；恢复仍从持久首次时钟计算，不重置预算。SDK 本地持久化、恢复前核验、全局会话锁、canonical hash、shell/verification 及 isolated Responses helper 使用该期限。直接 SDK 模型调用尚未逐次收紧在途 timeout；这些接线不能称完整 Run 等待上界。
+已整合有限 Git/export（`d42a8ff`）和 Sandbox（`1140aed`、`cc4d89e`）。父接线为一次 Run 首次时钟映射一个 monotonic 剩余期限，两个角色共用；恢复仍从持久首次时钟计算，不重置预算。SDK 本地持久化、恢复前核验、全局会话锁、canonical hash、shell/verification 及 isolated Responses helper 使用该期限。`f271bfb` 已在每次实际 SDK Chat/Responses 请求预算提交后重新取原 timeout、调用 timeout 和剩余期限的最小值，并以实际合成 SDK 传输验证；这只是现有传输参数，不保证整请求或供应商计费结束，也不能称完整 Run 等待上界。
 
 Sandbox 从 mount/create 入口开始计时，控制输出和容器 ID 有限，单所有者非阻塞 drain，实际 reap 与 EOF 分开核验；必要 cleanup 共用一个独立 15 秒窗口，不因子调用而刷新。最终查询覆盖整个 Run label，不能把命令超时或无输出解释为没有容器。
 
@@ -31,13 +31,17 @@ create 子进程已启动却没有正常、严格的 ACK 时，CLI 回收和当�
 
 **本片仍未覆盖 Popen 后、终态回执持久前控制器崩溃的窗口。** 下一步须在 Popen 前持久 logical operation 身份，按 owner/operation 的真实终态回执 CAS 结算；不能让普通 unknown→acknowledged 清除 process/daemon fence，不能补造 PID 或从空闲 lease 推断未发送。已有 shell/verification action 可作为准入身份；Git/export、mount 和清理探测也须登记。
 
+登记组件 `66fed5f` 已通过 82 项检查，包含独立窄表、严格终态 SQL 函数/索引核对、reserve/launch commit 后能力、真实进程回执和有限 ps/rm repair。**目前尚未生产启用**：Store 初始化与 fence、ambient actor、Git/Sandbox 生产入口、锁外 cleanup 及 API/worker/CLI 调用方必须一起闭合。无原 sandbox operation 的历史未知继续阻止，不能用空新表、空 ps 或跳过自身 fence 代替部署前核查。repair 仅结清新组，不清原 unknown。
+
 容器清理目前仍在既有行锁内；移出前须冻结 cleanup 身份、持久阻止及 owner/状态 CAS。组件审查和本机故障检查不替代父整合回归或完整 Worker.run 矩阵，最终收据见[续接记录](M4_RESUMPTION_20261113.md)。
 
 ## 有限文件操作与前台初始化
 
-工作区已有 10,000 项、单文件 10 MiB、总量 100 MiB、深度 100；Skill/任务集/Review/Evidence 也已有各自容量。它们尚未贯穿整链剩余期限，若干路径还会先全输出/全排序再计数，单项超时不能代替总工作量核验。
+工作区已有 10,000 项、单文件 10 MiB、总量 100 MiB、深度 100；Skill/任务集/Review/Evidence 也已有各自容量。`fff5761`、`f2b015c`、`0af9a0b` 与 `f271bfb` 已接入有限扫描、分块读写/hash、archive、冻结上下文和交付调用链；联合专项 390 项通过。Arena/Background 的 `bfdb43f` 组件保留审批、heldout 和环境绑定，91 项离线及 190 项数据库专项通过；其后初始化、凭据及 claim metadata 期限 `61a9dd3` 已通过 2126 项完整回归、Ruff 与前端构建。容量和局部超时仍不能代替完整工作量与调度等待验收。
 
-下一步给 read/write/hash/copy/archive/patch 按块和项检查剩余期限；Git stdout/stderr 与原始树条目在过滤前计数、有限读取，保留危险配置/helper 禁用及 Git 对象类型/大小/提交绑定。只复用冻结不可变且绑定 digest 的准备结果，实际使用前继续核验。首次摘要移出长事务后仍须重锁并复核 owner、状态和基线。
+上述实现按块和项检查 read/write/hash/copy/archive/patch 剩余期限；Git stdout/stderr 与原始树条目在过滤前计数、有限读取，保留危险配置/helper 禁用及 Git 对象类型/大小/提交绑定。只复用冻结不可变且绑定 digest 的准备结果，实际使用前继续核验；首次摘要移出长事务后仍重锁并复核 owner、状态和基线。后续仍须在最终源码验证近容量、超限与完整调度路径，不能从组件数推导完整上界。
+
+另一个尚未贯穿的链是锁内 Scheduler.preflight → Background.preflight → metadata `_unchanged`：其仍读取模型/凭据/环境文件，不能因为不检查 task contents 就视为纯数据库复核。Worker 模型/工具及 verifier 准入、后台 maintain 都会调用，必须继续传递共同期限并在最后准入前复检；必要核验不能为缩短数字而省略。与有限 yielded 候选及批次/窗口的 monotonic 映射一起完成后，再进行完整 Worker.run 验收。
 
 普通、Arena、generation 的前台初始化分别验证。健康本地 IO 下可以约束有限工作量；fsync、replace、阻塞系统调用、文件系统失联或宿主磁盘配额不能由局部 Python deadline 保证。新增整进程边界或宿主写盘配额如改变架构，先记录具体证据与决策。
 

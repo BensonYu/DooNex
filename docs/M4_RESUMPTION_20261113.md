@@ -112,3 +112,45 @@ PYTHONPATH=apps/server:tests .venv/bin/python scripts/test_local.py \
 继续按[等待控制计划](M4_WAIT_CONTROL_PLAN.md)实施共同剩余期限、Docker 管道与清理、有限 Git/export/快照/检查复制和普通/Arena/generation 前台初始化，再对同一 monotonic 时钟的实际 Worker.run 做正常、近容量及故障矩阵。文件系统失联、阻塞系统调用、远端请求结束和供应商最终计费不由现有局部限制证明。
 
 `main` 仍保留 M3；M4 完整退出条件及最终整合回归/证据核对通过后才推进。M5 社区仍关闭，未公开上线、收费或选择许可证。旧 API/worker 不自动恢复；服务升级须绑定已验证固定源码和回退收据，不指向开发目录。
+
+## 内容、交付与初始化期限的后续整合
+
+以下为真实后台验收之后的本机实现与检查，没有新增真实模型调用或操作生产账本。
+
+| 提交 | 已整合内容 | 实际检查与边界 |
+| --- | --- | --- |
+| `fff5761`、`f2b015c`、`0af9a0b` | Tasksets、Evidence/Review、Skill/Library/Generation 的有限扫描、分块读写/hash、archive 与冻结内容期限 | 保留不可变版本、审批、heldout 隔离及执行控制异常；组件证据只适用其冻结源码 |
+| `f271bfb` | Worker 内容与交付调用链、Scheduler receipt 和容器探测共用原执行期限；SDK 每次实际请求在预留提交后重算 timeout | 390 passed / 3 warnings / 169.56 秒 / exit 0，无跳过；146 个输入逐项绑定提交。传输 timeout 不保证整请求或远端计费结束 |
+| `66fed5f`，原 `ced2240` | 独立 controller operation 登记组件、窄表/严格 SQL 终态/索引核对、已提交 launch capability 与实际回执 | 82 passed（36 离线、46 真实 PostgreSQL）/ 8.01 秒 / exit 0；**尚未接入生产 Store、全局 fence 或 Popen 入口** |
+| `bfdb43f`，原 `24eb981` | Arena/Background 冻结准备、环境摘要与原子建批的 keyword-only deadline | 91 项离线及 190 项真实 PG/Docker 联合检查通过；standalone detail 的整链仍不能宣称有等待上界 |
+
+`deadline-delivery-integration-01.json/.log` 与 source-binding 收据绑定 `f271bfb`，日志 SHA256 为 `b81baa56fd81540b6c9d6013d604ca8eca6f487fd799b93453f12b51709e8fc0`。对应命令实际包含 execution/content/generation、Evidence/Review、Scheduler、Worker wait、SDK、session store 与 cleanup fences 联合专项；不把组件数相加作为全量。登记组件的首两轮 fixture 失败和上下文组件的旧候选收据均保留，最终以各自 HANDOFF 指定的收据为准。
+
+独立审查发现首次时钟之前的 Library/Generation/Arena 构造与凭据读取，以及最终 completion 行锁等待之后缺少期限复核。后续候选已将初始化移入首次时钟提交后的 try 和同一原期限，并在 completion 锁后重新核对 monotonic 与持久 wall 时长。私有凭据文件改为 no-follow/nonblocking 打开、普通文件/权限检查、1 MiB 总量、64 KiB 分块和 finally 关闭；错误不输出凭据正文。SDK 失败诊断记录实际请求 timeout。`deadline-initialization-integration-01` 已实际通过 190 项 / 2 warnings / 112.07 秒 / exit 0，151 个输入不变；该收据仍是此候选的中途专项。
+
+随后又补齐 Arena/Background 两处 credential 的期限，以及 Scheduler.claim_next → Background.claim → metadata `_unchanged` 的同一期限；到期回滚授权消费、分配与批次，原输入、日账和预算不改。准备时钟最多 30 秒，只约束健康本地操作之间的协作检查，不替代 Run/批次/UTC 日预算。增加 metadata 复核中及 allocation 写入后到期的真实数据库测试。`deadline-initialization-offline-04` 47 passed / 6 deselected / 2 warnings / exit 0；这是显式排除 postgres 的专项，不是全量。首次完整回归 `deadline-initialization-full-01.json/.log` 实际为 **7 failed / 2117 passed / 3 warnings / exit 1**，pytest 821.17 秒，外层 824.922 秒，151 份输入不变；日志 SHA256 为 `9c9c2e54cb7c44bed684bf97d6a4dbe2a67c264ca84ff38e994c2f3e42fb88fd`。失败均涉及旧测试替身未接收新增 keyword-only deadline；后续只在三个测试文件补齐 `**kwargs` 接收/向真实实现透传，未放宽断言。修复后 `deadline-initialization-integration-02` 实际通过 **160 项 / 2 warnings / 159.31 秒 / exit 0**，151 个输入不变，独立审查核对日志与源码；其日志 SHA256 为 `078391998c27031c2bff4c5ca5957889d83e9194cfff31e50be7f23c1b21a19d`。第二轮完整 `deadline-initialization-full-02` 实际为 **1 failed / 2123 passed / 3 warnings / 835.01 秒 / exit 1**，外层 838.461 秒，151 份输入不变，日志 SHA256 为 `477fcd5bcaa8c8290670e44e0b7cb1e4c196c1f53009f8e1b1bfb83b2eddf07c`。失败在 evidence 期限测试，原日志未保存底层 reason，不能据此推断应用故障原因。同期实际前端构建 `deadline-initialization-web-01` 已 exit 0，但三份测试变化后的最终检查仍待重跑。
+
+此前 `deadline-initialization-offline-01` 的 41 passed / 1 failed 保留：锁定 SDK 将 ModelCallError 包装成 ConversationRunError；仅修测试沿 cause 核对实际 ModelCallError、timeout 和未知预留，未改 SDK 失败语义。后续离线专项通过仍不替代最终全量。
+
+本轮测试运行期间另有权限 PRD 文档合并 `e620fcd` 进入现有分支，涉及 README/PRD/架构/路线图/评测规范，没有非 Markdown 源码变更；其 P27–P32 仍是待实施设计，按路线在 M4 之后推进。本轮继续 M4，不启用新权限或审批能力。
+
+下一项生产接线已拆为 Workspace 与 Sandbox 两个独立实现工作区，父负责 Store/actor/callers 与锁外 cleanup。普通新组不能排除自身历史 unknown；有原 sandbox operation 时只允许固定 ps/rm repair，且不解除原未知；没有可核验原身份的历史记录继续阻止。子片通过、空新表或空 ps 都不构成部署前的历史安全证明。完整 Worker.run 矩阵、有限 yielded 扫描及批次/窗口 monotonic 接线仍未完成。
+
+
+期限测试的独立复现与修正：`deadline-initialization-diagnostic-01` 未进入 pytest，临时 PostgreSQL 容器内部就绪但宿主映射端口超时，脚本 exit 1 并清理；重试 `diagnostic-02` 原单测 1 passed / 3.20 秒 / exit 0。随后在 SDK 返回后确定性模拟持久 wall 时钟前移 5 秒，`diagnostic-03` 为 1 failed / 3 passed / 15 deselected / exit 1，reason 明确为 actual deadline `438952.873931625` 不等于 SDK 初始 `438957.8739235`。原合同允许 `remaining_execution` 只收紧期限，数值恒等不是其合同；现测试要求期限仍未到期、不得超过 SDK 初始期限，前移分支还要求至少收紧 4 秒，并继续以真实 Delivery 的已过期期限验证 budget_exceeded、零新交付工件、原调用和无未知预留。没有改应用期限、预算或失败状态来取得通过；所有失败收据保留。修正后的联合专项和完整回归结果见下表，历史失败与各自输入收据保留。
+
+
+### 初始化期限最终源码绑定
+
+实现提交为 `61a9dd3730cdc6523bcbee2af2ed286153e078c5`。下列四份检查的全部 151 个非 Markdown 输入前后相同，且已逐项核对实际提交 blob 与当前文件，不以相同 HEAD 或组件数量推定一致。
+
+| 私有收据 | 实际结果 | 日志 SHA256 |
+| --- | --- | --- |
+| `deadline-initialization-integration-03` | 162 passed / 2 warnings / 162.32 秒 / exit 0 | `2f77e5314e573d72da300888c10278ce041585df4fec91f3dc5437ebe72059a6` |
+| `deadline-initialization-full-03` | 2126 passed / 3 warnings / 828.30 秒 / exit 0，无跳过；外层 832.395 秒 | `26ace73053641fc5db8a8d1385ee16453d0e51a5aaecb8769dda72f67d8b6606` |
+| `deadline-initialization-ruff-final-02` | 全范围 Ruff / exit 0 | 见原收据 |
+| `deadline-initialization-web-final-02` | 实际前端构建 / exit 0 | 见原收据 |
+
+绑定收据为 `deadline-initialization-final-source-binding.json`，SHA256 `305318a3cff18a066352c904cc8b0fbb2705de5c8303830065a10934326556b6`。临时数据库已由脚本清理；本轮没有真实模型调用、生产账本写入或服务升级。两轮完整回归失败、临时数据库连接失败及确定性诊断均保留，不能将它们改写为通过。
+
+下一片仍是持久 controller 登记的生产接线。Workspace `28a19e8`、Store/fence `6a011106`、Sandbox `8d406bb`，以及旧测试迁移 `5cfdb23`（78 项）与 `5070c01`（90 项）分别有组件证据，尚未纳入父分支；异常关联和 CLI actor 正做后续检查。父 API/Worker/cleanup/Evidence/Review/Arena/Scheduler 草稿与入口测试仍在私有目录，未应用，不能宣称生产可用。整合后须重新验证真实 Git/Docker、请求隔离、停止意图与锁外清理，继续完成调度共同期限、有限 yielded 和实际 Worker.run 矩阵。
