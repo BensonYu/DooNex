@@ -1094,24 +1094,65 @@ def test_near_capacity_unknown_model_reservation_survives_worker_restart(
     wide = _wide_tuning(tuning)
     _, _, _, batch = claimed(wide, store)
     identifier = batch["attempts"][0]["run_id"]
-    seeded, calls = [], []
+    seeded, calls, sessions, failures, provider_errors = ([] for _ in range(5))
     _seed_hook(monkeypatch, store, "small", seeded, phase="before_model")
+    original_session = sdk.run_session
 
     def unknown(*args, **kwargs):
         calls.append(identifier)
-        raise TimeoutError("Synthetic unknown provider outcome")
+        error = TimeoutError("Synthetic unknown provider outcome")
+        provider_errors.append(error)
+        raise error
 
+    def session(**kwargs):
+        sessions.append((kwargs["run_id"], kwargs["resume"]))
+        try:
+            return original_session(**kwargs)
+        except Exception as error:
+            # Ordinary provider failures settle unknown usage, then the native
+            # SDK wraps ModelCallError. They are failed Runs, distinct from a
+            # controller interruption or an uncertain cleanup/recovery state.
+            assert type(error).__name__ == "ConversationRunError"
+            model_error = error.__cause__
+            assert type(model_error) is sdk.ModelCallError
+            assert model_error.provider_error_type == "TimeoutError"
+            assert str(model_error) == "Model request failed (TimeoutError)"
+            assert model_error.__context__ is provider_errors[0]
+            failures.append(str(error))
+            raise
+
+    monkeypatch.setattr(sdk, "run_session", session)
     monkeypatch.setattr(sdk.GuardedLLM, "_transport_call", unknown)
     with _watchdog():
         Worker(wide[0]).run(once=True)
     original = store.get(identifier)
-    assert original["state"] == "interrupted", original["reason"]
+    assert original["state"] == "failed", original["reason"]
+    assert failures == [original["reason"]]
+    assert len(provider_errors) == 1
+    assert original["assignments"]["executor"]["state"] == "failed"
+    assert {
+        key: value
+        for key, value in original["arena_outcome"].items()
+        if key != "recorded_at"
+    } == {
+        "classification": "failed",
+        "kind": "controller_stop",
+        "safety_violation": False,
+    }
     assert original["usage"]["calls"] == original["usage"]["unknown_calls"] == 1
     assert original["usage"]["reserved_tokens"] > 0
     pending = store.pending(identifier)
     assert len(pending) == 1 and pending[0]["status"] == "unknown"
+    assert pending[0]["kind"] == "model"
+    assert pending[0]["data"]["result"] == {
+        "usage": None,
+        "reservation_retained": True,
+    }
+    assert pending[0]["data"]["tokens"] == original["usage"]["reserved_tokens"]
     original_files = _files(Path(seeded[0]["root"]))
     parent_before = _accounting(store, batch["id"])
+    assert parent_before["parent"]["usage"] == original["usage"]
+    assert original["assignments"]["executor"]["usage"] == original["usage"]
     repo_root = tmp_path / "unknown-foreground"
     repo_root.mkdir()
     repo, git = repository(repo_root)
@@ -1143,7 +1184,10 @@ def test_near_capacity_unknown_model_reservation_survives_worker_restart(
     with _watchdog():
         Worker(wide[0]).run(once=True)
     current = store.get(identifier)
-    assert current["state"] == "interrupted"
+    # Startup reconciliation excludes this terminal failed Run. Its reservation
+    # remains unknown without automatic SDK restore, replay, or budget refund.
+    assert current["state"] == "failed"
+    assert current == original
     assert current["usage"] == original["usage"]
     assert current["request"] == original["request"]
     assert current["first_started_at"] == original["first_started_at"]
@@ -1151,6 +1195,7 @@ def test_near_capacity_unknown_model_reservation_survives_worker_restart(
     assert _accounting(store, batch["id"]) == parent_before
     assert _files(Path(seeded[0]["root"])) == original_files
     assert calls == [identifier, foreground["id"]]
+    assert sessions == [(identifier, False), (foreground["id"], False)]
     assert len(admission) == 1 and before <= after <= admission[0]
     assert store.get(foreground["id"])["state"] == "completed_verified"
     print(
@@ -1165,6 +1210,14 @@ def test_near_capacity_unknown_model_reservation_survives_worker_restart(
                     "upper": admission[0] - before,
                 },
                 "unknown_reservation_and_original_parent_ledgers_preserved": True,
+                "failed_run_preserved_without_session_or_transport_replay": True,
+                "provider_error_type": "TimeoutError",
+                "sdk_exception_chain": [
+                    "ConversationRunError",
+                    "ModelCallError",
+                    "TimeoutError",
+                ],
+                "failed_run_state": current["state"],
                 "normal_latency_pass_claim": False,
             }
         )
