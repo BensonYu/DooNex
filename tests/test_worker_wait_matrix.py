@@ -5,6 +5,7 @@ promise. Observers always call the real method, including SDK close and Docker.
 """
 
 import json
+import textwrap
 import threading
 import time
 from contextlib import contextmanager
@@ -69,7 +70,10 @@ def test_actual_worker_wait_timeline(
     if background_stage == "verifier":
         source, _, _, checker, _ = taskset_source
         (checker / "verify.py").write_text(
-            bounded_file_gate("verifier") + "import sys\n"
+            "from pathlib import Path\n"
+            "if Path('/workspace/timeline-background').exists():\n"
+            + textwrap.indent(bounded_file_gate("verifier"), "    ")
+            + "import sys\n"
             "sys.path.insert(0, '/workspace')\nfrom main import answer\n"
             "assert answer == 42\n"
         )
@@ -313,11 +317,13 @@ def test_actual_worker_wait_timeline(
         return value
 
     def close(conversation, *args, **kwargs):
-        if active:
-            observe("sdk_close_enter", active[0])
+        identifier = getattr(conversation.state.agent, "doonex_run_id", None)
+        current = active and identifier == active[0]
+        if current:
+            observe("sdk_close_enter", identifier)
         value = original_close(conversation, *args, **kwargs)
-        if active:
-            observe("sdk_close_returned", active[0])
+        if current:
+            observe("sdk_close_returned", identifier)
         return value
 
     def maintain(scheduler, *args, **kwargs):
@@ -383,6 +389,8 @@ def test_actual_worker_wait_timeline(
                 entered.set()
                 assert release.wait(20), "Foreground did not release the model gate"
             command = "printf 'answer = 42\\n' > main.py"
+            if background_stage == "verifier":
+                command += "; touch timeline-background"
             if background_stage == "model":
                 command = "touch must-not-run"
             if background_stage == "shell":
