@@ -130,6 +130,40 @@ def test_native_success_preserves_pinned_response_and_narrow_private_cost(monkey
     assert stream.closed and len(calls) == len(hooks) == 1
 
 
+def test_native_provider_metadata_is_checked_then_removed_from_wire(monkeypatch):
+    body = {
+        **sample_response(),
+        "service_tier": "default",
+        "background": False,
+        "completed_at": 2,
+        "prompt_cache_retention": "in_memory",
+    }
+    terminal, stream, calls, hooks = execute_mock(monkeypatch, body=body)
+    assert terminal["kind"] == "result"
+    assert not (terminal["response"].keys() & protocol.PROVIDER_METADATA_FIELDS)
+    assert transport.rebuild_response(terminal).output[1].call_id == "call_one"
+    assert stream.closed and len(calls) == len(hooks) == 1
+
+
+@pytest.mark.parametrize(
+    "field,value,reason",
+    [
+        ("background", True, "response_metadata"),
+        ("private-extra-name", "private-extra-value", "response_fields"),
+    ],
+)
+def test_native_metadata_rejection_keeps_status_without_private_values(
+    monkeypatch, field, value, reason
+):
+    terminal, stream, calls, hooks = execute_mock(
+        monkeypatch, body={**sample_response(), field: value}
+    )
+    assert terminal["kind"] == "error" and terminal["reason"] == reason
+    assert terminal["diagnostics"]["http_status"] == 200
+    assert "private-extra" not in json.dumps(terminal)
+    assert stream.closed and len(calls) == len(hooks) == 1
+
+
 @pytest.mark.parametrize(
     "cost,expected",
     [

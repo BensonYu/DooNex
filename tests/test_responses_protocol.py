@@ -391,6 +391,61 @@ def test_incomplete_or_duplicate_executable_calls_are_rejected():
         protocol.validate_response(response)
 
 
+def test_provider_metadata_is_validated_and_projected_before_pinned_sdk():
+    response = sample_response()
+    provider = {
+        **response,
+        "background": False,
+        "completed_at": 2,
+        "max_tool_calls": None,
+        "service_tier": "default",
+        "prompt_cache_key": SESSION_ID,
+        "prompt_cache_retention": "in_memory",
+        "safety_identifier": None,
+        "top_logprobs": 0,
+        "prompt": None,
+        "conversation": None,
+        "context_management": None,
+    }
+    assert protocol.project_provider_response(provider) == response
+    assert "service_tier" in provider  # The caller's response is never mutated.
+    with pytest.raises(protocol.ProtocolError):
+        protocol.validate_response(provider)  # IPC still accepts only the SDK core.
+
+
+@pytest.mark.parametrize(
+    "field,value,reason",
+    [
+        ("background", True, "response_metadata"),
+        ("background", 0, "response_metadata"),
+        ("completed_at", "2", "response_metadata"),
+        ("completed_at", True, "response_metadata"),
+        ("max_tool_calls", 4097, "response_metadata"),
+        ("service_tier", ["default"], "response_metadata"),
+        ("service_tier", "unknown-private-value", "response_metadata"),
+        ("prompt_cache_key", "not-a-uuid", "response_metadata"),
+        ("prompt_cache_retention", "forever", "response_metadata"),
+        ("safety_identifier", "x" * 129, "response_metadata"),
+        ("top_logprobs", 21, "response_metadata"),
+        ("prompt", {"id": "private-prompt"}, "response_metadata"),
+        ("conversation", {"id": "private-conversation"}, "response_metadata"),
+        ("context_management", [], "response_metadata"),
+        ("arbitrary_private_field", "secret-value", "response_fields"),
+        ("output", [{"type": "web_search_call"}], "response_schema"),
+    ],
+)
+def test_provider_projection_never_accepts_arbitrary_or_executable_extras(
+    field, value, reason
+):
+    response = {**sample_response(), field: value}
+    with pytest.raises(protocol.ProviderResponseError) as caught:
+        protocol.project_provider_response(response)
+    assert caught.value.reason == reason
+    assert "private" not in str(caught.value) and "secret-value" not in str(
+        caught.value
+    )
+
+
 def test_diagnostics_is_finite_typed_and_secret_checked():
     for change in [
         {"raw_message": "sensitive"},

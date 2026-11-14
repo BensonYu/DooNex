@@ -21,10 +21,12 @@ from .responses_protocol import (
     ERROR_TYPES,
     MAX_HTTP_BODY,
     ProtocolError,
+    ProviderResponseError,
     assert_direct_environment,
     decode_frame_payload,
     encode_frame,
     project_cost,
+    project_provider_response,
     strict_json_loads,
     validate_diagnostics,
     validate_response,
@@ -301,9 +303,9 @@ def run_transport(arm: dict, *, before_request: Callable[[], None]) -> dict:
             except ProtocolError:
                 raise TransportPolicyError("response_json") from None
             try:
-                validate_response(body)
-            except ProtocolError:
-                raise TransportPolicyError("response_schema") from None
+                project_provider_response(body)
+            except ProviderResponseError as error:
+                raise TransportPolicyError(error.reason) from None
             return response
 
     observation = {}
@@ -333,8 +335,8 @@ def run_transport(arm: dict, *, before_request: Callable[[], None]) -> dict:
             )
         if type(response) is not ResponsesAPIResponse:
             raise TransportPolicyError("response_schema")
-        public = response.model_dump(mode="json")
         try:
+            public = project_provider_response(response.model_dump(mode="json"))
             validate_response(public)
             # Never permit LiteLLM's model_construct fallback to become success.
             ResponsesAPIResponse.model_validate(public)

@@ -1139,9 +1139,8 @@ class Worker:
             from doonex.arena import Arena
 
             arena = Arena(self.settings, self.store)
-            for batch in arena.list():
-                if batch["state"] in {"running", "cancelling"}:
-                    arena.sync(batch["id"])
+            for batch in arena.list(states={"running", "cancelling"}):
+                arena.sync(batch["id"])
             while not self.stopping:
                 self.fence()
                 from doonex.store import execution_fenced

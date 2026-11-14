@@ -75,6 +75,8 @@ ERROR_REASONS = frozenset(
         "dispatch_policy",
         "response_json",
         "response_schema",
+        "response_fields",
+        "response_metadata",
         "internal",
     }
 )
@@ -164,10 +166,37 @@ RESPONSE_FIELDS = frozenset(
         "store",
     }
 )
+# These provider metadata fields do not belong to the pinned LiteLLM response
+# type. Validate them before projecting that type; never forward arbitrary extras.
+PROVIDER_METADATA_FIELDS = frozenset(
+    {
+        "background",
+        "completed_at",
+        "max_tool_calls",
+        "service_tier",
+        "prompt_cache_key",
+        "prompt_cache_retention",
+        "safety_identifier",
+        "top_logprobs",
+        "prompt",
+        "conversation",
+        "context_management",
+    }
+)
 
 
 class ProtocolError(ValueError):
     """Only finite local messages escape; never format an untrusted value."""
+
+
+class ProviderResponseError(ProtocolError):
+    """A finite failure category, without provider field names or values."""
+
+    def __init__(self, reason):
+        if reason not in {"response_fields", "response_metadata", "response_schema"}:
+            raise ValueError("Invalid provider response failure category")
+        self.reason = reason
+        super().__init__("Unsupported provider Responses structure")
 
 
 def _validated(function):
@@ -697,6 +726,59 @@ def validate_response(response: dict) -> dict:
             case _:
                 raise ProtocolError("Unsupported isolated Responses output item")
     return response
+
+
+def project_provider_response(response: dict) -> dict:
+    """Validate known API metadata and the strict executable core separately.
+
+    The wire result remains the pinned SDK subset. Metadata cannot enable a
+    background job, stored prompt, conversation or context-management behavior.
+    """
+    try:
+        _tree(response)
+        _fields(
+            response,
+            {"id", "created_at", "output"},
+            RESPONSE_FIELDS | PROVIDER_METADATA_FIELDS,
+        )
+    except (ProtocolError, ValueError, TypeError):
+        raise ProviderResponseError("response_fields") from None
+    try:
+        _require(response.get("background") in (None, False))
+        if response.get("background") is not None:
+            _require(type(response["background"]) is bool)
+        if response.get("completed_at") is not None:
+            _int(response["completed_at"])
+        if response.get("max_tool_calls") is not None:
+            _int(response["max_tool_calls"], 1, 4096)
+        if response.get("service_tier") is not None:
+            _require(type(response["service_tier"]) is str)
+            _require(
+                response["service_tier"]
+                in {"auto", "default", "flex", "scale", "priority", "fast"}
+            )
+        if response.get("prompt_cache_key") is not None:
+            _uuid(response["prompt_cache_key"])
+        if response.get("prompt_cache_retention") is not None:
+            _require(type(response["prompt_cache_retention"]) is str)
+            _require(
+                response["prompt_cache_retention"] in {"in_memory", "in-memory", "24h"}
+            )
+        if response.get("safety_identifier") is not None:
+            _string(response["safety_identifier"], 128)
+        if response.get("top_logprobs") is not None:
+            _int(response["top_logprobs"], 0, 20)
+        for field in ("prompt", "conversation", "context_management"):
+            _require(response.get(field) is None)
+    except (ProtocolError, ValueError, TypeError):
+        raise ProviderResponseError("response_metadata") from None
+    projected = {
+        key: value for key, value in response.items() if key in RESPONSE_FIELDS
+    }
+    try:
+        return validate_response(projected)
+    except ProtocolError:
+        raise ProviderResponseError("response_schema") from None
 
 
 def _envelope(value: dict, kind: str, identity: dict | None = None):

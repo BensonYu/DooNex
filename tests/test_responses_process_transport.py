@@ -139,7 +139,15 @@ def loopback_server():
                             b'{"error":{"message":"private synthetic provider detail"}}'
                         )
                     else:
-                        self.wfile.write(json.dumps(_response()).encode())
+                        body = _response()
+                        if mode == "metadata":
+                            body.update(
+                                service_tier="default",
+                                background=False,
+                                completed_at=2,
+                                prompt_cache_retention="in_memory",
+                            )
+                        self.wfile.write(json.dumps(body).encode())
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
@@ -440,8 +448,9 @@ def _assert_request_once(request, state):
     assert _SYNTHETIC_KEY not in json.dumps(state.records)
 
 
-def test_fixed_child_finish_reasoning_usage_cost_and_real_reap(prepared):
-    request, state, observer, hooks = prepared("success")
+@pytest.mark.parametrize("mode", ["success", "metadata"])
+def test_fixed_child_finish_reasoning_usage_cost_and_real_reap(prepared, mode):
+    request, state, observer, hooks = prepared(mode)
     terminal = process.run_helper(request, hooks.hooks())
     _assert_request_once(request, state)
     assert terminal.envelope["kind"] == "result" and terminal.reap["exit_code"] == 0
@@ -457,6 +466,9 @@ def test_fixed_child_finish_reasoning_usage_cost_and_real_reap(prepared):
         "additional_headers": {transport.COST_HEADER: "0.125"}
     }
     assert _SYNTHETIC_KEY not in json.dumps(terminal.envelope)
+    assert not (
+        terminal.envelope["response"].keys() & protocol.PROVIDER_METADATA_FIELDS
+    )
 
     from openhands.sdk.llm import Message
     from openhands.sdk.llm.utils.metrics import Metrics
