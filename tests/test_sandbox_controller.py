@@ -200,7 +200,7 @@ def run(fake, **scenario):
     )
 
 
-def supervisor(controller):
+def supervisor(controller, *, deadline=None):
     operation = controller.registry.reserve(
         "sandbox_execute",
         scope=co.scope(
@@ -208,7 +208,11 @@ def supervisor(controller):
             container_name="doonex-fixture",
             run_label="doonex.run_id=" + str(uuid4()),
         ),
-        deadline_monotonic_ns=time.monotonic_ns() + 10_000_000_000,
+        deadline_monotonic_ns=(
+            time.monotonic_ns() + 10_000_000_000
+            if deadline is None
+            else int(deadline * 1_000_000_000)
+        ),
         run_id=str(uuid4()),
         project_id=None,
         parent_action_id=None,
@@ -216,7 +220,9 @@ def supervisor(controller):
         cleanup_allowance_seconds=15,
     )
     capability = operation.launch()
-    return operation, _Supervisor(_evidence(), _Cleanup(), capability=capability)
+    return operation, _Supervisor(
+        _evidence(), _Cleanup(business_deadline=deadline), capability=capability
+    )
 
 
 def test_execute_group_binds_every_real_process_before_launch_and_exact_targets(fake):
@@ -407,11 +413,40 @@ def test_invalid_create_ack_cannot_clear_group_with_empty_final_ps(fake, ack):
 @pytest.mark.parametrize(
     "output", ["short\n", "a" * 64 + "\n" + "a" * 64 + "\n", "x" * 5000]
 )
-def test_probe_records_unknown_on_malformed_or_incomplete_ps(fake, output):
-    with pytest.raises(SandboxError) as error:
+def test_probe_records_unknown_on_malformed_or_incomplete_ps(fake, output, monkeypatch):
+    # Give the one probe a finite admission/startup allowance. The output fault,
+    # rather than a pre-parser timeout, must explain the preserved unknown.
+    monkeypatch.setattr(implementation, "CLEANUP_SECONDS", 3)
+    deadlines = observe_process_deadlines(monkeypatch)
+    expected = (
+        "output_limit"
+        if len(output) > implementation.MAX_CONTAINER_IDS * 65
+        else "incomplete or malformed"
+    )
+    entered = time.monotonic()
+    with pytest.raises(SandboxError, match=expected) as error:
         fake.configure(ps_output=output).containers(fake.run_id, **fake.binding)
+    returned = time.monotonic()
     assert error.value.cleanup_unknown
-    assert fake.controller.operations[0].record["state"] == "unknown"
+    assert [item["operation"] for item in commands(fake)] == ["ps"]
+    assert [phase for phase, _ in deadlines] == ["ps"]
+    deadline = deadlines[0][1]
+    assert entered + 3 <= deadline <= returned + 3
+    assert returned < deadline + 0.3
+    record = fake.controller.operations[0].record
+    assert record["state"] == "unknown"
+    assert record["business_deadline_monotonic_ns"] == int(deadline * 1e9)
+    assert len(record["processes"]) == 1
+    receipt = record["processes"][0]
+    assert receipt["phase"] == "docker_ps" and receipt["pid"]
+    assert receipt["reaped"] and receipt["pipe_eof"]
+    process = error.value.cleanup_evidence["processes"][0]
+    assert process["pid"] == receipt["pid"]
+    if expected == "output_limit":
+        assert process["reason"] == "output_limit" and process["truncated"]
+    else:
+        assert receipt["exit_code"] == 0 and process["reason"] is None
+    assert_reaped_and_eof(error.value.cleanup_evidence)
 
 
 def test_probe_can_finish_with_exact_observed_nonempty_list(fake):
@@ -531,43 +566,113 @@ def test_process_cannot_spoof_receipt_target_or_docker_phase(
     assert service.capability._processes == []
 
 
-def test_create_ack_timeout_retains_daemon_unknown_after_complete_empty_ps(fake):
-    sandbox = fake.configure(create_delay=2)
-    result = sandbox.run(fake.workspace, "true", 0.6, fake.run_id, **fake.binding)
+def test_create_ack_timeout_retains_daemon_unknown_after_complete_empty_ps(
+    fake, monkeypatch
+):
+    # The original entry deadline includes mount/create startup. Require the
+    # actual create side effect before treating this as a lost-ACK scenario.
+    deadlines = observe_process_deadlines(monkeypatch)
+    sandbox = fake.configure(create_delay=30)
+    side_effect_seen = []
+
+    def observe_create():
+        if not side_effect_seen and (fake.control / "create-side-effect").exists():
+            side_effect_seen.append(time.monotonic())
+        return False
+
+    entered = time.monotonic()
+    result = sandbox.run(
+        fake.workspace, "true", 3, fake.run_id, observe_create, **fake.binding
+    )
+    returned = time.monotonic()
     assert result["timed_out"] and result["cleanup_unknown"]
     assert result["cleanup_evidence"]["daemon_request_unknown"]
     assert result["cleanup_evidence"]["container_snapshot_absence_confirmed"]
     record = fake.controller.operations[0].record
     assert record["state"] == "unknown" and record["reason"] == "daemon_unknown"
+    business = [
+        (phase, at)
+        for phase, at in deadlines
+        if phase in {"mount_validation", "create"}
+    ]
+    assert [phase for phase, _ in business] == ["mount_validation", "create"]
+    assert len({at for _, at in business}) == 1
+    deadline = business[0][1]
+    assert entered + 3 <= deadline < returned
+    assert len(side_effect_seen) == 1 and side_effect_seen[0] < deadline
+    assert record["business_deadline_monotonic_ns"] == int(deadline * 1e9)
+    assert returned < deadline + 0.5 + 0.3
+    assert (fake.control / "create-side-effect").read_text() == record["scope"][
+        "container_name"
+    ]
+    assert [item["operation"] for item in commands(fake)] == ["create", "rm", "ps"]
+    create = next(
+        item for item in record["processes"] if item["phase"] == "docker_create"
+    )
+    assert create["pid"] and create["exit_code"] == -signal.SIGKILL
+    assert create["reaped"] and create["pipe_eof"]
+    assert (
+        next(
+            item
+            for item in result["cleanup_evidence"]["processes"]
+            if item["operation"] == "create"
+        )["reason"]
+        == "timeout"
+    )
     assert all(item["reaped"] and item["pipe_eof"] for item in record["processes"])
+    assert_reaped_and_eof(result["cleanup_evidence"])
 
 
 def test_actual_escaped_inherited_pipe_never_counts_as_eof(
     controller, monkeypatch, tmp_path
 ):
-    operation, service = supervisor(controller)
+    entered = time.monotonic()
+    deadline = entered + 3
+    operation, service = supervisor(controller, deadline=deadline)
     monkeypatch.setattr(implementation, "CLEANUP_SECONDS", 0.2)
     pid_file = tmp_path / "escaped.pid"
+    leader_file = tmp_path / "leader-exit"
+    child_seen = []
+
+    def observe_child():
+        if not child_seen and pid_file.exists() and leader_file.exists():
+            child_seen.append(time.monotonic())
+        return False
+
     script = (
         "import os,time,pathlib; pid=os.fork(); "
         "\nif pid==0:\n os.setsid(); "
         f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
         "time.sleep(30); os._exit(0)\n"
+        f"else:\n pathlib.Path({str(leader_file)!r}).write_text(str(os.getpid()))\n"
     )
     try:
         result = service.process(
             [sys.executable, "-c", script],
-            deadline=time.monotonic() + 0.15,
+            deadline=deadline,
             operation="mount_validation",
             maximum=1024,
             capability=service.capability,
+            should_stop=observe_child,
         )
-        assert result.reason == "timeout"
+        returned = time.monotonic()
+        assert result.reason == "timeout" and result.returncode == 0
+        assert pid_file.exists()
+        assert len(child_seen) == 1 and child_seen[0] < deadline
         receipt = service.capability._processes[0]
+        assert receipt["phase"] == "mount_validation" and receipt["pid"]
+        assert leader_file.read_text() == str(receipt["pid"])
+        assert receipt["exit_code"] == 0
         assert receipt["reaped"] and not receipt["pipe_eof"]
+        with pytest.raises(ChildProcessError):
+            os.waitpid(receipt["pid"], os.WNOHANG)
+        assert service.cleanup.deadline == deadline + 0.2
+        assert returned < deadline + 0.2 + 0.3
         assert service.evidence["local_process_unknown"]
         implementation._settle(operation, service, reason="deadline")
         assert operation.record["state"] == "unknown"
+        assert operation.record["business_deadline_monotonic_ns"] == int(deadline * 1e9)
+        assert operation.record["processes"] == [receipt]
         assert operation.record["processes"][0]["pipe_eof"] is False
     finally:
         if pid_file.exists():
@@ -642,15 +747,55 @@ def test_complete_failed_mount_group_is_terminal_failed_after_final_ps(fake):
     assert [item["operation"] for item in commands(fake)] == ["ps"]
 
 
-def test_cleanup_deadline_cannot_refresh_across_child_calls(fake):
+def test_cleanup_deadline_cannot_refresh_across_child_calls(fake, monkeypatch):
     (fake.control / "container").write_text("existing")
+    # One initial allowance covers admission, the actual first ps, a stalled rm
+    # and the final stalled ps. Each fault must occur under that same deadline.
+    monkeypatch.setattr(implementation, "CLEANUP_SECONDS", 3)
+    original = implementation._Supervisor.process
+    deadlines, results = [], []
+
+    def observed(self, arguments, **options):
+        deadlines.append((options["operation"], options["deadline"]))
+        result = original(self, arguments, **options)
+        results.append(result)
+        if len(results) == 1:
+            assert options["operation"] == "ps" and result.returncode == 0
+            assert result.reason is None
+            # The initial listing must complete before the final-ps fault is
+            # enabled; otherwise an early ps timeout would skip rm entirely.
+            path = fake.control / "scenario.json"
+            scenario = json.loads(path.read_text())
+            scenario["ps_delay"] = 30
+            path.write_text(json.dumps(scenario))
+        return result
+
+    monkeypatch.setattr(implementation._Supervisor, "process", observed)
     started = time.monotonic()
-    result = fake.configure(ps_delay=0.2, rm_delay=2).stop_run(
+    result = fake.configure(ps_delay=0.2, rm_delay=30).stop_run(
         fake.run_id, **fake.binding
     )
-    assert time.monotonic() - started < 1.2
+    returned = time.monotonic()
+    assert [phase for phase, _ in deadlines] == ["ps", "rm", "ps"]
+    assert len({deadline for _, deadline in deadlines}) == 1
+    deadline = deadlines[0][1]
+    assert started + 3 <= deadline <= returned + 3
+    assert returned < deadline + 0.3
+    assert [item["operation"] for item in commands(fake)] == ["ps", "rm", "ps"]
+    assert all(item["at"] < deadline for item in commands(fake))
+    assert [item.reason for item in results] == [None, "timeout", "timeout"]
+    assert not (fake.control / "container").exists()
     assert result["cleanup_unknown"]
-    assert fake.controller.operations[0].record["state"] == "unknown"
+    record = fake.controller.operations[0].record
+    assert record["state"] == "unknown"
+    assert record["business_deadline_monotonic_ns"] == int(deadline * 1e9)
+    assert [item["phase"] for item in record["processes"]] == [
+        "docker_ps",
+        "docker_rm",
+        "docker_ps",
+    ]
+    assert all(item["pid"] for item in record["processes"])
+    assert_reaped_and_eof(result["cleanup_evidence"])
 
 
 def test_repair_cannot_change_run_or_project_scope(fake):
@@ -789,7 +934,20 @@ def test_pg_database_wait_expiry_at_production_leaf_starts_zero_processes(
     from doonex.store import dispatch_lock
 
     fixture = pg_sandbox
-    deadline = time.monotonic() + 1
+    # Keep the original one-second deadline, but advance a module-local paired
+    # clock only after the real PostgreSQL gate returns. Slow admission must not
+    # stand in for the intended post-database deadline check. This is a phase
+    # contract, not a one-second wall-clock latency claim.
+    clock = [time.monotonic()]
+    deadline = clock[0] + 1
+    monkeypatch.setattr(
+        implementation,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock[0], sleep=time.sleep),
+    )
+    monkeypatch.setattr(
+        co, "time", SimpleNamespace(monotonic_ns=lambda: int(clock[0] * 1e9))
+    )
     operation = implementation._reserve(
         "sandbox_execute",
         run_id=fixture.run_id,
@@ -805,6 +963,20 @@ def test_pg_database_wait_expiry_at_production_leaf_starts_zero_processes(
         capability=implementation._launch(operation, evidence),
     )
     held, release, failures = threading.Event(), threading.Event(), []
+    gate_entries = []
+    original_locked = operation._locked
+    timer = threading.Timer(0.15, release.set)
+
+    def waited(connection):
+        assert held.is_set() and not release.is_set()
+        assert clock[0] < deadline
+        gate_entries.append(clock[0])
+        timer.start()
+        record = original_locked(connection)
+        assert release.is_set()
+        assert record["business_deadline_monotonic_ns"] == int(deadline * 1e9)
+        clock[0] = deadline + 0.01
+        return record
 
     def lock():
         try:
@@ -818,8 +990,7 @@ def test_pg_database_wait_expiry_at_production_leaf_starts_zero_processes(
     holder = threading.Thread(target=lock)
     holder.start()
     assert held.wait(timeout=5)
-    timer = threading.Timer(max(0, deadline - time.monotonic() + 0.15), release.set)
-    timer.start()
+    monkeypatch.setattr(operation, "_locked", waited)
     monkeypatch.setattr(
         subprocess,
         "Popen",
@@ -839,9 +1010,14 @@ def test_pg_database_wait_expiry_at_production_leaf_starts_zero_processes(
         timer.cancel()
         holder.join(timeout=5)
     assert not holder.is_alive() and not failures
+    assert len(gate_entries) == 1 and gate_entries[0] < deadline < clock[0]
+    monkeypatch.setattr(operation, "_locked", original_locked)
     assert service.capability._processes == []
     implementation._settle(operation, service, reason="deadline")
-    assert pg_records(fixture)[0]["state"] == "unknown" and pg_fenced(fixture)
+    record = pg_records(fixture)[0]
+    assert record["state"] == "unknown" and pg_fenced(fixture)
+    assert record["business_deadline_monotonic_ns"] == int(deadline * 1e9)
+    assert record["attempted_processes"] == 0 and record["processes"] == []
 
 
 @pytest.mark.postgres
