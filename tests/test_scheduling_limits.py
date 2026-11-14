@@ -110,7 +110,9 @@ def test_background_claim_expiry_rolls_back_original_grant_and_allocation(
     )
     monkeypatch.setattr("doonex.deadline.time.monotonic", lambda: clock[0])
     assert Scheduler(settings, store).claim_next(deadline=101.0) is None
-    assert observed == ([101.0] if stage == "metadata" else [None])
+    # Both metadata and allocation accounting now consume the caller's same
+    # preparation deadline; neither may start a fresh allowance.
+    assert observed == [101.0]
     saved = background.get(grant["id"])
     assert saved["state"] == "enabled" and saved["evaluation_id"] is None
     assert saved["input"] == grant["input"] and saved["snapshot"] == grant["snapshot"]
