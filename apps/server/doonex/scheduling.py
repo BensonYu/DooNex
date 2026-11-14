@@ -60,11 +60,19 @@ class Scheduler:
         self._authorization_cursor = None
         self._maintenance_cursor = None
 
-    def preflight(self, connection, run, *, yield_foreground=True):
-        """Caller holds dispatch lock, then Run/batch locks, never external I/O."""
+    def preflight(
+        self, connection, run, *, yield_foreground=True, deadline: float | None = None
+    ):
+        """Recheck under dispatch/Run/batch locks using one cooperative deadline.
+
+        Background metadata still reads local profiles, credentials and controller
+        hashes. Checks after those reads and database waits prevent later admission;
+        they cannot interrupt a blocked filesystem or database operation.
+        """
         from doonex.background import BackgroundStopped
         from doonex.sdk import SchedulerYield
 
+        check_deadline(deadline)
         if cleanup_intent_unresolved(run):
             raise BatchHalt(
                 "原清理意图尚未核实；禁止派发",
@@ -74,17 +82,25 @@ class Scheduler:
         if not binding:
             return
         evaluation_id = run["request"]["arena"]["evaluation_id"]
-        if execution_fenced(connection):
+        fenced = execution_fenced(connection)
+        check_deadline(deadline)
+        if fenced:
             raise BatchHalt(
                 "存在未核查的容器或模型传输进程；禁止后台派发", evaluation_id
             )
         try:
             self.background.preflight(
-                connection, binding["authorization_id"], evaluation_id
+                connection,
+                binding["authorization_id"],
+                evaluation_id,
+                deadline=deadline,
             )
         except BackgroundStopped as error:
             raise BatchHalt(str(error), evaluation_id) from None
-        if yield_foreground and foreground_waiting(connection):
+        check_deadline(deadline)
+        waiting = yield_foreground and foreground_waiting(connection)
+        check_deadline(deadline)
+        if waiting:
             raise SchedulerYield("前台任务等待；已停止新后台派发")
 
     def should_yield(self, run_id):
@@ -317,42 +333,66 @@ class Scheduler:
             self.background.dispatch_status(authorization["id"], "blocked", reason)
             return None
 
-    def maintain(self):
-        """At most one reserved candidate; Worker.run currently calls this twice."""
+    def maintain(self, *, deadline: float | None = None):
+        """Inspect one candidate under a single finite preparation allowance."""
         from doonex.arena import Arena
         from doonex.background import TERMINAL_BATCHES, BackgroundStopped
 
+        check_deadline(deadline)
+        limit = time.monotonic() + PREPARATION_SECONDS
+        deadline = limit if deadline is None else min(limit, deadline)
+        check_deadline(deadline)
         identifier = self.background.next_reserved(self._maintenance_cursor)
+        check_deadline(deadline)
         if identifier is None and self._maintenance_cursor is not None:
             self._maintenance_cursor = None
             identifier = self.background.next_reserved()
+            check_deadline(deadline)
         if identifier is None:
             return
         # Advance even when this allocation must retain unknown reservations.
         self._maintenance_cursor = identifier
         with self.store.connect() as c:
-            batch = self.background.maintenance_batch(c, identifier)
+            check_deadline(deadline)
+            batch = self.background.maintenance_batch(c, identifier, deadline=deadline)
+            check_deadline(deadline)
         if batch is None:
             return
-        arena = Arena(self.settings, self.store)
+        arena = Arena(self.settings, self.store, deadline=deadline)
         if batch["state"] in {"queued", "running", "interrupted"}:
             try:
                 with self.store.connect() as c:
+                    check_deadline(deadline)
                     dispatch_lock(c)
-                    current = self.background.maintenance_batch(c, identifier)
+                    check_deadline(deadline)
+                    current = self.background.maintenance_batch(
+                        c, identifier, deadline=deadline
+                    )
                     if current is None:
                         return
                     self.background.preflight(
-                        c, current["background"]["authorization_id"], current["id"]
+                        c,
+                        current["background"]["authorization_id"],
+                        current["id"],
+                        deadline=deadline,
                     )
+                    check_deadline(deadline)
             except BackgroundStopped as error:
+                check_deadline(deadline)
                 arena.stop(batch["id"], "cancelling", str(error))
+                check_deadline(deadline)
         # A stop can have just made this parent terminal. Recheck its binding
         # under the parent lock before the original day/allocation settlement.
         with self.store.connect() as c:
-            current = self.background.maintenance_batch(c, identifier, lock=True)
+            check_deadline(deadline)
+            current = self.background.maintenance_batch(
+                c, identifier, lock=True, deadline=deadline
+            )
+            check_deadline(deadline)
             if current is not None and current["state"] in TERMINAL_BATCHES:
                 self.background.settle(c, current["id"], current)
+                # An expired settlement is rolled back by this original transaction.
+                check_deadline(deadline)
 
 
 def install_background_routes(app, settings, store, auth):

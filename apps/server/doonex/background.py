@@ -238,17 +238,21 @@ class Background:
             ).fetchone()
         return str(row["id"]) if row else None
 
-    def maintenance_batch(self, connection, allocation_id, *, lock=False):
+    def maintenance_batch(
+        self, connection, allocation_id, *, lock=False, deadline: float | None = None
+    ):
         """Recheck column/payload ownership without hiding a corrupt candidate.
 
         Terminal settlement callers lock the parent before day/allocation locks.
         This read never takes an authorization or child Run write lock.
         """
+        check_deadline(deadline)
         row = connection.execute(
             "SELECT id,authorization_id,evaluation_id,day,state,data "
             "FROM background_allocations WHERE id=%s",
             (_identifier(allocation_id),),
         ).fetchone()
+        check_deadline(deadline)
         if row and row["state"] == "settled":
             return None  # A concurrent explicit settlement already handled it.
         try:
@@ -273,10 +277,12 @@ class Background:
                 + (" FOR UPDATE" if lock else ""),
                 (evaluation_id,),
             ).fetchone()
+            check_deadline(deadline)
             grant = connection.execute(
                 "SELECT id,state,data FROM background_authorizations WHERE id=%s",
                 (authorization_id,),
             ).fetchone()
+            check_deadline(deadline)
             expected = {
                 "authorization_id": authorization_id,
                 "date": day,
@@ -299,6 +305,7 @@ class Background:
             raise BackgroundConflict(
                 "后台维护的分配、批次或授权关联无效；保留预留"
             ) from None
+        check_deadline(deadline)
         return parent["data"]
 
     def day(self, value, connection=None, *, lock=False):
@@ -349,6 +356,7 @@ class Background:
                 "SELECT data FROM library_versions WHERE kind='skill' AND id=%s FOR SHARE",
                 (identifier,),
             ).fetchone()
+            check_deadline(deadline)
             if not record or record["data"].get("review_status") != "approved":
                 raise BackgroundStopped("后台候选必须已经审核批准")
             record = record["data"]
@@ -750,12 +758,22 @@ class Background:
         self._save(connection, value, "attached", evaluation_id=identifier)
         return batch
 
-    def preflight(self, connection, authorization_id, evaluation_id):
+    def preflight(
+        self,
+        connection,
+        authorization_id,
+        evaluation_id,
+        *,
+        deadline: float | None = None,
+    ):
         # A row-share lock serializes revocation with an admitted dispatch intent.
+        # Metadata includes local profile/credential reads and controller hashes.
+        check_deadline(deadline)
         row = connection.execute(
             "SELECT data FROM background_authorizations WHERE id=%s FOR SHARE",
             (_identifier(authorization_id),),
         ).fetchone()
+        check_deadline(deadline)
         if not row:
             raise BackgroundStopped("后台授权不存在")
         value = row["data"]
@@ -764,11 +782,13 @@ class Background:
         ):
             raise BackgroundStopped("后台授权已撤销或批次关联无效")
         self._window(value)
-        self._unchanged(value, connection, inspect_contents=False)
+        self._unchanged(value, connection, inspect_contents=False, deadline=deadline)
+        check_deadline(deadline)
         allocation = connection.execute(
             "SELECT state,data FROM background_allocations WHERE authorization_id=%s AND evaluation_id=%s",
             (value["id"], evaluation_id),
         ).fetchone()
+        check_deadline(deadline)
         if not allocation or allocation["state"] != "reserved":
             raise BackgroundStopped("后台日额度预留无效或已经结算")
         duration = (
@@ -779,11 +799,13 @@ class Background:
                 "后台分配累计时长已达上限或时钟倒退；排队和让出不延长日预留"
             )
         ledger = self.day(value["date"], connection, lock=True)
+        check_deadline(deadline)
         if ledger["budget"] != value["input"]["daily_budget"]:
             raise BackgroundStopped("后台日预算绑定已变化")
         # Existing allocations need no second reservation, but overrun in another
         # batch cannot make an already admitted grant dispatch beyond the day cap.
         self._capacity(ledger, _empty_usage())
+        check_deadline(deadline)
         return value
 
     def settle(self, connection, evaluation_id, batch=None):
