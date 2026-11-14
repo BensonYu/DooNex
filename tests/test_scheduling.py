@@ -4,11 +4,13 @@ import json
 import threading
 from datetime import UTC, datetime, timedelta
 
+import controller_test_support
 import pytest
 from doonex.api import create_app
 from doonex.arena import Arena
 from doonex.background import Background
 from doonex.budget import Ledger
+from doonex.cleanup import sandbox_context
 from doonex.config import Settings
 from doonex.sandbox import Sandbox
 from doonex.scheduling import Scheduler
@@ -20,11 +22,12 @@ from test_tasksets import taskset_source as taskset_fixture
 from test_worker import response
 
 taskset_source = taskset_fixture
+controller_registry = controller_test_support.controller_registry
 pytestmark = pytest.mark.postgres
 
 
 @pytest.fixture
-def tuning(settings, store, taskset_source, tmp_path):
+def tuning(settings, store, taskset_source, tmp_path, controller_registry):
     settings = Settings(
         settings.home,
         settings.database_url,
@@ -381,11 +384,34 @@ def test_residual_container_blocks_foreground_even_when_background_is_yielded(
     settings, _, _, batch = claimed(tuning, store)
     run_id = batch["attempts"][0]["run_id"]
     with store.locked(run_id) as (_, current):
-        current.update(state="yielded", first_started_at=now())
+        current.update(
+            state="yielded", first_started_at=now(), owner="scheduling-yield-test-owner"
+        )
     user = foreground(store, request_data)
-    monkeypatch.setattr(Sandbox, "containers", lambda *_: ["unknown-container"])
+    probes = []
+
+    def containers(
+        self,
+        identifier,
+        *,
+        deadline=None,
+        project_id,
+        parent_action_id,
+        expected_run_owner,
+    ):
+        assert identifier == run_id
+        assert {
+            "project_id": project_id,
+            "parent_action_id": parent_action_id,
+            "expected_run_owner": expected_run_owner,
+        } == sandbox_context(store.get(identifier))
+        probes.append(identifier)
+        return ["unknown-container"]
+
+    monkeypatch.setattr(Sandbox, "containers", containers)
     with pytest.raises(RuntimeError, match="残留或未知容器"):
         Worker(settings).run(once=True)
+    assert probes == [run_id]
     assert store.get(user["id"])["state"] == "queued"
     assert store.get(run_id)["state"] == "interrupted"
 
@@ -397,11 +423,39 @@ def test_cleanup_error_never_becomes_safe_yield(
     settings, _, _, batch = claimed(tuning, store)
     run_id = batch["attempts"][0]["run_id"]
     user = []
+    cleanup_calls = []
 
     def transport(*args, **kwargs):
         return response("doonex_shell", {"command": "true"}, 0)
 
-    def shell(*args, **kwargs):
+    def shell(
+        self,
+        path,
+        command,
+        timeout,
+        identifier,
+        should_stop=lambda: False,
+        *,
+        read_only=False,
+        skill_path=None,
+        verifier_path=None,
+        deadline=None,
+        project_id,
+        parent_action_id,
+        expected_run_owner,
+    ):
+        assert identifier == run_id
+        assert {
+            "project_id": project_id,
+            "parent_action_id": parent_action_id,
+            "expected_run_owner": expected_run_owner,
+        } == sandbox_context(store.get(identifier), parent_action_id=parent_action_id)
+        assert parent_action_id is not None
+        with store.connect() as connection:
+            action = connection.execute(
+                "SELECT run_id,status FROM actions WHERE id=%s", (parent_action_id,)
+            ).fetchone()
+        assert str(action["run_id"]) == identifier and action["status"] == "pending"
         user.append(foreground(store, request_data))
         return {
             "exit_code": 0,
@@ -409,15 +463,30 @@ def test_cleanup_error_never_becomes_safe_yield(
             "cleanup_error": "synthetic cleanup failure",
         }
 
+    def stop_run(
+        self,
+        identifier,
+        *,
+        project_id,
+        parent_action_id,
+        expected_run_owner,
+        repair_of=None,
+    ):
+        assert identifier == run_id and repair_of is None
+        assert {
+            "project_id": project_id,
+            "parent_action_id": parent_action_id,
+            "expected_run_owner": expected_run_owner,
+        } == sandbox_context(store.get(identifier))
+        cleanup_calls.append(identifier)
+        return {"remaining": ["unknown"], "errors": ["synthetic"], "stopped": []}
+
     monkeypatch.setattr(GuardedLLM, "_transport_call", transport)
     monkeypatch.setattr(Sandbox, "run", shell)
-    monkeypatch.setattr(
-        Sandbox,
-        "stop_run",
-        lambda *_: {"remaining": ["unknown"], "errors": ["synthetic"], "stopped": []},
-    )
+    monkeypatch.setattr(Sandbox, "stop_run", stop_run)
     Worker(settings).run(once=True)
     result = store.get(run_id)
+    assert cleanup_calls == [run_id]
     assert result["state"] == "interrupted"
     assert not result.get("scheduling")
     assert any(

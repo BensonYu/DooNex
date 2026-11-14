@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from threading import Barrier
 from uuid import uuid4
 
+import controller_test_support
 import pytest
 from doonex.background import (
     BACKGROUND_SCHEMA,
@@ -21,12 +22,13 @@ from psycopg.types.json import Jsonb
 from test_tasksets import taskset_source as source_fixture
 
 taskset_source = source_fixture
+controller_registry = controller_test_support.controller_registry
 
 pytestmark = pytest.mark.postgres
 
 
 @pytest.fixture
-def background(settings, store, taskset_source, tmp_path):
+def background(settings, store, taskset_source, tmp_path, controller_registry):
     with store.connect() as c:
         c.execute(BACKGROUND_SCHEMA)
     source, spec, _, _, _ = taskset_source
