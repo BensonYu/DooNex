@@ -645,7 +645,7 @@ def test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore(
     assert len(paused["scheduling"]["receipt"]["pending_actions"]) == 2
     evaluation_id = paused["request"]["arena"]["evaluation_id"]
     parent_before = _accounting(store, evaluation_id)
-    reads, receipts, closes, sessions = [], [], [], []
+    reads, receipts, closes, close_calls, sessions = [], [], [], [], []
     original_read = SessionFileStore._read_fd
     original_receipt = sdk._SchedulingRuntime.receipt
     original_close = sdk._M1Conversation.close
@@ -663,8 +663,15 @@ def test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore(
         return value
 
     def close(conversation):
+        already_complete = conversation._cleanup_complete
         value = original_close(conversation)
-        closes.append(conversation.state.agent.doonex_run_id)
+        identifier = conversation.state.agent.doonex_run_id
+        assert conversation._cleanup_complete
+        close_calls.append({"run_id": identifier, "already_complete": already_complete})
+        # The SDK finish path closes natively; run_session's finally closes
+        # again idempotently. Count real first cleanup while recording both.
+        if not already_complete:
+            closes.append(identifier)
         return value
 
     def session(**kwargs):
@@ -751,6 +758,7 @@ def test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore(
                 "cold_final_directory_entries": final_entries,
                 "cold_startup_foreground_wait": cold_startup,
                 "cold_foreground_wait": cold_wait,
+                "native_close_calls": close_calls,
                 "original_usage_and_parent_ledgers_preserved": True,
                 "additional_model_calls": 0,
                 "transport": "synthetic",
