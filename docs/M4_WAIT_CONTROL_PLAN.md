@@ -14,22 +14,24 @@ helper 的启动、传输和 IPC 使用一个绝对 monotonic deadline；所有�
 | --- | --- | --- |
 | 原子 helper 预留 | `83fe6d0` 同一预算事务保存完整 reserved 身份；CAS、永久 lease inode、期限只收紧；生产 v2 索引定义核对通过 | 新动作消除 reserve/register 缺记录窗口；旧缺记录不补造身份，仍全局阻止；unknown 不返还 |
 | 有限数据库维护 | `98f0885` 每 maintain 最多一个重维护单位，worker 每循环两次；enabled 授权稳定 keyset，启动 Arena 状态筛选；10 个实际索引定义核对通过 | 原 100,000 Run/Action 及各 10,000 Arena/授权/分配的查询计划是规模样本，不是完整延迟保证；claimed_at 到实际结算仍保守计时 |
-| SDK 会话容量 | `42688c7` 正式 FileStore、构造前完整有限 inventory、故障锁存、序列化源与工具 fanout 限额、partial-write 证据、close finally | 合同和实际 SDK 故障检查见[容量记录](M4_SESSION_CAPACITY.md)；worker 尚未传入整链共同 persistence deadline |
+| SDK 会话容量 | `42688c7` 正式 FileStore、构造前完整有限 inventory、故障锁存、序列化源与工具 fanout 限额、partial-write 证据、close finally | 合同和实际 SDK 故障检查见[容量记录](M4_SESSION_CAPACITY.md)；worker 已将原 Run 剩余 monotonic deadline 传入 SDK persistence/restore/锁与 isolated helper；其余文件/初始化和调度路径仍未贯通 |
 | 真实隔离传输 | `b462502` 的普通样例和完整后台矩阵均通过，旧响应结构失败保留 | 只证明当前 Mac mini、Sol、网关和固定样例，不泛化到任意模型、容量或故障 |
 
 未知工具结果后的继续派发已修复；摘要计算在动作完成事务外，随后 owner CAS，未观察到可靠结果的动作继续保留未知。全局容器/helper 阻止、归属核查、冻结 Skill/任务集/Review 核验和历史失败不能为降低延迟数字而省略。
 
-## 下一纵向切片：共同期限与容器回收
+## 共同期限与容器回收的当前切片
 
-先从一次 sandbox 入口贯穿挂载验证、create、执行和输出管道，以同一 monotonic deadline 计算每个阶段的剩余时间。业务停止后仍需独立、明确且有限的必要清理期限；不能在每个 Docker 子操作重新取得完整额度，或因 Run 时长已到期而跳过清理。
+已整合有限 Git/export（`d42a8ff`）和 Sandbox（`1140aed`、`cc4d89e`）。父接线为一次 Run 首次时钟映射一个 monotonic 剩余期限，两个角色共用；恢复仍从持久首次时钟计算，不重置预算。SDK 本地持久化、恢复前核验、全局会话锁、canonical hash、shell/verification 及 isolated Responses helper 使用该期限。直接 SDK 模型调用尚未逐次收紧在途 timeout；这些接线不能称完整 Run 等待上界。
 
-限制 Docker CLI stdout/stderr、容器 ID 数与解析工作量；超限和超时不能解释为没有容器。子进程需真实终止、回收并观测 EOF，不能用存活的 daemon reader、遗弃 future 或关闭可能被持锁的 stdout 伪称清理完成。最终完整零残留检查失败、lost ACK、CLI 未回收或状态不明必须保留 unknown 并阻止前台派发。rm 的 ACK 丢失后，只有该 CLI 已实际 reap、管道已观察 EOF、随后完整 run label 查询独立证明零残留，才能消解该容器的不确定；空列表不能消解本机进程或管道未知。
+Sandbox 从 mount/create 入口开始计时，控制输出和容器 ID 有限，单所有者非阻塞 drain，实际 reap 与 EOF 分开核验；必要 cleanup 共用一个独立 15 秒窗口，不因子调用而刷新。最终查询覆盖整个 Run label，不能把命令超时或无输出解释为没有容器。
 
-已接入“观察到未知之后”的持久阻止：异常链或返回结果中的 `local_process_unknown` 合并入 recovery.errors，因此复用原全局阻止索引。重启核查、普通暂停/取消/续接及 Arena 恢复不能覆盖此证据。最多保留 16 份不同未决回执，超限保留 overflow 阻止；最新清理尝试及未决回执分开保存，并写入原 cleanup 事件。当前没有自动解除此类本机进程未知的入口。
+create 子进程已启动却没有正常、严格的 ACK 时，CLI 回收和当前空列表仍不能证明 daemon 请求终止。`daemon_request_unknown` 持久进入 recovery.errors 和全局派发阻止；`container_snapshot_absence_confirmed` 只表示当前查询结果，不等于 `container_absence_confirmed`。rm ACK 丢失则仅在 CLI 已实际 reap/EOF、完整独立查询零残留时可核实容器清理。
 
-这尚未覆盖控制器在子进程启动后、终态回执持久前崩溃的窗口。后续需在 Popen 前持久 logical operation 身份，按同一 owner/operation 的实际 reap/EOF 回执 CAS 结算；已有 shell/verification action 可以复用准入身份，Git/export、mount 和清理探测还需相应登记。普通 unknown→acknowledged、空容器列表或重启不能被当作该证明。此窗口继续阻止宣称完整等待与崩溃恢复验收完成。
+已观察的 `local_process_unknown` 与 `daemon_request_unknown` 沿异常链和返回值合并，普通 pause/cancel/resume、Arena 确认、重启或后续空 ps 均不能清除。独立保留当前 cleanup attempt 与最多 16 份不同未决回执，溢出仍锁存阻止。API/Arena 新探测自身失败也持久记录，不能只抛异常然后遗失其子进程证据。
 
-容器清理移出数据库行锁前须另行冻结 cleanup 身份和持久阻止，外部清理后按 owner/状态 CAS；不得只移动调用并省略 fence。实现优先沿用现有标准库与 Sandbox，不新增服务或通用监管框架。以真实 Docker 正常/故障检查、原账本及首次时钟保留作为切片完成条件。
+**本片仍未覆盖 Popen 后、终态回执持久前控制器崩溃的窗口。** 下一步须在 Popen 前持久 logical operation 身份，按 owner/operation 的真实终态回执 CAS 结算；不能让普通 unknown→acknowledged 清除 process/daemon fence，不能补造 PID 或从空闲 lease 推断未发送。已有 shell/verification action 可作为准入身份；Git/export、mount 和清理探测也须登记。
+
+容器清理目前仍在既有行锁内；移出前须冻结 cleanup 身份、持久阻止及 owner/状态 CAS。组件审查和本机故障检查不替代父整合回归或完整 Worker.run 矩阵，最终收据见[续接记录](M4_RESUMPTION_20261113.md)。
 
 ## 有限文件操作与前台初始化
 

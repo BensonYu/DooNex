@@ -1,6 +1,6 @@
 # M4：2026-11-13 续接记录
 
-日期按纽约时间记录，原始收据使用 UTC；本次真实完整批次发生在 **UTC 2026-11-14**。用户于 2026-11-13 明确恢复开发。本轮从 `6a0a227` 续接，应用源码固定到 `b462502`；原暂停事实见[交接文档](DEVELOPMENT_HANDOFF.md)。旧失败、未知预留和冻结日预算完整保留。
+日期按纽约时间记录，原始收据使用 UTC；本次真实完整批次发生在 **UTC 2026-11-14**。用户于 2026-11-13 明确恢复开发。本轮从 `6a0a227` 续接，真实验收源码固定到 `b462502`；其后继续离线等待控制接线，原暂停事实见[交接文档](DEVELOPMENT_HANDOFF.md)。旧失败、未知预留和冻结日预算完整保留。
 
 ## 整合与环境
 
@@ -50,7 +50,7 @@
 
 [容量合同与专项证据](M4_SESSION_CAPACITY.md)规定 base/单事件各 16 MiB、总量 64 MiB、临时写峰值 80 MiB、最多 1024 个事件和 2048 项，并在解析/序列化/branch 整体分配前限制源形状。正式 FileStore 无缓存，descriptor/no-follow、单链接普通文件和稳定 inode/stat 复核；SDK 吞掉 list/marker 异常也会因故障锁存而拒绝覆盖、后续准入及安全回执。partial write 保留证据；close 异常仍清除全部回调登记。
 
-近容量真实 SDK EventLog 样本为 1024 events / 1027 entries / 63,362,935 bytes；追加约 1.02 秒，冷 inventory 与 SDK 读取约 5.09 秒，canonical 哈希约 0.11 秒。第 1025 事件拒绝且旧事件摘要不变。该样本不是 Worker.run 延迟验收；worker 尚未传入整链共同 persistence deadline。
+近容量真实 SDK EventLog 样本为 1024 events / 1027 entries / 63,362,935 bytes；追加约 1.02 秒，冷 inventory 与 SDK 读取约 5.09 秒，canonical 哈希约 0.11 秒。第 1025 事件拒绝且旧事件摘要不变。该样本不是 Worker.run 延迟验收。后续父接线已将原 Run 的剩余 monotonic deadline 传入 SDK 本地持久化、恢复读取、锁和哈希；其他初始化与调度路径尚未贯通。
 
 ## UTC 2026-11-14 完整后台批次
 
@@ -86,7 +86,28 @@
 
 UTC 2026-11-14 的后续离线切片已建立共同 monotonic deadline 检查基础（`3e88a96`，7 项专项通过），并接入已观察到的本机控制进程未知回执：不再被重启的空容器核查、普通暂停/取消/续接或 Arena 确认覆盖；后台自动续接的 Docker 探测失败也持久阻止。11 项专门检查使用实际 Worker.run、一次性 PostgreSQL 和合成故障，通过且源码输入前后相同；没有真实模型调用。私有 `cleanup-fence-03.json/.log` 保留 7.73 秒、exit 0 和日志 SHA `3a8c6251e26663cb7e1d924b127a86081d6f5e08fc5cf81460b6384792ae1139`。早一轮组合检查 53 项通过；第一轮在检查期间源码变化，`inputs_unchanged=false`，不能充当最终绑定。新增代码尚待后续整合全量，不能沿用 b462502 的 1826 项作为当前源码通过数。
 
-本片只保证已观察回执不丢失；控制器在 Popen 后、回执持久前崩溃的窗口尚未覆盖。期限基础尚未贯穿 SDK、文件和普通/Arena/generation 全链。Sandbox 与有限 Git/export 在独立 worktree 实施和审查中，尚未整合；没有升级服务或改动生产账本。具体剩余合同见[等待计划](M4_WAIT_CONTROL_PLAN.md)。
+有限 Git/export（原 `71c334f` → `d42a8ff`）、Sandbox（原 `d8a3d49` / `b8db9ee` → `1140aed` / `cc4d89e`）现已整合；依赖的 `3e88a96` 没有重复引入。Git 在过滤前最多 20,000 原始条目/16 MiB、路径 4096 bytes/深度 100，再保留 10,000 文件/单 10 MiB/总 100 MiB；导出统一 30 秒局部上限并受外层剩余期限收紧。组件近容量真实导出 104,850,000 bytes 约 2.596 秒，仅为组件样本。
+
+Sandbox 的 mount/create/attach/inspect 使用同一业务期限，控制输出、严格完整 ID 和查询有限；必要 cleanup 共用独立 15 秒，单所有者非阻塞读，实际 reap/EOF 分开核验。create ACK 缺失锁存 daemon 请求未知，当前空 ps 不能代替 daemon 终态。父接线将 daemon-only 与 process-only 未知都持久进入原 global fence；普通恢复和重启不能解除。API/Arena 新探测故障自身也保存，不遗失其控制进程证据。
+
+一次 Run 的剩余 monotonic 期限现已传至 Workspace 初始化/scan/checkpoint、SDK persistence/恢复前读取/锁/canonical hash、shell/verifier 与 isolated Responses helper；两个角色共用，恢复仍受原首次持久时钟限制。直接 SDK 模型请求尚未逐次钳制在途 timeout；Skill/Tasksets/Generation、Review/Evidence 和调度 receipt 的接线仍在独立实施。上述能力只覆盖健康本地操作之间的协作检查，不保证阻塞内核/文件系统调用或远端计费终止。
+
+父接线应用提交 `43f6147` 的联合专项实际执行：
+
+```bash
+PYTHONPATH=apps/server:tests .venv/bin/python scripts/test_local.py \
+  tests/test_arena_recovery.py tests/test_cleanup_fences.py \
+  tests/test_execution_deadline.py tests/test_worker_wait_paths.py \
+  tests/test_responses_reservation.py tests/test_responses_worker.py \
+  tests/test_session_store.py tests/test_sdk.py tests/test_sdk_scheduling.py \
+  tests/test_sdk_unknown_tools.py tests/test_sandbox_deadline.py tests/test_workspace.py
+```
+
+**334 passed / 3 warnings / 128.62 秒 / exit 0，无跳过**；外层 132.08 秒。`deadline-integration-03.json/.log` 的输入前后相同，提交绑定收据逐项核对全部非 Markdown 输入与 `43f6147` 一致，日志 SHA `05162d286270dd2d72d99d7b181da2967bb376300a4821f96752a2e6e0be6975`。Ruff 全范围 exit 0。另一次 89 项恢复专项通过；不把不同组件通过数相加当全量。
+
+失败收据保留：`deadline-integration-01` 为 321 passed / 1 failed，原 stop_containers 测试替身缺新 keyword；只适配参数。`full-03` 在定位到旧 verifier 0.1 秒只计执行阶段的假设后中止，**220 passed / 1 failed / exit 2，不是全量通过**。夹具现给予包含真实 mount/create 的 5 秒，并新增日志哨兵证明检查命令确实进入，然后检查超时、历史失败与恢复仍保留；原断言未放宽。最终整合全量仍须在后续内容/证据切片接入后执行，旧 1826 项不适用于新源码。
+
+本片仍只保证已观察回执不丢失；控制器在 Popen 后、回执持久前崩溃的窗口尚未覆盖。没有升级服务、调用真实模型或改动生产账本。具体剩余合同见[等待计划](M4_WAIT_CONTROL_PLAN.md)。
 
 继续按[等待控制计划](M4_WAIT_CONTROL_PLAN.md)实施共同剩余期限、Docker 管道与清理、有限 Git/export/快照/检查复制和普通/Arena/generation 前台初始化，再对同一 monotonic 时钟的实际 Worker.run 做正常、近容量及故障矩阵。文件系统失联、阻塞系统调用、远端请求结束和供应商最终计费不由现有局部限制证明。
 

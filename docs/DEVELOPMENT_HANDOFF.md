@@ -6,7 +6,7 @@
 
 | 对象 | 当前事实 |
 | --- | --- |
-| 开发入口 | `codex/responses-transport`；真实后台验收源码 `b4625026e1e247dedeee8859b8cd5cf36086b040`；其后新增离线控制器终态保护，状态见下文 |
+| 开发入口 | `codex/responses-transport`；真实后台验收源码 `b4625026e1e247dedeee8859b8cd5cf36086b040`；其后离线接线源码 `43f6147`，联合专项 334 项通过，最终全量仍待后续整合；见下文 |
 | 开发目录 | `/Users/benson/.codex/worktrees/doonex-delivery-docs/doonex` |
 | 固定真实验收目录 | `/Users/benson/.codex/worktrees/responses-process-transport-tests/doonex`，detached `b462502`；保持干净，不在此开发 |
 | main | `a965d7faaf83f6f70f22971da21ab5aa03e27257`，M3 已验收版本，尚未推进 |
@@ -35,9 +35,9 @@ PYTHONPATH=apps/server:tests .venv/bin/python -c 'import doonex; print(doonex.__
 - 原子 helper 预留 `51cd8c7` 已整合为 `83fe6d0`；有限数据库维护 `6183ec3` 已整合为 `98f0885`。原 worker 启动过滤补丁已应用。不要重复 cherry-pick，也不要把两片历史组件测试相加作为最终整合数。
 - 新 reserved 身份与预算同事务；永久 inode、CAS、期限只收紧及 v2 索引保留。新动作消除首次登记缺记录窗口，旧 record_missing 仍全局阻止，不能补造身份或从空闲 lease 推断没发送。未知预算不返还。
 - 10 个生产维护索引及 `actions_helper_fenced_v2` 的实际定义和 valid/ready/live 核对通过。数据库维护每次最多一个重单位，worker 每循环两次；规模查询计划不等于完整延迟保证。
-- SDK 会话容量 `42688c7` 已整合，正式 file_store=、无缓存有限 inventory、故障锁存、源形状/事件/fanout 限额和 close finally，详见[容量合同](M4_SESSION_CAPACITY.md)。worker 尚未传入整链共同 persistence deadline。
+- SDK 会话容量 `42688c7` 已整合，正式 file_store=、无缓存有限 inventory、故障锁存、源形状/事件/fanout 限额和 close finally，详见[容量合同](M4_SESSION_CAPACITY.md)。worker 已向 SDK 本地持久化、恢复前核验、哈希和锁传入原 Run 的剩余 monotonic deadline；其余全链接线仍待完成。
 - 严格 Responses 投影在 `b462502` 支持本网关已核验的中性元数据及细分用量；任意字段、非法工具和非零内置工具仍拒绝。无 retry/fallback，不改写 aggregate 用量。
-- 后续离线切片增加共同 monotonic deadline 基础和已观察控制进程未知的持久阻止；11 项实际 Worker.run/一次性 PostgreSQL 合成故障专项通过，没有真实 API 调用。Sandbox/Git/export 切片尚在独立实施。Popen 后、回执持久前崩溃窗口及整链 deadline 仍未完成，不能据此推进 main；具体证据和限制见[续接记录](M4_RESUMPTION_20261113.md#下一步与合并条件)。
+- 后续离线切片已整合有限 Git/export（`d42a8ff`）、Sandbox（`1140aed`、`cc4d89e`）及父接线：共同 Run 剩余期限、SDK 本地读取/哈希/锁、isolated helper，以及 process/daemon 两类未知的持久全局阻止。API/Arena 新探测自身的未知也保存。普通确认、空 ps 和重启均不能清除。Popen 后、回执持久前崩溃窗口及整链 deadline 仍未完成，不能据此推进 main；实际命令、失败和当前检查见[续接记录](M4_RESUMPTION_20261113.md#下一步与合并条件)。
 
 ## 本轮真实验收：全部已经执行，禁止重放
 
@@ -58,9 +58,9 @@ PYTHONPATH=apps/server:tests .venv/bin/python -c 'import doonex; print(doonex.__
 ## 下一步的具体顺序
 
 1. 核对本页最终检查收据及 Git/进程状态。普通 gateway、后台 run_once、所有 prepare/finish/finalize intent 均已消费；不要重跑同一授权、样例或清理脚本。
-2. 按[等待控制计划](M4_WAIT_CONTROL_PLAN.md)实施一个共同期限/容器回收纵向切片：从 mount/create 入口贯穿剩余 monotonic deadline、有限 CLI 输出/ID、单所有者管道 drain、实际 reap/EOF、必要清理独立限时与最终完整零残留核查。无法确认清理就保持 unknown/global fence。
-3. SDK 持久化期限接入时复用同一剩余时钟，不为每阶段重置额度。将 cleanup 移出 Run 锁前必须设计持久 cleanup 身份/fence 和 owner CAS，不能只移动调用或去掉安全核查。
-4. 再完成有限 Git/export/快照/archive/验证复制和普通/Arena/generation 前台初始化。保留冻结输入完整核查，近容量和超限拒绝须实际验证。
+2. 先核对父接线专项和后续最终整合收据。有限 Git/export、Sandbox 与 SDK 持久化期限已整合，不重复 cherry-pick；所有当前回归失败保留，旧 1826 项不代表新源码通过。
+3. 补齐 Popen 前持久 operation 身份、真实终态 CAS 与全局 fence；普通动作 acknowledged 不能解除。将 cleanup 移出 Run 锁前须先有持久身份和 owner 校验，不只移动调用。
+4. 完成 Skill/任务集/Generation、Review/Evidence 及调度 receipt 的共同期限传递、有限 yielded 候选与前台优先；直接 SDK 每次请求 timeout 仍须收紧。两个内容/证据切片正在独立 worktree 实施，未整合前不能记完成。保留冻结输入完整核查，近容量和超限拒绝须实际验证。
 5. 用真实 Worker.run、一次性 PostgreSQL、真实 Docker、本地 synthetic provider，在同一 monotonic 时间线覆盖正常/近容量/故障及启动恢复；记录前台入队提交区间到首次准入 commit。明确容量、队列和健康依赖后才给出数值操作目标。
 6. 最终整合验证及 M4 剩余退出条件通过后推进 main，再考虑常驻服务的固定源码升级和回退收据。公开上线、收费和许可证仍单独确认。
 
@@ -68,7 +68,9 @@ PYTHONPATH=apps/server:tests .venv/bin/python -c 'import doonex; print(doonex.__
 
 ## 检查与私有证据
 
-`b462502` 最终全量 **1826 passed / 3 warnings / 905.09 秒 / exit 0，无跳过**；138 份非 Markdown 输入前后相同且绑定该提交，临时 PostgreSQL 与任务容器已清理。`689bc2a` 的旧全量为 1747 passed / 3 warnings；会话/Responses 联合专项 526 passed / 2 warnings；b462502 Responses 专项 222 passed / 1 warning。Ruff 与本轮实际前端构建已通过，当前源码与验证绑定见续接记录。
+当前 `43f6147` 的联合专项 **334 passed / 3 warnings / exit 0**、Ruff 通过，全部非 Markdown 输入与提交逐项绑定；最终整合全量尚待。`full-03` 的 220 passed / 1 failed / exit 2 保留，不算通过。细节见续接记录。
+
+历史 `b462502` 全量 **1826 passed / 3 warnings / 905.09 秒 / exit 0，无跳过**；138 份非 Markdown 输入前后相同且绑定该提交，临时 PostgreSQL 与任务容器已清理。`689bc2a` 的旧全量为 1747 passed / 3 warnings；会话/Responses 联合专项 526 passed / 2 warnings；b462502 Responses 专项 222 passed / 1 warning。Ruff 与本轮实际前端构建已通过，当前源码与验证绑定见续接记录。
 
 私有根为 `~/Library/Application Support/DooNex/verification/resume-20261113/`：
 
@@ -76,7 +78,8 @@ PYTHONPATH=apps/server:tests .venv/bin/python -c 'import doonex; print(doonex.__
 | --- | --- |
 | 固定普通验收、失败和独立后验 | 根目录 gateway-01，`gateway-02` 至 `gateway-05` |
 | direct 诊断与脱敏 raw/pinned | `gateway-diagnostic-01` 至 `gateway-diagnostic-03`，不得进入产品 Git |
-| 当前整合检查、输入/日志摘要与退出码 | `full-02.json/.log`、`ruff-final-01.json`、`web-01.json` |
+| 真实验收源码 b462502 的全量与构建 | `full-02.json/.log`、`ruff-final-01.json`、`web-01.json` |
+| 后续期限接线专项及中途失败 | `deadline-integration-*.json/.log`、`full-03.json/.log`；最终状态见续接记录 |
 | SDK 容量与近容量样本 | `combined-*.json/.log`、`session-capacity-benchmark.json`、`session-benchmark-source-binding.json` |
 | 实际索引定义核对 | `index-audit.json`，首轮失败保留 |
 | 唯一新后台尝试 | `background-20261114/execution.intent.json`、`execution-receipt.json`、`audit-02/independent-after.json` |
