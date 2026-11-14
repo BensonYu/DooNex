@@ -38,7 +38,7 @@ tuning = tuning_fixture
 pytestmark = [pytest.mark.postgres, pytest.mark.docker]
 
 
-def bounded_file_gate(stage):
+def bounded_file_gate(stage, hold_seconds=0):
     """A real container waits for submission to commit, with a finite fallback."""
     return (
         "from pathlib import Path\nimport time\n"
@@ -48,7 +48,8 @@ def bounded_file_gate(stage):
         "while not release.exists() and time.monotonic() < limit:\n"
         "    time.sleep(0.02)\n"
         "assert release.exists(), 'Synthetic fixture gate expired'\n"
-        f"Path('/workspace/{stage}-finished').write_text('finished')\n"
+        + (f"time.sleep({hold_seconds!r})\n" if hold_seconds else "")
+        + f"Path('/workspace/{stage}-finished').write_text('finished')\n"
     )
 
 
@@ -65,14 +66,18 @@ def test_actual_worker_wait_timeline(
     monkeypatch,
     background_stage,
     foreground_kind,
+    gate_hold_seconds=0,
 ):
+    assert gate_hold_seconds == 0 or background_stage in {"shell", "verifier"}
     settings, background, background_body, repository_path = tuning
     if background_stage == "verifier":
         source, _, _, checker, _ = taskset_source
         (checker / "verify.py").write_text(
             "from pathlib import Path\n"
             "if Path('/workspace/timeline-background').exists():\n"
-            + textwrap.indent(bounded_file_gate("verifier"), "    ")
+            + textwrap.indent(
+                bounded_file_gate("verifier", gate_hold_seconds), "    "
+            )
             + "import sys\n"
             "sys.path.insert(0, '/workspace')\nfrom main import answer\n"
             "assert answer == 42\n"
@@ -285,7 +290,7 @@ def test_actual_worker_wait_timeline(
         if run_id == background_id:
             stage = "verifier" if kwargs.get("verifier_path") else "shell"
             container_workspaces[stage] = path
-        observe("sandbox_enter", run_id, command=command)
+        observe("sandbox_enter", run_id, command=command, timeout_seconds=timeout)
         value = original_sandbox(
             sandbox, path, command, timeout, run_id, *args, **kwargs
         )
@@ -408,7 +413,7 @@ def test_actual_worker_wait_timeline(
 
                 command = (
                     "python -c "
-                    + shlex.quote(bounded_file_gate("shell"))
+                    + shlex.quote(bounded_file_gate("shell", gate_hold_seconds))
                     + "; "
                     + command
                 )
@@ -503,7 +508,9 @@ def test_actual_worker_wait_timeline(
             observe("real_inflight_after_enqueue_commit", background_id)
             (path / ("release-" + background_stage)).write_text("committed")
         release.set()
-        assert finished.wait(45), "Worker did not finish the selected foreground"
+        assert finished.wait(45 + gate_hold_seconds), (
+            "Worker did not finish the selected foreground"
+        )
     finally:
         release.set()
         for stage, path in container_workspaces.items():
@@ -580,7 +587,17 @@ def test_actual_worker_wait_timeline(
     first_admission = admission[foreground_id]
     assert before <= after
     assert before <= running[foreground_id] <= first_admission
-    assert first_admission - before < 45  # finite fixture deadlock guard only
+    # A failure guard for the measured fixture, not a product latency promise.
+    assert first_admission - before < 45 + gate_hold_seconds
+    if gate_hold_seconds:
+        assert first_admission - after >= gate_hold_seconds
+        background_commands = [
+            item
+            for item in observations
+            if item["kind"] == "sandbox_enter" and item["run_id"] == background_id
+        ]
+        assert background_commands
+        assert all(item["timeout_seconds"] == 60 for item in background_commands)
     for run_id in (background_id, foreground_id):
         kinds = [item["kind"] for item in observations if item["run_id"] == run_id]
         if run_id != background_id or background_stage != "preparation":
@@ -643,8 +660,35 @@ def test_actual_worker_wait_timeline(
                     "upper": first_admission - before,
                 },
                 "model_transport": "synthetic",
+                "real_container_hold_after_enqueue_seconds": gate_hold_seconds,
                 "observations": observations,
             },
             sort_keys=True,
         )
+    )
+
+
+@pytest.mark.parametrize("background_stage", ["shell", "verifier"])
+def test_real_sixty_second_action_yields_after_long_remaining_work(
+    tuning,
+    taskset_source,
+    store,
+    request_data,
+    tmp_path,
+    monkeypatch,
+    background_stage,
+):
+    # The real container stays in flight for another 55 seconds after the
+    # foreground transaction commits. Keep the production 60-second timeout
+    # and all settlement, no-new-dispatch and actual Worker.run assertions.
+    test_actual_worker_wait_timeline(
+        tuning,
+        taskset_source,
+        store,
+        request_data,
+        tmp_path,
+        monkeypatch,
+        background_stage,
+        "ordinary",
+        gate_hold_seconds=55,
     )
