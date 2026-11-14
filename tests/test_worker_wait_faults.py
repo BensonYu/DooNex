@@ -694,6 +694,7 @@ def test_worker_real_docker_delayed_ack_keeps_proof_or_durable_unknown(
     executable.chmod(0o700)
     original_init = sandbox_module.Sandbox.__init__
     original_docker = sandbox_module.Sandbox._docker
+    original_process = sandbox_module._Supervisor.process
     original_run = sandbox_module.Sandbox.run
     results = []
     monkeypatch.setattr(sandbox_module, "CLEANUP_SECONDS", 3.0)
@@ -708,21 +709,6 @@ def test_worker_real_docker_delayed_ack_keeps_proof_or_durable_unknown(
             supervisor.capability._operation.record["run_id"] if supervisor else None
         )
         assert supervisor is not None
-        operation_record = supervisor.capability._operation.record
-        # Worker actions are sequential. Publish the exact invocation before
-        # launching this shim; the shim refuses any argv/binding mismatch.
-        (control / "current-call.json").write_text(
-            json.dumps(
-                {
-                    "operation": arguments[0],
-                    "arguments": list(arguments),
-                    "run_id": run_id,
-                    "controller_operation_id": operation_record["operation_id"],
-                    "controller_operation_kind": operation_record["operation_kind"],
-                    "container_name": operation_record["scope"]["container_name"],
-                }
-            )
-        )
         if (
             arguments[0] == "rm"
             and run_id == context.background_id
@@ -733,6 +719,26 @@ def test_worker_real_docker_delayed_ack_keeps_proof_or_durable_unknown(
             (control / "armed").write_text("fault only after foreground commit")
             context.observe("delayed_docker_ack_armed", operation=fault_operation)
         return original_docker(sandbox, *arguments, **kwargs)
+
+    def supervised_process(supervisor, arguments, *args, **kwargs):
+        if arguments[0] == str(executable):
+            operation_record = supervisor.capability._operation.record
+            # start uses the supervisor directly, so observe the actual launch
+            # boundary rather than assuming every CLI traverses Sandbox._docker.
+            # Worker actions are sequential; the shim also verifies exact argv.
+            (control / "current-call.json").write_text(
+                json.dumps(
+                    {
+                        "operation": arguments[1],
+                        "arguments": list(arguments[1:]),
+                        "run_id": operation_record["run_id"],
+                        "controller_operation_id": operation_record["operation_id"],
+                        "controller_operation_kind": operation_record["operation_kind"],
+                        "container_name": operation_record["scope"]["container_name"],
+                    }
+                )
+            )
+        return original_process(supervisor, arguments, *args, **kwargs)
 
     def run(sandbox, path, command, timeout, run_id, *args, **kwargs):
         value = original_run(sandbox, path, command, timeout, run_id, *args, **kwargs)
@@ -755,6 +761,7 @@ def test_worker_real_docker_delayed_ack_keeps_proof_or_durable_unknown(
     context.response = response_with_shell
     monkeypatch.setattr(sandbox_module.Sandbox, "__init__", init)
     monkeypatch.setattr(sandbox_module.Sandbox, "_docker", docker)
+    monkeypatch.setattr(sandbox_module._Supervisor, "process", supervised_process)
     monkeypatch.setattr(sandbox_module.Sandbox, "run", run)
     context.run()
     fired = json.loads((control / "fired.json").read_text())
