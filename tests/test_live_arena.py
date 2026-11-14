@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from doonex import controller_operations as co
 from doonex.worker import WORKER_LOCK
 
 from scripts import live_arena
@@ -62,6 +63,8 @@ def harness(tmp_path, monkeypatch):
         initialized=False,
         connected=False,
         acquired=True,
+        lock_owned=True,
+        fence_calls=0,
         credential=True,
         on_execute=None,
         detail_error=None,
@@ -73,10 +76,14 @@ def harness(tmp_path, monkeypatch):
         autocommit = False
 
         def execute(self, statement, parameters):
-            assert statement == "SELECT pg_try_advisory_lock(%s) AS acquired"
-            assert parameters == (WORKER_LOCK,)
-            assert self.autocommit
-            return SimpleNamespace(fetchone=lambda: {"acquired": value.acquired})
+            assert self.autocommit and value.connected
+            if statement == "SELECT pg_try_advisory_lock(%s) AS acquired":
+                assert parameters == (WORKER_LOCK,)
+                return SimpleNamespace(fetchone=lambda: {"acquired": value.acquired})
+            assert "FROM pg_locks" in statement
+            assert "pid=pg_backend_pid()" in statement
+            assert parameters == (WORKER_LOCK >> 32, WORKER_LOCK & 0xFFFFFFFF)
+            return SimpleNamespace(fetchone=lambda: {"owned": value.lock_owned})
 
     class Store:
         def initialize(self):
@@ -115,7 +122,13 @@ def harness(tmp_path, monkeypatch):
             self.store = store
             self.lock_connection = None
 
+        def fence(self):
+            assert_locks()
+            assert self.lock_connection is connection
+            value.fence_calls += 1
+
         def execute(self, run_id):
+            assert co.current_registry().actor.kind == "cli"
             assert_locks()
             assert self.lock_connection is connection
             assert run_id in run_ids

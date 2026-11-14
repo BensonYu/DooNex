@@ -1,4 +1,9 @@
-"""Explicitly verify one authorized background batch yields to one prepared Run.
+"""Disabled legacy background model harness; retained for evidence analysis.
+
+The old global Docker inventory has no exact Run scope. This entry point is
+unavailable until a separately bounded inventory is designed and verified.
+
+Explicitly verify one authorized background batch yields to one prepared Run.
 
 The foreground Run must already be paused, never started, and contain no stop
 request. This controlled harness wraps the real Ledger.reserve only while the
@@ -32,7 +37,6 @@ from doonex.background import Background
 from doonex.budget import Ledger
 from doonex.config import Settings
 from doonex.models import model_for_role, run_roles
-from doonex.sandbox import Sandbox
 from doonex.store import dispatch_lock, now, termination_unknown
 from doonex.worker import WORKER_LOCK, Worker, get_workspace, run_directory
 
@@ -40,6 +44,7 @@ if __package__ in {None, ""}:
     from live_arena import (
         TERMINAL,
         Refused,
+        cli_registry,
         count,
         load_campaign,
         same_evaluation,
@@ -50,6 +55,7 @@ else:
     from scripts.live_arena import (
         TERMINAL,
         Refused,
+        cli_registry,
         count,
         load_campaign,
         same_evaluation,
@@ -151,9 +157,8 @@ def pristine_action_log(connection, run_id):
 
 
 def no_containers():
-    # A single label query also catches task containers absent from this DB.
-    if Sandbox()._docker("ps", "-aq", "--filter", "label=doonex.run_id").stdout.split():
-        raise Refused("existing_task_container")
+    # A broad inventory is not an exact Run capability. Never fake its scope.
+    raise Refused("legacy_background_harness_disabled")
 
 
 def check_scope(worker, arena, foreground_id, evaluation_id=None, run_ids=()):
@@ -488,9 +493,15 @@ def execute_reserved(worker, arena, background, path, campaign, attempt, foregro
         return summary, False
 
 
-def run(args):
+def _legacy_fixture(args):
+    """Historical accounting fixture; public entry points always reject.
+
+    The permanent no_containers refusal also blocks this helper unless an
+    offline test explicitly substitutes its own synthetic inventory.
+    """
     if not args.confirm_model_usage:
         raise Refused("model_usage_confirmation_required")
+    no_containers()
     settings = Settings.load()
     with (settings.home / "live-acceptance.lock").open("a+") as lock:
         try:
@@ -510,42 +521,51 @@ def run(args):
             if not acquired:
                 raise Refused("worker_locked")
             worker.lock_connection = connection
-            arena = Arena(settings, worker.store)
-            background = Background(settings, worker.store)
-            grant = background.get(args.authorization_id)
-            expected_state = "draft" if args.enable_authorization else "enabled"
-            if grant["state"] != expected_state or grant.get("evaluation_id"):
-                raise Refused("unconsumed_enabled_authorization_required")
-            background.prepare(grant["id"])
-            model = grant["snapshot"]["model"]
-            check_model(settings, model, args.model)
-            foreground = worker.store.get(args.foreground_run_id)
-            calls, tokens = prepared_foreground(settings, foreground, model)
-            with worker.store.connect() as c:
-                dispatch_lock(c)
-                isolated(c, foreground["id"])
-                pristine_action_log(c, foreground["id"])
-            check_scope(worker, arena, foreground["id"])
-            budget = grant["input"]["batch_budget"]
-            count(budget["max_seconds"], positive=True)
-            attempt = {
-                "attempt_id": str(uuid4()),
-                "authorization_id": grant["id"],
-                "foreground_run_id": foreground["id"],
-                "enable_authorization": args.enable_authorization,
-                "authorization_revision": grant["revision"],
-                "model": args.model,
-                "status": "reserved",
-                "allocated_calls": calls + count(budget["max_calls"], positive=True),
-                "allocated_tokens": tokens + count(budget["max_tokens"], positive=True),
-            }
-            campaign["reserved_calls"] += attempt["allocated_calls"]
-            campaign["reserved_tokens"] += attempt["allocated_tokens"]
-            campaign["runs"].append(attempt)
-            save_campaign(path, campaign)
-            return execute_reserved(
-                worker, arena, background, path, campaign, attempt, foreground
-            )
+            with cli_registry(worker, connection):
+                arena = Arena(settings, worker.store)
+                background = Background(settings, worker.store)
+                grant = background.get(args.authorization_id)
+                expected_state = "draft" if args.enable_authorization else "enabled"
+                if grant["state"] != expected_state or grant.get("evaluation_id"):
+                    raise Refused("unconsumed_enabled_authorization_required")
+                background.prepare(grant["id"])
+                model = grant["snapshot"]["model"]
+                check_model(settings, model, args.model)
+                foreground = worker.store.get(args.foreground_run_id)
+                calls, tokens = prepared_foreground(settings, foreground, model)
+                with worker.store.connect() as c:
+                    dispatch_lock(c)
+                    isolated(c, foreground["id"])
+                    pristine_action_log(c, foreground["id"])
+                check_scope(worker, arena, foreground["id"])
+                budget = grant["input"]["batch_budget"]
+                count(budget["max_seconds"], positive=True)
+                attempt = {
+                    "attempt_id": str(uuid4()),
+                    "authorization_id": grant["id"],
+                    "foreground_run_id": foreground["id"],
+                    "enable_authorization": args.enable_authorization,
+                    "authorization_revision": grant["revision"],
+                    "model": args.model,
+                    "status": "reserved",
+                    "allocated_calls": calls
+                    + count(budget["max_calls"], positive=True),
+                    "allocated_tokens": tokens
+                    + count(budget["max_tokens"], positive=True),
+                }
+                campaign["reserved_calls"] += attempt["allocated_calls"]
+                campaign["reserved_tokens"] += attempt["allocated_tokens"]
+                campaign["runs"].append(attempt)
+                save_campaign(path, campaign)
+                return execute_reserved(
+                    worker, arena, background, path, campaign, attempt, foreground
+                )
+
+
+def run(args):
+    # Fail before loading private configuration, opening the ledger/database or
+    # taking an action that could replay the historical model campaign.
+    raise Refused("legacy_background_harness_disabled")
 
 
 def main():

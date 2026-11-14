@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
+from doonex import controller_operations as co
 from doonex.background import Background as RealBackground
 from doonex.config import Settings
 from doonex.sdk import GuardedLLM
@@ -165,6 +166,10 @@ def harness(tmp_path, monkeypatch):
             if statement == "SELECT pg_try_advisory_lock(%s) AS acquired":
                 assert parameters == (WORKER_LOCK,) and self.autocommit
                 return SimpleNamespace(fetchone=lambda: {"acquired": value.acquired})
+            if "FROM pg_locks" in statement:
+                assert parameters == (WORKER_LOCK >> 32, WORKER_LOCK & 0xFFFFFFFF)
+                assert self.autocommit
+                return SimpleNamespace(fetchone=lambda: {"owned": value.acquired})
             if statement == "SELECT id,state FROM runs ORDER BY id":
                 rows = [
                     {"id": UUID(item["id"]), "state": item["state"]}
@@ -305,7 +310,12 @@ def harness(tmp_path, monkeypatch):
             self.scheduler = Scheduler()
             self.lock_connection = None
 
+        def fence(self):
+            assert_locks()
+            assert self.lock_connection is connection
+
         def execute(self, identifier):
+            assert co.current_registry().actor.kind == "cli"
             assert_locks()
             assert self.lock_connection is connection
             assert value.runs[identifier]["state"] == "queued"
@@ -462,17 +472,19 @@ def harness(tmp_path, monkeypatch):
             value.settled.append(identifier)
             return {"settled_at": datetime.now(UTC).isoformat()}
 
-    class Sandbox:
-        def _docker(self, *args):
-            assert args == ("ps", "-aq", "--filter", "label=doonex.run_id")
-            return SimpleNamespace(stdout=b"residual\n" if value.containers else b"")
+    def fixture_inventory():
+        # This synthetic observation belongs only to the historical accounting
+        # fixture. The public CLI and production inventory remain disabled.
+        if value.containers:
+            raise live_background.Refused("existing_task_container")
 
     monkeypatch.setattr(live_background.Settings, "load", lambda: settings)
     monkeypatch.setattr(live_background, "Worker", Worker)
     monkeypatch.setattr(live_background, "Ledger", Ledger)
     monkeypatch.setattr(live_background, "Arena", Arena)
     monkeypatch.setattr(live_background, "Background", Background)
-    monkeypatch.setattr(live_background, "Sandbox", Sandbox)
+    monkeypatch.setattr(live_background, "no_containers", fixture_inventory)
+    monkeypatch.setattr(live_background, "run", live_background._legacy_fixture)
     monkeypatch.setattr(
         live_background, "get_workspace", lambda *_: "offline-workspace"
     )
@@ -892,7 +904,7 @@ def test_known_budget_stop_settles_actual_usage_but_exits_failure(harness, capsy
 
 @pytest.mark.postgres
 @pytest.mark.docker
-def test_real_sdk_postgres_docker_harness_with_synthetic_model_only(
+def test_private_historical_fixture_with_postgres_docker_and_synthetic_model(
     tuning, store, request_data, tmp_path, monkeypatch, capsys
 ):
     original_settings, _, body, _ = tuning
@@ -945,6 +957,22 @@ def test_real_sdk_postgres_docker_harness_with_synthetic_model_only(
         )
 
     monkeypatch.setattr(live_background.Settings, "load", lambda: settings)
+    monkeypatch.setattr(live_background, "run", live_background._legacy_fixture)
+
+    # A finite test-owned daemon observation; never a product _docker bypass.
+    def fixture_inventory():
+        import subprocess
+
+        result = subprocess.run(
+            ["docker", "ps", "-aq", "--no-trunc", "--filter", "label=doonex.run_id"],
+            stdout=subprocess.PIPE,
+            check=True,
+            timeout=10,
+        )
+        if result.stdout.split():
+            raise live_background.Refused("existing_task_container")
+
+    monkeypatch.setattr(live_background, "no_containers", fixture_inventory)
     monkeypatch.setattr(RealWorker, "execute", execute)
     monkeypatch.setattr(GuardedLLM, "_transport_call", transport)
     monkeypatch.setattr(

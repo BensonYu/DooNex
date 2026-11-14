@@ -10,10 +10,13 @@ import json
 import logging
 import os
 import tempfile
+from contextlib import contextmanager
 from uuid import UUID, uuid4
 
+from doonex import controller_operations as co
 from doonex.arena import Arena
 from doonex.config import Settings
+from doonex.store import external_execution_fenced
 from doonex.worker import WORKER_LOCK, Worker
 
 TERMINAL = {"complete", "cancelled", "budget_exceeded"}
@@ -22,6 +25,40 @@ STATES = TERMINAL | {"queued", "running", "interrupted", "cancelling"}
 
 class Refused(Exception):
     """A fixed safe reason, never an exception from private configuration."""
+
+
+@contextmanager
+def cli_registry(worker, connection):
+    """Grant this CLI scope only while its exact worker-lock session is live."""
+
+    def authority():
+        if worker.lock_connection is not connection:
+            raise co.RegistryError("cli_authority_lost")
+        worker.fence()
+        # Observe the lock without reacquiring it: a recursive advisory lock
+        # could hide a lost permission and leak another lock count.
+        row = connection.execute(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks "
+            "WHERE locktype='advisory' AND pid=pg_backend_pid() "
+            "AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) "
+            "AND classid=%s AND objid=%s AND objsubid=1 "
+            "AND mode='ExclusiveLock' AND granted) AS owned",
+            (WORKER_LOCK >> 32, WORKER_LOCK & 0xFFFFFFFF),
+        ).fetchone()
+        if row is None or row.get("owned") is not True:
+            raise co.RegistryError("cli_authority_lost")
+
+    registry = co.ControllerRegistry(
+        worker.store,
+        actor=co.fresh_actor("cli"),
+        check_owner=authority,
+        check_other_fences=external_execution_fenced,
+    )
+    try:
+        with co.bind_registry(registry):
+            yield registry
+    finally:
+        registry.close()
 
 
 def save_campaign(path, campaign):
@@ -188,24 +225,25 @@ def run(args):
             if not acquired:
                 raise Refused("worker_locked")
             worker.lock_connection = connection
-            arena = Arena(settings, worker.store)
-            evaluation = arena.get(args.evaluation_id)
-            calls, tokens, run_ids = preflight(settings, evaluation, args.model)
-            attempt = {
-                "attempt_id": str(uuid4()),
-                "evaluation_id": args.evaluation_id,
-                "model": args.model,
-                "status": "reserved",
-                "allocated_calls": calls,
-                "allocated_tokens": tokens,
-            }
-            campaign["reserved_calls"] += calls
-            campaign["reserved_tokens"] += tokens
-            campaign["runs"].append(attempt)
-            save_campaign(campaign_path, campaign)
-            return execute_reserved(
-                worker, arena, campaign_path, campaign, attempt, run_ids
-            )
+            with cli_registry(worker, connection):
+                arena = Arena(settings, worker.store)
+                evaluation = arena.get(args.evaluation_id)
+                calls, tokens, run_ids = preflight(settings, evaluation, args.model)
+                attempt = {
+                    "attempt_id": str(uuid4()),
+                    "evaluation_id": args.evaluation_id,
+                    "model": args.model,
+                    "status": "reserved",
+                    "allocated_calls": calls,
+                    "allocated_tokens": tokens,
+                }
+                campaign["reserved_calls"] += calls
+                campaign["reserved_tokens"] += tokens
+                campaign["runs"].append(attempt)
+                save_campaign(campaign_path, campaign)
+                return execute_reserved(
+                    worker, arena, campaign_path, campaign, attempt, run_ids
+                )
 
 
 def main():

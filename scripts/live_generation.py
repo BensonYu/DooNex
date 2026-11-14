@@ -20,13 +20,21 @@ from doonex.worker import WORKER_LOCK, Worker, run_directory
 try:
     from scripts.live_arena import (
         Refused,
+        cli_registry,
         count,
         load_campaign,
         save_campaign,
         usage_summary,
     )
 except ModuleNotFoundError:
-    from live_arena import Refused, count, load_campaign, save_campaign, usage_summary
+    from live_arena import (
+        Refused,
+        cli_registry,
+        count,
+        load_campaign,
+        save_campaign,
+        usage_summary,
+    )
 
 
 def preflight(settings, draft, args):
@@ -148,8 +156,8 @@ def run(args):
         ):
             raise Refused("generation_already_attempted")
         worker = Worker(settings)
-        # The source must already have its schema installed. Do not migrate or
-        # reconcile unrelated records as part of a single live model attempt.
+        # Initialize the fixed schema without dispatching or reconciling runs.
+        worker.store.initialize()
         with worker.store.connect() as connection:
             connection.autocommit = True
             if not connection.execute(
@@ -157,24 +165,25 @@ def run(args):
             ).fetchone()["acquired"]:
                 raise Refused("worker_locked")
             worker.lock_connection = connection
-            service = Generation(settings, worker.store)
-            draft = service.detail(args.generation_id)
-            calls, tokens = preflight(settings, draft, args)
-            attempt = {
-                "attempt_id": str(uuid4()),
-                "generation_id": args.generation_id,
-                "revision": draft["revision"],
-                "model": args.model,
-                "status": "reserved",
-                "allocated_calls": calls,
-                "allocated_tokens": tokens,
-                "max_seconds": draft["budget"]["max_seconds"],
-            }
-            campaign["reserved_calls"] += calls
-            campaign["reserved_tokens"] += tokens
-            campaign["runs"].append(attempt)
-            save_campaign(path, campaign)
-            return execute_reserved(worker, service, path, campaign, attempt, draft)
+            with cli_registry(worker, connection):
+                service = Generation(settings, worker.store)
+                draft = service.detail(args.generation_id)
+                calls, tokens = preflight(settings, draft, args)
+                attempt = {
+                    "attempt_id": str(uuid4()),
+                    "generation_id": args.generation_id,
+                    "revision": draft["revision"],
+                    "model": args.model,
+                    "status": "reserved",
+                    "allocated_calls": calls,
+                    "allocated_tokens": tokens,
+                    "max_seconds": draft["budget"]["max_seconds"],
+                }
+                campaign["reserved_calls"] += calls
+                campaign["reserved_tokens"] += tokens
+                campaign["runs"].append(attempt)
+                save_campaign(path, campaign)
+                return execute_reserved(worker, service, path, campaign, attempt, draft)
 
 
 def main():

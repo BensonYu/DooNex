@@ -23,6 +23,11 @@ from doonex.worker import WORKER_LOCK, Worker
 from doonex.workspace import _git
 from fastapi.testclient import TestClient
 
+try:
+    from scripts.live_arena import cli_registry
+except ModuleNotFoundError:
+    from live_arena import cli_registry
+
 TERMINAL = {
     "completed_verified",
     "completed_unverified",
@@ -172,115 +177,120 @@ def main():
                     "An existing worker is active; stop it before this explicit acceptance run"
                 )
             worker.lock_connection = connection
-            repo = settings.home / args.sample_name
-            if repo.is_symlink():
-                raise SystemExit("The controlled sample cannot be a symbolic link")
-            if not repo.exists():
-                repo.mkdir()
-                git(repo, "init", "-b", "main")
-                git(repo, "config", "user.name", "DooNex acceptance fixture")
-                git(repo, "config", "user.email", "fixture@example.invalid")
-                (repo / "calculator.py").write_text(
-                    "def add(a, b):\n    return a - b\n"
-                )
-                (repo / "README.md").write_text(
-                    "Controlled DooNex acceptance fixture.\n"
-                )
-                git(repo, "add", "calculator.py", "README.md")
-                git(repo, "commit", "-m", "Controlled acceptance baseline")
-                (repo / "README.md").write_text(
-                    "User working copy change: preserve me.\n"
-                )
-                git(repo, "add", "README.md")
-                (repo / "untracked.txt").write_text(
-                    "User untracked file: preserve me.\n"
-                )
-            original = source_fingerprint(repo)
-            check = "python -c \"from calculator import add; assert add(2, 3) == 5; assert add(-2, 2) == 0; assert add(0, 0) == 0; print('DooNex acceptance passed')\""
-            with TestClient(create_app(settings)) as client:
-                client.headers["Authorization"] = "Bearer " + settings.token
-                registered = client.post("/api/projects", json={"path": str(repo)})
-                if registered.status_code != 200:
-                    raise SystemExit("Could not register the controlled sample")
-                project_id = registered.json()["id"]
-                attempt = {
-                    "attempt_id": str(uuid4()),
+            with cli_registry(worker, connection):
+                repo = settings.home / args.sample_name
+                if repo.is_symlink():
+                    raise SystemExit("The controlled sample cannot be a symbolic link")
+                if not repo.exists():
+                    repo.mkdir()
+                    git(repo, "init", "-b", "main")
+                    git(repo, "config", "user.name", "DooNex acceptance fixture")
+                    git(repo, "config", "user.email", "fixture@example.invalid")
+                    (repo / "calculator.py").write_text(
+                        "def add(a, b):\n    return a - b\n"
+                    )
+                    (repo / "README.md").write_text(
+                        "Controlled DooNex acceptance fixture.\n"
+                    )
+                    git(repo, "add", "calculator.py", "README.md")
+                    git(repo, "commit", "-m", "Controlled acceptance baseline")
+                    (repo / "README.md").write_text(
+                        "User working copy change: preserve me.\n"
+                    )
+                    git(repo, "add", "README.md")
+                    (repo / "untracked.txt").write_text(
+                        "User untracked file: preserve me.\n"
+                    )
+                original = source_fingerprint(repo)
+                check = "python -c \"from calculator import add; assert add(2, 3) == 5; assert add(-2, 2) == 0; assert add(0, 0) == 0; print('DooNex acceptance passed')\""
+                with TestClient(create_app(settings)) as client:
+                    client.headers["Authorization"] = "Bearer " + settings.token
+                    registered = client.post("/api/projects", json={"path": str(repo)})
+                    if registered.status_code != 200:
+                        raise SystemExit("Could not register the controlled sample")
+                    project_id = registered.json()["id"]
+                    attempt = {
+                        "attempt_id": str(uuid4()),
+                        "model": args.model,
+                        "workflow": args.workflow,
+                        "role_models": {
+                            role: item.model_id for role, item in role_models.items()
+                        },
+                        "status": "reserved",
+                        "allocated_calls": args.max_calls,
+                        "allocated_tokens": args.max_tokens,
+                    }
+                    campaign["reserved_calls"] += args.max_calls
+                    campaign["reserved_tokens"] += args.max_tokens
+                    campaign["runs"].append(attempt)
+                    save_campaign(campaign_path, campaign)
+                    response = client.post(
+                        "/api/runs",
+                        json={
+                            "project_id": project_id,
+                            "workflow": args.workflow,
+                            "model_profile_id": args.model_profile,
+                            "reviewer_model_profile_id": args.reviewer_model_profile,
+                            "prompt": "Fix calculator.py so add(a, b) returns the sum. Inspect it with doonex_shell, make the smallest change, and finish. Do not modify acceptance criteria. This is a controlled coding acceptance task.",
+                            "checks": [check],
+                            "base_ref": "HEAD",
+                            "budget": {
+                                "max_calls": args.max_calls,
+                                "max_tokens": args.max_tokens,
+                                "max_cost_usd": None if subscription_only else 2,
+                                "max_seconds": 300,
+                            },
+                        },
+                    )
+                    if response.status_code != 200:
+                        attempt["status"] = "preflight_rejected"
+                        save_campaign(campaign_path, campaign)
+                        raise SystemExit(
+                            "Run preflight rejected; conservative campaign reservation retained"
+                        )
+                    run_id = response.json()["id"]
+                    attempt["run_id"] = run_id
+                    save_campaign(campaign_path, campaign)
+                worker.execute(run_id)
+                final = Store(settings.database_url).get(run_id)
+                preserved = source_fingerprint(repo) == original
+                summary = {
+                    "run_id": run_id,
                     "model": args.model,
                     "workflow": args.workflow,
                     "role_models": {
                         role: item.model_id for role, item in role_models.items()
                     },
-                    "status": "reserved",
-                    "allocated_calls": args.max_calls,
-                    "allocated_tokens": args.max_tokens,
-                }
-                campaign["reserved_calls"] += args.max_calls
-                campaign["reserved_tokens"] += args.max_tokens
-                campaign["runs"].append(attempt)
-                save_campaign(campaign_path, campaign)
-                response = client.post(
-                    "/api/runs",
-                    json={
-                        "project_id": project_id,
-                        "workflow": args.workflow,
-                        "model_profile_id": args.model_profile,
-                        "reviewer_model_profile_id": args.reviewer_model_profile,
-                        "prompt": "Fix calculator.py so add(a, b) returns the sum. Inspect it with doonex_shell, make the smallest change, and finish. Do not modify acceptance criteria. This is a controlled coding acceptance task.",
-                        "checks": [check],
-                        "base_ref": "HEAD",
-                        "budget": {
-                            "max_calls": args.max_calls,
-                            "max_tokens": args.max_tokens,
-                            "max_cost_usd": None if subscription_only else 2,
-                            "max_seconds": 300,
-                        },
+                    "state": final["state"],
+                    "reason": final["reason"],
+                    "usage": final["usage"],
+                    "original_workspace_preserved": preserved,
+                    "snapshot_digest": (final.get("evidence") or {}).get(
+                        "snapshot_digest"
+                    ),
+                    "review_status": (final.get("review") or {}).get("status"),
+                    "role_usage": {
+                        role: item["usage"]
+                        for role, item in final.get("assignments", {}).items()
                     },
-                )
-                if response.status_code != 200:
-                    attempt["status"] = "preflight_rejected"
-                    save_campaign(campaign_path, campaign)
-                    raise SystemExit(
-                        "Run preflight rejected; conservative campaign reservation retained"
+                }
+                if final["state"] in TERMINAL:
+                    campaign["reserved_calls"] += (
+                        final["usage"]["calls"] - args.max_calls
                     )
-                run_id = response.json()["id"]
-                attempt["run_id"] = run_id
+                    campaign["reserved_tokens"] += (
+                        final["usage"]["tokens"]
+                        + final["usage"]["reserved_tokens"]
+                        - args.max_tokens
+                    )
+                    attempt["status"] = "settled"
+                else:
+                    attempt["status"] = "nonterminal_allowance_retained"
+                attempt.update(summary)
                 save_campaign(campaign_path, campaign)
-            worker.execute(run_id)
-            final = Store(settings.database_url).get(run_id)
-            preserved = source_fingerprint(repo) == original
-            summary = {
-                "run_id": run_id,
-                "model": args.model,
-                "workflow": args.workflow,
-                "role_models": {
-                    role: item.model_id for role, item in role_models.items()
-                },
-                "state": final["state"],
-                "reason": final["reason"],
-                "usage": final["usage"],
-                "original_workspace_preserved": preserved,
-                "snapshot_digest": (final.get("evidence") or {}).get("snapshot_digest"),
-                "review_status": (final.get("review") or {}).get("status"),
-                "role_usage": {
-                    role: item["usage"]
-                    for role, item in final.get("assignments", {}).items()
-                },
-            }
-            if final["state"] in TERMINAL:
-                campaign["reserved_calls"] += final["usage"]["calls"] - args.max_calls
-                campaign["reserved_tokens"] += (
-                    final["usage"]["tokens"]
-                    + final["usage"]["reserved_tokens"]
-                    - args.max_tokens
-                )
-                attempt["status"] = "settled"
-            else:
-                attempt["status"] = "nonterminal_allowance_retained"
-            attempt.update(summary)
-            save_campaign(campaign_path, campaign)
-            print(json.dumps(summary, ensure_ascii=False, indent=2))
-            if final["state"] != "completed_verified" or not preserved:
-                raise SystemExit(1)
+                print(json.dumps(summary, ensure_ascii=False, indent=2))
+                if final["state"] != "completed_verified" or not preserved:
+                    raise SystemExit(1)
 
 
 if __name__ == "__main__":
