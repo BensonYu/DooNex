@@ -67,8 +67,10 @@ def test_actual_worker_wait_timeline(
     background_stage,
     foreground_kind,
     gate_hold_seconds=0,
+    extra_observation_seconds=0,
 ):
     assert gate_hold_seconds == 0 or background_stage in {"shell", "verifier"}
+    observation_seconds = 45 + gate_hold_seconds + extra_observation_seconds
     settings, background, background_body, repository_path = tuning
     if background_stage == "verifier":
         source, _, _, checker, _ = taskset_source
@@ -508,7 +510,7 @@ def test_actual_worker_wait_timeline(
             observe("real_inflight_after_enqueue_commit", background_id)
             (path / ("release-" + background_stage)).write_text("committed")
         release.set()
-        assert finished.wait(45 + gate_hold_seconds), (
+        assert finished.wait(observation_seconds), (
             "Worker did not finish the selected foreground"
         )
     finally:
@@ -588,7 +590,7 @@ def test_actual_worker_wait_timeline(
     assert before <= after
     assert before <= running[foreground_id] <= first_admission
     # A failure guard for the measured fixture, not a product latency promise.
-    assert first_admission - before < 45 + gate_hold_seconds
+    assert first_admission - before < observation_seconds
     if gate_hold_seconds:
         assert first_admission - after >= gate_hold_seconds
         background_commands = [
@@ -661,6 +663,7 @@ def test_actual_worker_wait_timeline(
                 },
                 "model_transport": "synthetic",
                 "real_container_hold_after_enqueue_seconds": gate_hold_seconds,
+                "fixture_extra_observation_seconds": extra_observation_seconds,
                 "observations": observations,
             },
             sort_keys=True,
