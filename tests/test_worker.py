@@ -228,10 +228,12 @@ def test_pause_during_verification_restarts_checks_without_model_replay(
     interrupted = False
 
     def pause_check(
-        self, workspace, command, timeout, run_id, should_stop=lambda: False
+        self, workspace, command, timeout, run_id, should_stop=lambda: False, **kwargs
     ):
         nonlocal interrupted
-        result = original(self, workspace, command, timeout, run_id, should_stop)
+        result = original(
+            self, workspace, command, timeout, run_id, should_stop, **kwargs
+        )
         if not interrupted:
             interrupted = True
             with store.locked(run_id) as (_, current):

@@ -277,7 +277,7 @@ def test_waiting_candidates_advance_one_per_call_then_wrap(background, monkeypat
     )
     seen = []
 
-    def waiting(identifier):
+    def waiting(identifier, **kwargs):
         seen.append(identifier)
         raise BackgroundWaiting("尚未开始")
 
@@ -303,10 +303,10 @@ def test_first_refused_candidate_does_not_starve_later_ready_grant(
     second = enabled(background, body)
     prepare = background.prepare
 
-    def checked(identifier):
+    def checked(identifier, **kwargs):
         if first_status == "blocked" and identifier == first["id"]:
             raise OSError("PRIVATE_DETAIL")
-        return prepare(identifier)
+        return prepare(identifier, **kwargs)
 
     monkeypatch.setattr(background, "prepare", checked)
     scheduler = scheduler_for(background)
@@ -326,8 +326,8 @@ def test_foreground_arrival_during_prepare_blocks_final_admission(
     grant = enabled(background, body)
     prepare = background.prepare
 
-    def enqueue_during_inspection(identifier):
-        receipt = prepare(identifier)
+    def enqueue_during_inspection(identifier, **kwargs):
+        receipt = prepare(identifier, **kwargs)
         background.store.create_run(request_data)
         return receipt
 

@@ -381,7 +381,7 @@ class Background:
             profile = ModelRegistry(self.settings).get(body.model_profile_id)
             check_deadline(deadline)
             model = profile.model.model_dump()
-            credential = self.settings.credential(model)
+            credential = self.settings.credential(model, deadline=deadline)
             check_deadline(deadline)
         except (KeyError, ValueError, OSError) as error:
             _raise_execution_control(error)
@@ -615,8 +615,9 @@ class Background:
         if current.date().isoformat() != value["date"] or not start <= current < end:
             raise BackgroundStopped("后台授权已到期或不在原 UTC 日窗口内")
 
-    def claim(self, connection, identifier, *, prepared=None):
-        value = self.get(identifier, connection, lock=True)
+    def claim(self, connection, identifier, *, prepared=None, deadline=None):
+        check_deadline(deadline)
+        value = self.get(identifier, connection, lock=True, deadline=deadline)
         if value["state"] != "enabled" or value["evaluation_id"]:
             raise BackgroundConflict("后台授权未启用或已消费")
         self._window(value, waiting=True)
@@ -631,8 +632,11 @@ class Background:
             <= 10
         ):
             raise BackgroundStopped("后台使用前检查回执已变化或过期")
-        body = self._unchanged(value, connection, inspect_contents=prepared is None)
+        body = self._unchanged(
+            value, connection, inspect_contents=prepared is None, deadline=deadline
+        )
         ledger = self.day(value["date"], connection, lock=True)
+        check_deadline(deadline)
         if ledger["budget"] != body.daily_budget.model_dump():
             raise BackgroundStopped("后台日预算绑定已变化")
         required = self._reservation(body)
@@ -652,8 +656,10 @@ class Background:
             (allocation["id"], value["id"], value["date"], Jsonb(allocation)),
         )
         self._refresh_day(connection, value["date"])
+        check_deadline(deadline)
         value.update(state="consumed", consumed_at=allocation["claimed_at"])
         self._save(connection, value, "claimed", reservation_id=allocation["id"])
+        check_deadline(deadline)
         return {
             "authorization_id": value["id"],
             "date": value["date"],

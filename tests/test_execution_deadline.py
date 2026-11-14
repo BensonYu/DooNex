@@ -1,5 +1,6 @@
 """A shared clock reaches SDK restore, hashing, locks and Worker callbacks."""
 
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 
@@ -7,6 +8,7 @@ import pytest
 from doonex import sdk
 from doonex.deadline import ExecutionDeadlineExceeded
 from doonex.evidence import Evidence
+from doonex.library import Library
 from doonex.review import Review
 from doonex.sandbox import Sandbox
 from doonex.scheduling import Scheduler
@@ -128,6 +130,31 @@ def test_each_actual_sdk_request_clamps_timeout_after_reservation(
     assert not sdk._CALLBACKS and not sdk._SCHEDULING and not sdk._SESSION_STORES
 
 
+def test_failed_responses_diagnostic_records_actual_clamped_timeout(
+    tmp_path, monkeypatch
+):
+    from openhands.sdk.conversation.exceptions import ConversationRunError
+
+    captured = []
+
+    def transport(*args, **kwargs):
+        captured.append(kwargs["timeout"])
+        raise RuntimeError("Synthetic transport failure")
+
+    kwargs, reservations, settlements, commands, _ = response_harness(
+        tmp_path, monkeypatch, transport
+    )
+    kwargs["persistence_deadline"] = time.monotonic() + 2
+    with pytest.raises(ConversationRunError) as caught:
+        sdk.run_session(**kwargs)
+    assert len(captured) == len(reservations) == len(settlements) == 1
+    error = exception_cause(caught.value, sdk.ModelCallError)
+    assert error is not None
+    assert 0 < error.diagnostics["timeout_seconds"] == captured[0] <= 2
+    assert settlements[0][1] is None and not commands
+    assert not sdk._CALLBACKS and not sdk._SCHEDULING and not sdk._SESSION_STORES
+
+
 @pytest.mark.parametrize("stage", ["save", "validate"])
 def test_scheduling_expiry_precedes_new_probe_or_snapshot(tmp_path, monkeypatch, stage):
     def unexpected(*args, **kwargs):
@@ -156,6 +183,12 @@ def test_expired_container_probe_does_not_start_process(monkeypatch):
     monkeypatch.setattr(Sandbox, "_containers", unexpected)
     with pytest.raises(ExecutionDeadlineExceeded):
         Sandbox().containers("unused", deadline=time.monotonic() - 1)
+
+
+def test_expired_background_preparation_does_not_start_query():
+    scheduler = object.__new__(Scheduler)
+    with pytest.raises(ExecutionDeadlineExceeded):
+        scheduler.claim_next(deadline=time.monotonic() - 1)
 
 
 @pytest.mark.postgres
@@ -188,10 +221,52 @@ def test_worker_passes_original_remaining_clock_and_records_deadline_stop(
 
 
 @pytest.mark.postgres
-@pytest.mark.parametrize("stage", ["review", "evidence"])
-def test_worker_expires_delivery_before_starting_new_work(
-    settings, store, request_data, tmp_path, monkeypatch, stage
+def test_worker_commits_first_clock_before_expiring_content_initialization(
+    settings, store, request_data, tmp_path, monkeypatch
 ):
+    run, _, _ = prepare_run(store, settings, request_data, tmp_path)
+    calls = scripted_model(monkeypatch, [])
+    original = Library.__init__
+    observed = []
+
+    def expires(service, *args, **kwargs):
+        if kwargs.get("deadline") is not None:
+            current = store.get(run["id"])
+            assert current["state"] == "running" and current["first_started_at"]
+            observed.append(kwargs["deadline"])
+            kwargs["deadline"] = time.monotonic() - 1
+        return original(service, *args, **kwargs)
+
+    monkeypatch.setattr(Library, "__init__", expires)
+    monkeypatch.setattr(
+        Sandbox,
+        "stop_run",
+        lambda *_a, **_k: {"remaining": [], "errors": [], "stopped": []},
+    )
+    Worker(settings).run(once=True)
+    final = store.get(run["id"])
+    assert len(observed) == 1 and final["state"] == "budget_exceeded"
+    assert final["first_started_at"] and not calls
+    assert final["usage"]["calls"] == final["usage"]["reserved_tokens"] == 0
+    assert not store.pending(run["id"])
+    assert not (settings.home / "runs" / run["id"]).exists()
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("stage", ["review", "evidence"])
+@pytest.mark.parametrize("wall_forward", [False, True])
+def test_worker_expires_delivery_before_starting_new_work(
+    settings, store, request_data, tmp_path, monkeypatch, stage, wall_forward
+):
+    from doonex import worker as worker_module
+
+    original_elapsed = worker_module.elapsed
+    clock_advanced = False
+
+    def elapsed_after_forward_step(current):
+        return original_elapsed(current) + (5 if clock_advanced else 0)
+
+    monkeypatch.setattr(worker_module, "elapsed", elapsed_after_forward_step)
     if stage == "review":
         request_data["workflow"] = "execute_review"
     run, _, _ = prepare_run(store, settings, request_data, tmp_path)
@@ -201,11 +276,18 @@ def test_worker_expires_delivery_before_starting_new_work(
     original_delivery = Review.prepare if stage == "review" else Evidence.capture
 
     def session(**kwargs):
+        nonlocal clock_advanced
         deadlines.append(kwargs["persistence_deadline"])
-        return original_session(**kwargs)
+        result = original_session(**kwargs)
+        clock_advanced = wall_forward
+        return result
 
     def expired_delivery(*args, **kwargs):
-        assert kwargs["deadline"] == deadlines[0]
+        # The original clock may tighten after a persisted wall-clock forward
+        # step; it must remain live and may never extend the SDK's allowance.
+        assert time.monotonic() < kwargs["deadline"] <= deadlines[0]
+        if wall_forward and stage == "evidence":
+            assert kwargs["deadline"] <= deadlines[0] - 4
         return original_delivery(*args, **{**kwargs, "deadline": time.monotonic() - 1})
 
     monkeypatch.setattr(sdk, "run_session", session)
@@ -221,9 +303,105 @@ def test_worker_expires_delivery_before_starting_new_work(
     )
     Worker(settings).run(once=True)
     final = store.get(run["id"])
-    assert final["state"] == "budget_exceeded"
+    assert final["state"] == "budget_exceeded", final["reason"]
     assert len(calls) == len(deadlines) == final["usage"]["calls"] == 1
     assert final["usage"]["tokens"] == 120
     assert final["usage"]["unknown_calls"] == final["usage"]["reserved_tokens"] == 0
     assert not store.pending(run["id"]) and not final.get("evidence")
     assert not (settings.home / "runs" / run["id"] / stage).exists()
+
+
+@pytest.mark.postgres
+@pytest.mark.docker
+def test_terminal_commit_wait_cannot_outlive_original_deadline(
+    settings, store, request_data, tmp_path, monkeypatch
+):
+    request_data["budget"]["max_seconds"] = 8
+    run, _, _ = prepare_run(store, settings, request_data, tmp_path, checks=["true"])
+    calls = scripted_model(monkeypatch, [])
+    original_session, original_inspect = sdk.run_session, Evidence.inspect
+    deadlines, locks, threads = [], [], []
+
+    def session(**kwargs):
+        deadlines.append(kwargs["persistence_deadline"])
+        return original_session(**kwargs)
+
+    def inspect(*args, **kwargs):
+        result = original_inspect(*args, **kwargs)
+        if not locks:
+            assert result["valid"] and time.monotonic() < deadlines[0]
+            # Keep the actual lock hold below the configured 5 s DB limit,
+            # while still crossing the original monotonic Run deadline.
+            time.sleep(max(0, deadlines[0] - time.monotonic() - 3))
+            connection = store.connect()
+            row = connection.execute(
+                "SELECT data FROM runs WHERE id=%s FOR UPDATE", (run["id"],)
+            ).fetchone()["data"]
+            assert row["state"] == "verifying"
+            locks.append(row["first_started_at"])
+
+            def release():
+                try:
+                    time.sleep(max(0, deadlines[0] - time.monotonic()) + 0.1)
+                    connection.commit()
+                finally:
+                    connection.close()
+
+            thread = threading.Thread(target=release, daemon=True)
+            threads.append(thread)
+            thread.start()
+        return result
+
+    monkeypatch.setattr(sdk, "run_session", session)
+    monkeypatch.setattr(Evidence, "inspect", inspect)
+    monkeypatch.setattr(
+        Sandbox,
+        "stop_run",
+        lambda *_a, **_k: {"remaining": [], "errors": [], "stopped": []},
+    )
+    try:
+        Worker(settings).run(once=True)
+    finally:
+        for thread in threads:
+            thread.join(timeout=12)
+    final = store.get(run["id"])
+    assert len(locks) == len(deadlines) == len(calls) == 1
+    assert final["state"] == "budget_exceeded" and final["first_started_at"] == locks[0]
+    assert final["evidence"]["checks"][0]["exit_code"] == 0
+    assert final["usage"]["calls"] == 1 and not store.pending(run["id"])
+    assert final["usage"]["unknown_calls"] == final["usage"]["reserved_tokens"] == 0
+    assert not any(
+        event["kind"] in {"completed_verified", "completed_unverified"}
+        for event in store.events(run["id"])["events"]
+    )
+
+
+@pytest.mark.postgres
+def test_credential_error_is_recorded_after_original_clock_commit(
+    settings, store, request_data, tmp_path, monkeypatch
+):
+    from doonex.config import Settings
+
+    run, _, _ = prepare_run(store, settings, request_data, tmp_path)
+    calls = scripted_model(monkeypatch, [])
+    seen = []
+
+    def invalid(self, *args, **kwargs):
+        current = store.get(run["id"])
+        assert current["state"] == "running" and current["first_started_at"]
+        assert kwargs["deadline"] > time.monotonic()
+        seen.append(True)
+        raise ValueError("Synthetic invalid credential file")
+
+    monkeypatch.setattr(Settings, "credential", invalid)
+    monkeypatch.setattr(
+        Sandbox,
+        "stop_run",
+        lambda *_a, **_k: {"remaining": [], "errors": [], "stopped": []},
+    )
+    Worker(settings).run(once=True)
+    final = store.get(run["id"])
+    assert seen and final["first_started_at"] and final["state"] == "failed"
+    assert not calls and not store.pending(run["id"])
+    assert final["usage"]["calls"] == final["usage"]["reserved_tokens"] == 0
+    assert any(event["kind"] == "failed" for event in store.events(run["id"])["events"])

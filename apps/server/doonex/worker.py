@@ -172,30 +172,15 @@ class Worker:
         from doonex.workspace import Workspace, read_files
 
         directory = run_directory(self.settings, run_id)
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         sandbox = Sandbox()
         run = self.store.get(run_id)
         request = run["request"]
         from doonex.library import Library
 
-        library = Library(self.settings, self.store)
         generation_service = None
-        if request.get("purpose") == "skill_generation":
-            from doonex.generation import Generation
-
-            generation_service = Generation(self.settings, self.store)
         arena = None
-        if request.get("arena"):
-            from doonex.arena import Arena
-
-            arena = Arena(self.settings, self.store)
-            if not arena.start(request["arena"]["evaluation_id"]):
-                return
-        role_keys = {
-            role: self.settings.credential(model_for_role(request, role))
-            for role in run_roles(request)
-        }
-        secrets = (*role_keys.values(), self.settings.token, self.settings.database_url)
+        role_keys = {}
+        secrets = (self.settings.token, self.settings.database_url)
 
         def event(kind, payload):
             self.lease()
@@ -238,6 +223,34 @@ class Worker:
                 return remaining_time(execution_deadline)
 
             execution_fence()
+            for role in run_roles(request):
+                role_keys[role] = self.settings.credential(
+                    model_for_role(request, role), deadline=execution_deadline
+                )
+                secrets = (
+                    *role_keys.values(),
+                    self.settings.token,
+                    self.settings.database_url,
+                )
+                check_deadline(execution_deadline)
+            library = Library(self.settings, self.store, deadline=execution_deadline)
+            if request.get("purpose") == "skill_generation":
+                from doonex.generation import Generation
+
+                generation_service = Generation(
+                    self.settings, self.store, deadline=execution_deadline
+                )
+            if request.get("arena"):
+                from doonex.arena import Arena
+                from doonex.budget import BatchHalt
+
+                arena = Arena(self.settings, self.store, deadline=execution_deadline)
+                if not arena.start(
+                    request["arena"]["evaluation_id"], deadline=execution_deadline
+                ):
+                    raise BatchHalt("评测批次已停止", request["arena"]["evaluation_id"])
+            check_deadline(execution_deadline)
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             if generation_service:
                 generation_service.validate_run(
                     self.store.get(run_id), directory, deadline=execution_deadline
@@ -902,9 +915,12 @@ class Worker:
                 library.skill_context(request["skill"], deadline=execution_deadline)
             if (
                 arena
-                and not arena.integrity(arena.get(request["arena"]["evaluation_id"]))[
-                    "valid"
-                ]
+                and not arena.integrity(
+                    arena.get(
+                        request["arena"]["evaluation_id"], deadline=execution_deadline
+                    ),
+                    deadline=execution_deadline,
+                )["valid"]
             ):
                 raise ValueError("评测冻结上下文已变化，禁止生成通过证据")
 
@@ -1093,6 +1109,9 @@ class Worker:
             with self.store.locked(run_id, self.owner) as (c, current):
                 if current["state"] != "verifying":
                     raise Halt("验证结束时已收到停止请求")
+                check_deadline(execution_deadline)
+                if elapsed(current) >= request["budget"]["max_seconds"]:
+                    raise Halt("验证完成提交前，原运行时长已达上限")
                 current.update(
                     state=state,
                     reason="固定快照通过全部检查"

@@ -1018,6 +1018,7 @@ class GuardedLLM(LLM):
                 raise
             raise _AcceptedSchedulerYield(self._scheduling) from None
         started = time.monotonic()
+        attempt_timeout = kwargs.get("timeout", self.timeout)
         try:
             if self._session_store is not None:
                 self._session_store.check_ok()
@@ -1034,6 +1035,7 @@ class GuardedLLM(LLM):
                             remaining_time(self._session_store.deadline),
                         ),
                     }
+                    attempt_timeout = kwargs["timeout"]
             if mode == "responses":
                 expected_tools = (
                     [
@@ -1082,7 +1084,7 @@ class GuardedLLM(LLM):
                     "api_mode": "responses",
                     "client_request_id": client_request_id,
                     "elapsed_ms": elapsed_ms,
-                    "timeout_seconds": self.timeout,
+                    "timeout_seconds": attempt_timeout,
                     **details,
                 }
                 if type(reservation) is dict:

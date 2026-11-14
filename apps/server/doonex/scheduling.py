@@ -1,10 +1,13 @@
 """One worker, finite authorizations and provable foreground dispatch priority."""
 
+import time
 from copy import deepcopy
 
 from doonex.budget import BatchHalt, elapsed
 from doonex.deadline import check_deadline
 from doonex.store import dispatch_lock, execution_fenced, now
+
+PREPARATION_SECONDS = 30.0
 
 
 class Yielded(BaseException):
@@ -224,10 +227,18 @@ class Scheduler:
                 )
             return False
 
-    def claim_next(self):
+    def claim_next(self, *, deadline=None):
         from doonex.arena import Arena, EvaluationInput
         from doonex.background import BackgroundStopped, BackgroundWaiting
 
+        # This bounds cooperative preparation work; the Run/batch/day guards
+        # remain authoritative and no model request is admitted by this clock.
+        deadline = (
+            min(time.monotonic() + PREPARATION_SECONDS, deadline)
+            if deadline is not None
+            else time.monotonic() + PREPARATION_SECONDS
+        )
+        check_deadline(deadline)
         with self.store.connect() as c:
             if execution_fenced(c) or queued_work(c):
                 return
@@ -240,8 +251,8 @@ class Scheduler:
         self._authorization_cursor = (authorization["created_at"], authorization["id"])
         try:
             # Full content inspection takes place without the admission lock.
-            prepared = self.background.prepare(authorization["id"])
-            arena = Arena(self.settings, self.store)
+            prepared = self.background.prepare(authorization["id"], deadline=deadline)
+            arena = Arena(self.settings, self.store, deadline=deadline)
             body = EvaluationInput(
                 **{
                     k: authorization["input"][k]
@@ -255,20 +266,29 @@ class Scheduler:
                     )
                 }
             )
-            arena_prepared = arena.prepare(body)
+            arena_prepared = arena.prepare(body, deadline=deadline)
             with self.store.connect() as c:
                 dispatch_lock(c)
+                check_deadline(deadline)
                 if execution_fenced(c) or queued_work(c):
                     return
-                claim = self.background.claim(c, authorization["id"], prepared=prepared)
+                claim = self.background.claim(
+                    c, authorization["id"], prepared=prepared, deadline=deadline
+                )
                 binding = {
                     key: claim[key]
                     for key in ("authorization_id", "date", "reservation_id")
                 }
                 result = arena.create(
-                    body, connection=c, background=binding, prepared=arena_prepared
+                    body,
+                    connection=c,
+                    background=binding,
+                    prepared=arena_prepared,
+                    deadline=deadline,
                 )
+                check_deadline(deadline)
                 self.background.attach(c, claim, result)
+                check_deadline(deadline)
             return result
         except BackgroundWaiting as error:
             self.background.dispatch_status(authorization["id"], "waiting", str(error))

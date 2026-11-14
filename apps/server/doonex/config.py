@@ -3,10 +3,14 @@
 import json
 import os
 import secrets
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from doonex.deadline import check_deadline
 from doonex.models import ModelConfig
+
+MAX_CREDENTIAL_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -57,7 +61,8 @@ class Settings:
             raise ValueError("请设置 DOONEX_DATABASE_URL；参见 README 本地启动说明")
         return cls(home, database_url, token, model)
 
-    def credential(self, model: dict | None = None) -> str | None:
+    def credential(self, model: dict | None = None, *, deadline=None) -> str | None:
+        check_deadline(deadline)
         name = (
             model["credential_env"]
             if model
@@ -68,11 +73,42 @@ class Settings:
         path = self.home / "credentials.json"
         if path.is_symlink():
             raise ValueError("凭据文件不能是符号链接")
-        if path.is_file():
-            if path.stat().st_mode & 0o077:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return None
+        try:
+            information = os.fstat(fd)
+            if not stat.S_ISREG(information.st_mode):
+                raise ValueError("凭据文件必须是普通文件")
+            if information.st_mode & 0o077:
                 raise ValueError("凭据文件权限必须是 0600")
-            return json.loads(path.read_text()).get(name)
-        return None
+            if information.st_size > MAX_CREDENTIAL_BYTES:
+                raise ValueError("凭据文件超过 1 MiB 限额")
+            body = bytearray()
+            while True:
+                check_deadline(deadline)
+                chunk = os.read(
+                    fd, min(64 * 1024, MAX_CREDENTIAL_BYTES + 1 - len(body))
+                )
+                check_deadline(deadline)
+                if not chunk:
+                    break
+                body.extend(chunk)
+                if len(body) > MAX_CREDENTIAL_BYTES:
+                    raise ValueError("凭据文件超过 1 MiB 限额")
+        finally:
+            os.close(fd)
+        try:
+            document = json.loads(body)
+        except (ValueError, UnicodeError):
+            raise ValueError("凭据文件 JSON 格式无效") from None
+        check_deadline(deadline)
+        if type(document) is not dict or (
+            document.get(name) is not None and type(document[name]) is not str
+        ):
+            raise ValueError("凭据值必须是字符串或 null")
+        return document.get(name)
 
 
 def redact(value, secrets_to_hide=()):

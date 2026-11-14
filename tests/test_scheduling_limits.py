@@ -1,6 +1,7 @@
 """Independent limits review using PostgreSQL, real SDK/Docker and fake transport."""
 
 import json
+import time
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -11,6 +12,7 @@ from doonex.arena import Arena
 from doonex.background import Background, BackgroundStopped
 from doonex.budget import BatchHalt, Ledger
 from doonex.config import Settings
+from doonex.deadline import ExecutionDeadlineExceeded
 from doonex.model_registry import ModelRegistry, RegistryError
 from doonex.scheduling import Scheduler, foreground_waiting
 from doonex.sdk import GuardedLLM
@@ -25,6 +27,96 @@ from test_worker import response
 tuning = tuning_fixture
 taskset_source = source_fixture
 pytestmark = pytest.mark.postgres
+
+
+def test_background_preparation_uses_one_deadline_and_expiry_does_not_claim(
+    tuning, store, monkeypatch
+):
+    settings, background, body, _ = tuning
+    draft = background.create(body)
+    grant = background.enable(draft["id"], draft["revision"])
+    scheduler = Scheduler(settings, store)
+    original = scheduler.background.prepare
+    deadline = time.monotonic() + 10
+    observed = []
+
+    def expired(*args, **kwargs):
+        observed.append(kwargs["deadline"])
+        return original(*args, **{**kwargs, "deadline": time.monotonic() - 1})
+
+    monkeypatch.setattr(scheduler.background, "prepare", expired)
+    assert scheduler.claim_next(deadline=deadline) is None
+    assert observed == [deadline]
+    final = background.get(grant["id"])
+    assert final["state"] == "enabled" and final["evaluation_id"] is None
+    assert final["snapshot"] == grant["snapshot"] and final["input"] == grant["input"]
+    assert final["dispatch_status"]["state"] == "blocked"
+    assert ExecutionDeadlineExceeded.__name__ in final["dispatch_status"]["reason"]
+    with store.connect() as c:
+        for table in ("arena_evaluations", "background_allocations", "runs"):
+            assert c.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"] == 0
+
+
+def test_background_preparation_keeps_deadline_through_atomic_batch_creation(
+    tuning, store, monkeypatch
+):
+    settings, background, body, _ = tuning
+    draft = background.create(body)
+    grant = background.enable(draft["id"], draft["revision"])
+    observed = []
+    for owner, method in (
+        (Background, "prepare"),
+        (Arena, "prepare"),
+        (Background, "claim"),
+        (Arena, "create"),
+    ):
+        original = getattr(owner, method)
+
+        def track(self, *args, _original=original, _method=method, **kwargs):
+            observed.append((_method, kwargs["deadline"]))
+            return _original(self, *args, **kwargs)
+
+        monkeypatch.setattr(owner, method, track)
+    deadline = time.monotonic() + 10
+    batch = Scheduler(settings, store).claim_next(deadline=deadline)
+    assert batch is not None and batch["background"]["authorization_id"] == grant["id"]
+    assert [name for name, _ in observed] == ["prepare", "prepare", "claim", "create"]
+    assert all(value == deadline for _, value in observed)
+    assert batch["usage"]["calls"] == batch["usage"]["tokens"] == 0
+
+
+@pytest.mark.parametrize("stage", ["metadata", "allocation"])
+def test_background_claim_expiry_rolls_back_original_grant_and_allocation(
+    tuning, store, monkeypatch, stage
+):
+    settings, background, body, _ = tuning
+    draft = background.create(body)
+    grant = background.enable(draft["id"], draft["revision"])
+    before_day = deepcopy(background.day(grant["date"]))
+    clock = [100.0]
+    original = getattr(Background, "_unchanged" if stage == "metadata" else "_refresh_day")
+    observed = []
+
+    def expire(self, *args, **kwargs):
+        if stage == "allocation" or kwargs.get("inspect_contents") is False:
+            observed.append(kwargs.get("deadline"))
+            clock[0] = 102.0
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        Background, "_unchanged" if stage == "metadata" else "_refresh_day", expire
+    )
+    monkeypatch.setattr("doonex.deadline.time.monotonic", lambda: clock[0])
+    assert Scheduler(settings, store).claim_next(deadline=101.0) is None
+    assert observed == ([101.0] if stage == "metadata" else [None])
+    saved = background.get(grant["id"])
+    assert saved["state"] == "enabled" and saved["evaluation_id"] is None
+    assert saved["input"] == grant["input"] and saved["snapshot"] == grant["snapshot"]
+    assert ExecutionDeadlineExceeded.__name__ in saved["dispatch_status"]["reason"]
+    assert background.day(grant["date"]) == before_day
+    with store.connect() as c:
+        for table in ("arena_evaluations", "background_allocations", "runs", "actions"):
+            assert c.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"] == 0
 
 
 def counts(store):

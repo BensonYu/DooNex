@@ -224,7 +224,7 @@ class Arena:
         profile = ModelRegistry(self.settings).get(body.model_profile_id)
         check_deadline(deadline)
         model = profile.model.model_dump()
-        if not self.settings.credential(model):
+        if not self.settings.credential(model, deadline=deadline):
             raise ValueError("所选模型凭据不可用")
         check_deadline(deadline)
         run_budget, batch_budget = (

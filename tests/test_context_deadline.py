@@ -92,7 +92,9 @@ def context(frozen_skill, frozen_taskset, model):
 
     store = Store()
     settings = SimpleNamespace(
-        home=registry.home, model=model, credential=lambda model: "offline-fixture-only"
+        home=registry.home,
+        model=model,
+        credential=lambda model, **kwargs: "offline-fixture-only",
     )
     now = datetime(2031, 4, 5, 10, tzinfo=UTC)
     service = Background(settings, store, clock=lambda: now)
@@ -175,6 +177,7 @@ def test_background_prepare_same_deadline_binding_and_budget(context, monkeypatc
     tracked(monkeypatch, service.library.skills, ["_load"], seen)
     tracked(monkeypatch, service.library.tasksets, ["_load"], seen)
     tracked(monkeypatch, background, ["environment", "digest"], seen)
+    tracked(monkeypatch, service.settings, ["credential"], seen)
     result = service.prepare(store.grant["id"], deadline=deadline)
     assert result == {
         "authorization_id": before["id"],
@@ -190,6 +193,7 @@ def test_background_prepare_same_deadline_binding_and_budget(context, monkeypatc
         "_load",
         "environment",
         "digest",
+        "credential",
     }
     assert all(value == deadline for _, value in seen)
 
@@ -210,6 +214,7 @@ def test_arena_prepare_integrity_and_start_share_deadline(context, monkeypatch):
     tracked(monkeypatch, service.library.skills, ["_load"], seen)
     tracked(monkeypatch, service.library.tasksets, ["_load"], seen)
     tracked(monkeypatch, arena, ["environment"], seen)
+    tracked(monkeypatch, service.settings, ["credential"], seen)
     bounded = service.prepare(evaluation_body, deadline=deadline)
     assert bounded == plain
     assert service.integrity(store.batch, approval=True, deadline=deadline) == {

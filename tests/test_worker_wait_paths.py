@@ -436,8 +436,8 @@ def test_sync_rechecks_parent_after_initial_read(settings, store, monkeypatch, c
     original_get = arena.get
     changed = []
 
-    def get(identifier, connection=None):
-        value = original_get(identifier, connection)
+    def get(identifier, connection=None, **kwargs):
+        value = original_get(identifier, connection, **kwargs)
         if connection is None and not changed:
             latest = deepcopy(parent)
             if change == "cancel":
