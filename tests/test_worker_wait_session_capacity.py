@@ -27,7 +27,13 @@ from doonex import sandbox as sandbox_module
 from doonex import sdk
 from doonex import workspace as workspace_module
 from doonex.budget import Ledger
-from doonex.session_store import LIMITS, MIB, SessionFileStore, canonical_sha256
+from doonex.session_store import (
+    LIMITS,
+    MIB,
+    SessionFileStore,
+    SessionStorageError,
+    canonical_sha256,
+)
 from doonex.store import Store
 from doonex.worker import Worker, run_directory
 from openhands.sdk.conversation.event_store import EventLog
@@ -866,33 +872,100 @@ def test_full_active_prompt_respects_original_input_contract_before_reserving(
     wide = _wide_tuning(tuning)
     _, _, _, batch = claimed(wide, store)
     identifier = batch["attempts"][0]["run_id"]
-    records, calls, reservations = [], [], []
+    original_run = store.get(identifier)
+    original_accounting = _accounting(store, batch["id"])
+    records, calls, reservations, tool_admissions, source_errors = (
+        [] for _ in range(5)
+    )
     _seed_hook(monkeypatch, store, shape, records, phase="before_model")
     original = Ledger.reserve
+    original_tool_intent = Ledger.tool_intent
+    original_validate = SessionFileStore.validate_source
 
     def reserve(ledger, *args, **kwargs):
         reservations.append(ledger.run_id)
         return original(ledger, *args, **kwargs)
+
+    def tool_intent(ledger, *args, **kwargs):
+        tool_admissions.append(ledger.run_id)
+        return original_tool_intent(ledger, *args, **kwargs)
+
+    def validate_source(current, value, **kwargs):
+        caller = sys._getframe(1).f_code.co_name
+        try:
+            return original_validate(current, value, **kwargs)
+        except SessionStorageError as error:
+            source_errors.append(
+                {
+                    "error_type": type(error).__name__,
+                    "reason": str(error),
+                    "caller": caller,
+                    "value_type": type(value).__name__,
+                    "latched_reason": current._failure,
+                }
+            )
+            print("worker_capacity_source_error=" + json.dumps(source_errors[-1]))
+            raise
 
     def forbidden(*args, **kwargs):
         calls.append(True)
         pytest.fail("The original input guards must refuse before model transport")
 
     monkeypatch.setattr(Ledger, "reserve", reserve)
+    monkeypatch.setattr(Ledger, "tool_intent", tool_intent)
+    monkeypatch.setattr(SessionFileStore, "validate_source", validate_source)
     monkeypatch.setattr(sdk.GuardedLLM, "_transport_call", forbidden)
     with _watchdog():
         Worker(wide[0]).run(once=True)
     final = store.get(identifier)
     assert final["state"] == "failed", final["reason"]
-    assert reason in final["reason"].lower()
+    if shape == "bytes":
+        # validate_source's original capacity exception is latched by the
+        # FileStore operation. The SDK's subsequent autosave sees that latch.
+        assert [
+            error
+            for error in source_errors
+            if error["reason"] == "Session source capacity exceeded"
+        ] == [
+            {
+                "error_type": "SessionStorageError",
+                "reason": "Session source capacity exceeded",
+                "caller": "_guarded_request",
+                "value_type": "list",
+                "latched_reason": "Session persistence failed",
+            }
+        ]
+        assert final["reason"] == "Session persistence failed"
+    else:
+        assert reason in final["reason"].lower()
+        assert not source_errors
     assert not calls and not reservations and not action_rows(store, identifier)
+    assert not tool_admissions
+    assert final["usage"] == original_run["usage"]
+    assert final["request"] == original_run["request"]
+    current_accounting = _accounting(store, batch["id"])
+    assert (
+        current_accounting["parent"]["usage"] == original_accounting["parent"]["usage"]
+    )
+    for key in ("allocations", "days"):
+        assert current_accounting[key] == original_accounting[key]
     assert final["usage"]["calls"] == final["usage"]["unknown_calls"] == 0
     assert final["usage"]["reserved_tokens"] == 0
     assert final["first_started_at"] is not None
     assert records[0]["events"] == 1000
     print(
         "worker_session_input_refusal="
-        + json.dumps({"shape": shape, "seed": records[0], "reason": final["reason"]})
+        + json.dumps(
+            {
+                "shape": shape,
+                "seed": records[0],
+                "reason": final["reason"],
+                "source_errors": source_errors,
+                "model_reservations": reservations,
+                "tool_admissions": tool_admissions,
+                "run_request_usage_and_parent_usage_background_rows_preserved": True,
+            }
+        )
     )
 
 
