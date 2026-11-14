@@ -451,7 +451,7 @@ function App() {
               {(selected.state === 'running' || selected.state === 'queued') && <button disabled={busy} onClick={() => control('pause')}>暂停</button>}
               {(isActive || selected.state === 'paused' || selected.state === 'interrupted') && <button className="danger" disabled={busy || selected.state === 'cancelling'} onClick={() => control('cancel')}>取消运行</button>}
               {selected.state === 'paused' && <button className="primary" disabled={busy || (recovery !== null && !recoveryReady)} onClick={() => control('resume')}>继续执行</button>}
-              {selected.state === 'interrupted' && <button disabled={busy} onClick={() => { void perform(async ({ signal, isCurrent }) => {
+              {(selected.state === 'paused' || selected.state === 'interrupted') && <button disabled={busy} onClick={() => { void perform(async ({ signal, isCurrent }) => {
                 const nextRecovery = await api.get<Recovery>(runPath(projectId, selected.id, 'recovery'), signal);
                 if (isCurrent()) { setRecovery(nextRecovery); setAcknowledge(false); }
               }); }}>核查恢复条件</button>}
