@@ -267,7 +267,7 @@ def _census(conversation):
     }
 
 
-def _seed_active(conversation, shape, *, target=1000):
+def _seed_active(conversation, shape, *, target=1000, entry_headroom=None):
     state, store = conversation.state, conversation.state._fs
     count = target - len(state.events)
     assert count > 900
@@ -287,8 +287,9 @@ def _seed_active(conversation, shape, *, target=1000):
             state.append_event(event)
             ids.append(event.id)
     state.rebuild_view()
-    if shape == "entries":
-        while len(store._files) + len(store._dirs) < LIMITS.entries - 8:
+    if shape == "entries" or entry_headroom is not None:
+        headroom = 8 if entry_headroom is None else entry_headroom
+        while len(store._files) + len(store._dirs) < LIMITS.entries - headroom:
             store.write(f"capacity-sidecar-{len(store._files):05d}", "x")
     store.verify_inventory()
     branch = state.active_branch()
@@ -303,20 +304,23 @@ def _seed_active(conversation, shape, *, target=1000):
     assert value["active_branch_events"] >= count
     if shape == "bytes":
         assert 62 * MIB <= value["logical_bytes"] < LIMITS.total_bytes
-    if shape == "entries":
-        assert value["entries"] == LIMITS.entries - 8
+    if shape == "entries" or entry_headroom is not None:
+        assert value["entries"] == LIMITS.entries - headroom
     value["sdk_generated_seed_ids_sha256"] = canonical_sha256(ids)
     return value
 
 
-def _seed_hook(monkeypatch, store, shape, records, *, phase):
+def _seed_hook(monkeypatch, store, shape, records, *, phase, entry_headroom=None):
     if phase == "receipt":
         original = sdk._SchedulingRuntime.receipt
 
         def receipt(runtime, conversation):
             if not records:
                 record = _seed_active(
-                    conversation, shape, target=1020 if shape == "events" else 1000
+                    conversation,
+                    shape,
+                    target=1020 if shape == "events" else 1000,
+                    entry_headroom=entry_headroom,
                 )
                 records.append(record)
             result = original(runtime, conversation)
@@ -334,7 +338,9 @@ def _seed_hook(monkeypatch, store, shape, records, *, phase):
         identifier = conversation.state.agent.doonex_run_id
         if not records and store.get(identifier)["request"].get("background"):
             try:
-                records.append(_seed_active(conversation, shape))
+                records.append(
+                    _seed_active(conversation, shape, entry_headroom=entry_headroom)
+                )
             except BaseException:
                 # __init__ has returned from the real SDK, but the outer local
                 # variable is not assigned yet. Close that actual SDK instance.
@@ -384,7 +390,15 @@ def test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore(
     with monkeypatch.context() as warm:
         _replace_pending_command(warm)
         _seed_hook(
-            warm, store, shape, seeded, phase="init" if shape == "small" else "receipt"
+            warm,
+            store,
+            shape,
+            seeded,
+            phase="init" if shape == "small" else "receipt",
+            # Native sidecars count toward the unchanged directory contract.
+            # Leave 32 entries for real model/status and restored observations;
+            # retain every sidecar through the complete cold inventory.
+            entry_headroom=32 if shape == "small" else None,
         )
         with _watchdog():
             chat_timeline_fixture(
@@ -459,6 +473,10 @@ def test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore(
     assert set(original_files.items()).issubset(set(reads))
     final_files = _files(root)
     assert all(final_files[name] == digest for name, digest in original_events.items())
+    final_entries = sum(1 for _ in root.rglob("*"))
+    if shape == "small":
+        assert seeded[0]["entries"] == LIMITS.entries - 32
+        assert seeded[0]["entries"] <= final_entries <= LIMITS.entries
     assert [r["kind"] for r in action_rows(store, paused["id"])] == [
         "model",
         "shell",
@@ -476,6 +494,7 @@ def test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore(
                 "warm_seed": seeded[0],
                 "cold_all_original_files_read_and_hashed": True,
                 "cold_original_event_count": len(original_events),
+                "cold_final_directory_entries": final_entries,
                 "original_usage_and_parent_ledgers_preserved": True,
                 "additional_model_calls": 0,
                 "transport": "synthetic",
