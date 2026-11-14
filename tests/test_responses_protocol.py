@@ -442,7 +442,8 @@ def test_provider_metadata_is_validated_and_projected_before_pinned_sdk():
         ("max_tool_calls", 4097, "response_metadata"),
         ("service_tier", ["default"], "response_metadata"),
         ("service_tier", "unknown-private-value", "response_metadata"),
-        ("prompt_cache_key", "not-a-uuid", "response_metadata"),
+        ("prompt_cache_key", "x" * 257, "response_metadata"),
+        ("prompt_cache_key", 1, "response_metadata"),
         ("prompt_cache_retention", "forever", "response_metadata"),
         ("safety_identifier", "x" * 129, "response_metadata"),
         ("top_logprobs", 21, "response_metadata"),
@@ -474,6 +475,19 @@ def test_provider_projection_never_accepts_arbitrary_or_executable_extras(
     assert "private" not in str(caught.value) and "secret-value" not in str(
         caught.value
     )
+
+
+@pytest.mark.parametrize("key", ["", "opaque-provider-cache-key", "x" * 256])
+def test_provider_cache_key_is_an_opaque_bounded_string_not_an_identity(key):
+    response = sample_response()
+    assert (
+        protocol.project_provider_response({**response, "prompt_cache_key": key})
+        == response
+    )
+    arm = sample_arm()
+    arm["call"]["prompt_cache_key"] = key
+    with pytest.raises(protocol.ProtocolError):
+        protocol.validate_call(arm["call"], client_request_id=CLIENT_ID)
 
 
 @pytest.mark.parametrize(

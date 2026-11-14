@@ -765,7 +765,9 @@ def project_provider_response(response: dict) -> dict:
                 in {"auto", "default", "flex", "scale", "priority", "fast"}
             )
         if response.get("prompt_cache_key") is not None:
-            _uuid(response["prompt_cache_key"])
+            # Provider cache keys are opaque strings, not request identities.
+            # The pinned SDK's outgoing cache key remains UUID-constrained.
+            _string(response["prompt_cache_key"], 256)
         if response.get("prompt_cache_retention") is not None:
             _require(type(response["prompt_cache_retention"]) is str)
             _require(
