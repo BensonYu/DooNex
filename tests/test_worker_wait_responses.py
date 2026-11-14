@@ -149,8 +149,12 @@ def test_actual_isolated_worker_wait_timeline(
     background_stage,
     foreground_kind,
     near_deadline=False,
+    request_timeout_seconds=None,
+    extra_observation_seconds=0,
 ):
     settings, _, body, repository_path = tuning
+    if request_timeout_seconds is None:
+        request_timeout_seconds = 8 if near_deadline else 30
     eof, closed = [], []
     original_eof = responses_process._eof_and_exit
     original_close = responses_process._Resources.close_all
@@ -186,7 +190,7 @@ def test_actual_isolated_worker_wait_timeline(
                     "responses_transport": "isolated_direct_v1",
                     "base_url": provider.url,
                     "allow_private_http": True,
-                    "timeout_seconds": 8 if near_deadline else 30,
+                    "timeout_seconds": request_timeout_seconds,
                 }
             ),
         )
@@ -201,6 +205,7 @@ def test_actual_isolated_worker_wait_timeline(
             ResponsesProviderPatch(monkeypatch, provider),
             background_stage,
             foreground_kind,
+            extra_observation_seconds=extra_observation_seconds,
         )
         assert not provider.errors, provider.errors
         if near_deadline:
@@ -277,4 +282,24 @@ def test_isolated_request_completes_near_original_deadline(
         "model",
         foreground_kind,
         near_deadline=True,
+    )
+
+
+def test_isolated_sixty_second_request_completes_near_original_deadline(
+    tuning, taskset_source, store, request_data, tmp_path, monkeypatch
+):
+    # Keep the real helper deadline at the original 60 seconds. Only the
+    # surrounding test's observation guard receives additional finite time.
+    test_actual_isolated_worker_wait_timeline(
+        tuning,
+        taskset_source,
+        store,
+        request_data,
+        tmp_path,
+        monkeypatch,
+        "model",
+        "ordinary",
+        near_deadline=True,
+        request_timeout_seconds=60,
+        extra_observation_seconds=60,
     )
