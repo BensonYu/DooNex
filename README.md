@@ -48,7 +48,7 @@ M5 面向自托管单站点，范围与实际检查见 [M5 记录](docs/M5_IMPLE
 
 首个验证环境为 Apple Silicon Mac mini、macOS、Docker 与 Python 3.12。系统 Python 3.9 不用于应用运行；`uv` 根据项目约束创建 Python 3.12 环境。还需可用的 Git、Node.js 和 `pnpm`，前端包管理器锁定为 `pnpm@11.1.1`。这些命令供本机开发使用，不代表已验证其他硬件或公网部署。
 
-当前整合成果位于 `codex/responses-transport` 分支，`main` 暂保留 M3，等待 M4 剩余退出条件通过。本轮已整合原子 helper 身份、有限数据库维护及 [SDK 会话容量](docs/M4_SESSION_CAPACITY.md)，真实验收源码 `b462502` 通过 **1826 项本机测试**、Ruff 和前端构建。后续已整合有限 Git/export、Sandbox 清理、内容/交付及逐次 SDK 请求的共同期限，`f271bfb` 联合专项 390 项通过。初始化、凭据及后台领取期限 `61a9dd3` 的完整回归 **2126 项通过**，同一源码的 Ruff 和前端构建通过。其后持久 controller 登记、生产 actor、Git/Sandbox 入口和锁外 cleanup 已纳入 `a5c7ece`，**160 项专项**、Ruff 与前端构建通过；旧调用方迁移和新整合完整回归仍待，不能沿用 2126 项为当前源码结论。证据及剩余退出条件见[续接记录](docs/M4_RESUMPTION_20261113.md#持久-controller-生产接线)与[等待控制计划](docs/M4_WAIT_CONTROL_PLAN.md)。当前 API/worker 未加载，保留的 plist 仍指向旧 M5 版本；常驻服务尚未升级。以下命令检出当前整合分支。
+当前整合成果位于 `codex/responses-transport`，`main` 暂保留 M3。M4 收尾应用候选 `e868ad3` 已接入持久 controller、锁外清理、共享执行时钟和有限调度集合；旧调用方测试迁移已整合。实际 Worker.run 的小容量正常矩阵及原 60 秒动作限制内的 55 秒真实容器等待样本已通过；隔离 Responses 基础矩阵与原 60 秒样本已通过，故障场景已有分轮通过证据；近容量、历史调度规模与最终全量仍在验证，不能沿用历史 2126 项回归作为当前源码结论。具体源码、失败及原始收据见[续接记录](docs/M4_RESUMPTION_20261113.md#m4-收尾共同期限与完整调度候选2026-11-14继续中)与[等待控制计划](docs/M4_WAIT_CONTROL_PLAN.md)。当前 API/worker 未加载，保留的 plist 仍指向旧 M5 版本；常驻服务尚未升级。以下命令检出当前整合分支。
 
 ```bash
 git clone --branch codex/responses-transport git@github.com:BensonYu/DooNex.git doonex

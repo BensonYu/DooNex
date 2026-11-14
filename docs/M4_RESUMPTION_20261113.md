@@ -230,6 +230,8 @@ PYTHONPATH=apps/server:tests .venv/bin/python scripts/test_local.py \
 
 当前应用候选为 `e868ad3`，父分支仍 `codex/responses-transport`。已纳入 Community/Generation/Worker SIGKILL 的生产 actor fixture 迁移、yielded 同一期限、Arena 有限维护、ExecutionClock 和 Background 时钟接线；不改模型、凭据、单 Run/批次/日额度或历史未知。本节不是最终退出结论，完整 Worker.run 等待矩阵和最终全量仍待。
 
+最新进度：隔离 Responses 基础 15 场景和故障矩阵的全部场景已有分轮实际通过证据，已纳入父整合；原 60 秒 Responses、近容量和最终整合全量仍待。下文各轮失败及其首错后未执行项保留原义，不能把分轮通过相加冒充最终全量通过。
+
 调用链修正：Worker、Scheduler、Background 共享一次进程生命周期 clock；Run 原首次启动、批次、allocation、窗口和 UTC 日截止只收紧，退出/让出后不重新计算出更晚期限；SDK store 和 Responses binding 同步收紧当前 bound。启动恢复和每轮准备复用各自的 30 秒协作期限；必要清理仍有独立 15 秒窗口，不等于整段 startup 的硬上界。reconcile 在提交 intent 后、开始外部 cleanup 前复检期限；如已过期，intent 保留，下次真实启动先阻止恢复/派发，不补造清理成功。yielded 探测前后均校验旧 owner/request，不能借新归属继续派发。
 
 候选工作量边界为 16 个 yielded、64 个 active/interrupted 恢复记录、64 个启动活动批次；cap+1 拒绝完整集合，保留原记录。64 个恢复记录包含历史 interrupted，积累过多会保守拒绝，不能声称任意历史规模可直接启动。批次计划复用已有 1–400 个唯一 Run 的有限核验。Background 全日 allocation 汇总仍依赖原数据库查询和健康规模条件，前后 deadline 检查不构成 SQL 工作量硬界。
@@ -274,3 +276,26 @@ PYTHONPATH=apps/server:tests .venv/bin/python scripts/test_local.py \
 父 `worker-recovery-integration-01` 在 `1e7ada2` 对 `tests/test_worker_process.py`、`tests/test_m3_api.py` 的整合检查为 **25 passed / 1 warning / 91.76 秒 / exit 0**（外层 96.260 秒），全部非 Markdown 输入相同。实际硬中断保留未决 controller 阻止及 API 恢复入口通过；日志 SHA256 `2ff4df9f0a91d599333c9467ad5dfcedc8a4d199a9291997b75730bdc376be44`。PG 与 Run-label 容器成功查询为空。该结果关闭原迁移后的两个模块复验，不能替代新 checkpoint/cleanup 故障矩阵或完整全量。
 
 父 `worker-long-inflight-01` 的两项实际容器等待检查 **2 passed / 2 warnings / 132.01 秒 / exit 0**（外层 136.911 秒），输入前后不变；独立进程组 watchdog 为 360 秒且未触发。前台入队提交后，shell/verifier 容器分别继续真实工作 55 秒，实际 Sandbox 收到原 60 秒动作上限；完整结算、清理、回执/close 和首次前台准入继续走同一 Worker.run。入队提交到首次准入区间分别为 **56.755135–56.767005 秒**、**56.610749–56.624138 秒**，后台没有新增动作或兄弟工具，原已结算账目与首次时钟保持。测试修正与新场景已提交 `cb13165`，只增加合成 gate 的默认零延迟参数，不更改产品配置或期限。日志 SHA256 `56f206c627dccdfe6c8e825dffee6c8a2cf6dfbcbe4a327706152f9f449e9ab0`，PG/Run-label 库存成功查询为空。该实测仍是小容量和无前置前台，不能代替近容量、隔离 Responses 或异常路径验收。
+
+
+### 隔离 Responses 与完整 Worker 故障场景
+
+`822ef90` 的实际 Responses 基础矩阵为 **15 passed / exit 0**，外层 179.437 秒，195 个跟踪输入前后及 Git blob 相同；父整合为 `b3e459e`。四个后台在途阶段 × 三类前台走实际 SDK Responses 转换、binding、helper/匿名管道/lease，仅 HTTP 供应商为本机合成服务，禁止进入父进程假传输。另三个 8 秒配置临近截止场景分别在实际 helper 截止前约 1.2471、1.2460、1.2468 秒发送响应；helper 均实际 reap/EOF、FD/selector 关闭、lease unlocked。8 秒样本不外推原 60 秒配置。原始收据 `m4-worker-wait-faults/responses-matrix-00/RECEIPT.json` SHA256 `f6f665e2b1f85fd7b71fa72ae4f38c7fd79ccc04ed1d2b7e2f2b89f693c5390f`，日志 SHA256 `012580b7c86a862a9ca7ab2680078e7fa02a8e4aa6a2071b697bace225e46285`；先行单例 `responses-single-00` 也退出 0。两轮无 watchdog 触发，PG 已删除，最终 Run/test 标签库存成功查询为空。
+
+故障分片的产品仍为 `e868ad3`，测试最终 `3335e37`，父整合至 `4afc1ab`；分轮覆盖全部 12 场景，尚须最终整合全量验证。以下失败不是产品安全检查失败，分类来自实际入口及调用链核对，不据失败名称推断：
+
+- `fault-fifo-01` 在 Worker 前拒绝：私有 runner 把 basetemp 放入应用管理目录，TaskSet 正确拒绝；runner004 改用系统独立临时目录，原产品边界保持。`fault-fifo-02` 单例通过。
+- `fault-matrix-01` 为 **4 passed / 1 failed**，首错后 7 场景未执行。特殊/变化文件及两个共同期限场景通过；持 SDK 锁时产品按期限拒绝，测试错误匹配英文而实际原因为中文。`e699d173` 仅改成准确原因，并保留 budget_exceeded、实际 deadline 后释放和无救援旁路断言；`fault-sdk-lock-01` 单例通过。
+- `fault-tail-01` 为 **2 passed / 1 failed**，后续未执行。真实 SDK close 返回后合成 TimeoutError、真实 PG checkpoint 行锁等待通过；Docker ACK 夹具漏了直接 `_Supervisor.process` 的 start 入口，故在目标故障之前被夹具自身拒绝。`3335e37` 把绑定观察移到唯一实际启动入口，原调用不变；没有以修改生产清理逻辑适应错误夹具。
+- `fault-ack-rm-01` 单例通过：真实 Docker rm 已完成，shim 延迟其 CLI 回执，产品终止/reap/EOF 后以实际独立 ps 证明零残留；后台安全让出，前台验证完成。收据 SHA256 `7c9709351b9d1577da0931aee0774526467f11e83ead5e410a3dbce7b25b5a30`。
+- `fault-final-tail-01` **4 passed / exit 0**，外层 38.502 秒：实际 ps 回执丢失持久阻止前台及重启；before_save、after_commit、cleanup_intent_committed 三点真实 SIGKILL 后均先核查、不重放。原 Arena/日账/分配/首次时钟保持，cleanup intent 的 1 unknown / 4,824 reserved tokens 保留。收据 SHA256 `43d08e0605e46a77ae0ea3fbed0b76732a185817e1a87f6cb1867ddd5aedd15a`。
+
+故障原始收据位于 `m4-worker-wait-faults/fault-*/RECEIPT.json`；每轮输入不变，无 watchdog 触发，pytest EOF/reap、精确资源清点和 PG 删除有记录。close 故障是实际返回后注入；ACK 故障是实际 Docker 完成后的 CLI 回执延迟，不伪称 daemon 内部永久停滞。正常等待与故障拒绝分开统计，任何未知仍阻止派发，未改变生产账本或模型配置。
+
+
+原 60 秒 isolated Responses 后续样例 `responses-sixty-00` 也已通过：源码 `091f86f`，父整合为 `df275fe`，exit 0、外层 74.433 秒，195 个输入前后及 Git blobs 一致；没有改变产品期限，只为合成 fixture 增加显式观察时间。响应在实际 armed helper deadline 前 **1.241098 秒**送达，入队提交到首次前台准入为 **59.424576–59.445822 秒**；两个 helper 实际 reap，全部 FD/selector 与 lease 关闭，watchdog 未触发，PG/Run-label 清点为空。收据 SHA256 `671a38b717186a51de75bdc2c0f97ca154048bbc7f0ab1e24d993e0cfd9d55ae`，日志 SHA256 `de53712e1af890e7b00a80fc94676774a11a1a93c360c83d8b5f0991702c2955`。这是原 60 秒配置的小容量完整路径观测，不是任意容量或外部供应商 SLA。
+
+
+近容量会话首两轮尚未通过：`capacity-small01` 在最终 close 次数断言失败；`capacity-small02` 在三次 receipt 必须全相同的断言失败。两轮实际 Worker 最后均完成，但不因此改写测试退出 1。第二轮后停止追加补丁，审计真实 SDK 初始化、发送消息、恢复验证、再次让出、保存回执、最终 pending 动作和 close 全链。审计确认旧 fixture 在 SDK 正常初始 SystemPrompt 之前插入 1000 事件，导致冷恢复合法追加相同的 SystemPrompt 与 Pause；原事件是完整相同前缀、原两项 Action 身份与结算记录保持，最终 Observation 各一次。应将合成历史插入移至真实初始化之后，并精确核对 R0 验证 → R1 保存 → R1 验证，不能简单允许任意摘要变化。
+
+close 原解释同时更正：先前口头称“finish 关闭后 finally 再关闭”未经源码支持；源码核对为 `run_session` 的 finally 和 `LocalConversation.__del__` 的幂等 close，后续观察器须保留真实 caller 与所有清理完成证据。原工件审计 `m4-worker-session-capacity/LIFECYCLE_AUDIT_001.json` SHA256 `455185f887d86c2a6cc74b83bed77f493f34c3900b158da6403ba5a0de27ce0c`；small02 收据 SHA256 `6cce417774cf3dcd262a6d63bb07a40bb6696f77c8840a5b48f3b966302a07b1`，日志 SHA256 `061f9e678e47e7bcc6cbc4f169d217ff8ce178b9c6a19545af777bdc705bf8d9`。原 PG/Run 库存成功查询为空，watchdog 未触发；修正后的行为仍待。
