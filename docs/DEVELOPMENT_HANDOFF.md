@@ -2,6 +2,26 @@
 
 更新：2026-11-14；用户于 2026-11-13 恢复开发，最新验收收据为 **UTC 2026-11-14**。用户已明确结束暂停；本页是当前启动入口。原暂停快照保存在 Git 提交 `6a0a227`，不要照其中“尚未执行”的命令重放本轮已执行动作。完整经过、失败和证据见[续接记录](M4_RESUMPTION_20261113.md)。
 
+## 2026-11-14 持续目标清除后的恢复点
+
+本轮持续目标已被用户清除，已停止派发新开发/测试切片；正在执行的父检查只做收尾。下次明确继续时先核对本节，不新建重复整合分支，也不按旧计划重放真实模型验收。`main` 的剩余退出条件没有变化。
+
+| 对象 | 保存状态与下一步 |
+| --- | --- |
+| 父整合分支 | `codex/responses-transport` 的 `ac0a075665020ceabe9cd34e2d155b4c369f24b9` 已推送并逐哈希核对 GitHub；其前已纳入 Tasksets `b794e70`、Background/Scheduling `f1cdeb5` 与调度预检共同期限 `514774a` |
+| 父当前修复 | 保留真实 cleanup attempt、未知回执库存和 overflow；普通 API resume 在 Review/Git/容器探测前拒绝已有 fence；Worker 最后 model/tool/verification 准入传同一期限并复检。联合 `controller-preflight-integration-02` 是 **396 passed / 1 failed / exit 1**，不能写成通过；原历史未知恢复用例已按既有安全合同迁移，尾部复验结果见本轮续接记录 |
+| Community 测试迁移 | `codex/m4-community-evidence-actors` / `ab36a07ee63fabdfc1a8cce0abe74a49ae5b18dd`，目录 `m4-bounded-git-export/doonex`；仅 `test_community_evidence.py`、`test_community_review.py`。组件 **36 passed / exit 0**、120 个输入与原提交绑定；尚未 cherry-pick 到父，未推送；父所需 `test_community_integration.py` registry alias 已在 `ac0a075` |
+| Generation 测试迁移 | `codex/m4-generation-evidence-actors` / `82dafbb857720a5f002e68eaab1efe135f67bf21`，同名 worktree；仅 `test_generation.py`、`test_content_deadline.py`。四模块组件 **113 passed / exit 0**、121 个输入与原提交绑定；尚未 cherry-pick 到父，未推送；共享 `setup_generation` 没有改动 |
+| yielded 共同期限候选 | `codex/m4-yielded-shared-deadline`，目录 `m4-sandbox-deadline/doonex`，HEAD `514774a`；**未暂存、未提交**的 `apps/server/doonex/scheduling.py` 和新增 `tests/test_yielded_deadline.py`。candidate003 静态及独立只读审查通过，19 项行为检查完全未执行；不清理该工作区 |
+| Worker 硬中断测试候选 | `codex/m4-worker-kill-actors` / `e7445607e600ff2ef907e1121cd2eeb7dee6e116`，同名 worktree，父提交恰为 `ac0a075`；仅 `test_worker_process.py`、`test_m3_api.py`，工作区干净。静态及 25 项收集通过，真实 PG/Docker 行为完全未执行；尚未整合、未推送 |
+| 尚无实现的设计 | 有限 yielded cap+1/完整集合审计及跨 Run/批次/分配/窗口的进程生命周期 monotonic 映射仍只是设计。clock core 新任务仅做只读准备，未创建分支/worktree或源码；不能当成已实现 |
+
+上述子工作区均位于 `/Users/benson/.codex/worktrees/`；已有提交/候选、私有收据和原失败保留。完成组件的原输入绑定不代替父整合验收，真实硬中断候选依赖父当前提前 fence 修复。父尾部 `controller-scheduling-tail-01` 已结束，**107 passed / 1 failed / exit 1**：历史私有 fixture 清点得到 `existing_task_container` 而拒绝执行，迁移后的历史未知拒绝恢复用例已通过。一次性 PG 与 pytest 已退出，留下一个已停止的 Run-label 容器；只做了私有清点，没有删除，不能按标签宽扫清理。
+
+下一次先核对尾部失败收据与该容器的原操作归属，再依次取得独占 PG/Docker 资源验证 yielded 19 项及硬中断两个模块，确认清理后才移交；通过后仅整合各自负责文件并完成新完整回归。不要再次执行已完成的 Community/Generation 原组件轮来冒充最终整合，也不从失败消息猜测容器归属。父全部 160 个非 Markdown 尾部输入已逐项绑定 `ac0a075`；失败收据及清点为 `resume-20261113/controller-scheduling-tail-01.json/.log`、`controller-scheduling-tail-01-source-binding.json`、`controller-scheduling-tail-01-container-inventory.json`，后者明确是只读、未清理。
+
+私有证据相对 `~/Library/Application Support/DooNex/verification/`：Community 与 Generation 分别为 `m4-community-evidence-actors/`、`m4-generation-evidence-actors/` 的 `pg_001.json/.log`、`HANDOFF.md`、`FINAL_RECEIPT.json`；yielded 为 `m4-yielded-shared-deadline/static-3.json`，SHA256 `1585c14fa6deba16312dc63c6b185dda03b405cd1166cec0675cd67e1aa7f68d`；硬中断为 `m4-worker-kill-actors/STATIC_RECEIPT_002.json`，SHA256 `39bfd0d258c41d9378023b7809d8aa05f1ad0b53eaec48784501b9533d8c285d`。各片独立审查位于 `m4-wait-control-review-20261114/`。这里只保存脱敏事实，原始材料不进入产品 Git。
+
 ## 当前状态与源码
 
 | 对象 | 当前事实 |

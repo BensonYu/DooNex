@@ -41,7 +41,7 @@ API immediate control、Worker reconcile 与 execute 异常三处清理已移出
 
 上述实现按块和项检查 read/write/hash/copy/archive/patch 剩余期限；Git stdout/stderr 与原始树条目在过滤前计数、有限读取，保留危险配置/helper 禁用及 Git 对象类型/大小/提交绑定。只复用冻结不可变且绑定 digest 的准备结果，实际使用前继续核验；首次摘要移出长事务后仍重锁并复核 owner、状态和基线。后续仍须在最终源码验证近容量、超限与完整调度路径，不能从组件数推导完整上界。
 
-另一个尚未贯穿的链是锁内 Scheduler.preflight → Background.preflight → metadata `_unchanged`：其仍读取模型/凭据/环境文件，不能因为不检查 task contents 就视为纯数据库复核。Worker 模型/工具及 verifier 准入、后台 maintain 都会调用，必须继续传递共同期限并在最后准入前复检；必要核验不能为缩短数字而省略。与有限 yielded 候选及批次/窗口的 monotonic 映射一起完成后，再进行完整 Worker.run 验收。
+锁内 Scheduler.preflight → Background.preflight → metadata `_unchanged` 的共同期限已在 `514774a` 接通，19 项组件通过；Worker 模型/工具及 verifier 的最后准入和返回后复检已在 `ac0a075` 接入。预检仍读取模型/凭据/环境文件，必要核验保留。父联合检查为 396 passed / 1 failed，并非联合通过，剩余复验见[续接记录](M4_RESUMPTION_20261113.md)。maintain 复用调用方期限与 30 秒准备窗口的较小值；Arena.stop/sync 仍有只在外部检查的区间，不能将局部接线说成完整维护上界。有限 yielded 集合及跨生命周期批次/窗口 monotonic 映射仍待，完成后再做完整 Worker.run 验收。
 
 普通、Arena、generation 的前台初始化分别验证。健康本地 IO 下可以约束有限工作量；fsync、replace、阻塞系统调用、文件系统失联或宿主磁盘配额不能由局部 Python deadline 保证。新增整进程边界或宿主写盘配额如改变架构，先记录具体证据与决策。
 

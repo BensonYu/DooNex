@@ -209,8 +209,18 @@ PYTHONPATH=apps/server:tests .venv/bin/python scripts/test_local.py \
 
 父候选将这个 deadline 传给 Worker 的 Ledger model/tool 准入及 GuardedVerifier，并在 preflight 返回后再次检查，再写新 action。新增三个真实 Worker.run/PG/SDK 合成传输检查分别覆盖 model、shell 和 verification 返回后到期，核对实际 action、原已结算用量、未知预留、首次时钟与 SDK 关闭。首轮 `controller-preflight-integration-01` 实际 **1 failed / 13 passed / 2 warnings / 6.64 秒 / exit 1**（外层 10.129 秒），日志 SHA256 `20d52982176ced5d65603955ac93e0a1086289eed3cfc01cbdccecc4f06ce008`：新测试的模拟时钟持续影响 execute 结束后的 maintain。仅将模拟 clock 限于真实 Worker.execute 作用域，保留触发和账本断言，没有修改产品来通过；失败收据保留。
 
-`controller-preflight-integration-02` 已结束：**396 passed / 1 failed / 2 warnings / 599.04 秒 / exit 1**（外层 602.687 秒），159 个非 Markdown 输入前后相同，日志 SHA256 `7ab52924e15059203f0d0f367583ff586563330e9a193d97057d92c3428d6c16`。三个新 Worker 准入到期检查及恢复/证据修复已在本轮实际执行；整轮在 `-x` 首次失败处停止，后续用例未运行，不能记为联合通过。pytest 和一次性 PG 已退出并确认清理。
+`controller-preflight-integration-02` 已结束：**396 passed / 1 failed / 2 warnings / 599.04 秒 / exit 1**（外层 602.687 秒），160 个非 Markdown 输入前后相同，日志 SHA256 `7ab52924e15059203f0d0f367583ff586563330e9a193d97057d92c3428d6c16`。三个新 Worker 准入到期检查及恢复/证据修复已在本轮实际执行；整轮在 `-x` 首次失败处停止，后续用例未运行，不能记为联合通过。pytest 和一次性 PG 已退出并确认清理。
 
-失败用例人工写入没有原 controller operation 身份的历史 `recovery.remaining/errors`，再要求普通 Arena resume 根据空容器列表清除阻止。此行为违反既有历史未知合同，不能通过产品旁路恢复。现保留真实 Worker 中断、原未知调用/预留、日账和首次时钟，改验收为两种确认值均在新探测之前拒绝；完整 Run、批次、日账、动作、controller 行与事件不变，不确认或返还未知用量。该迁移后的行为复验仍待；Ruff 已通过，不能用静态检查冒充行为通过。
+失败用例人工写入没有原 controller operation 身份的历史 `recovery.remaining/errors`，再要求普通 Arena resume 根据空容器列表清除阻止。此行为违反既有历史未知合同，不能通过产品旁路恢复。现保留真实 Worker 中断、原未知调用/预留、日账和首次时钟，改验收为两种确认值均在新探测之前拒绝；完整 Run、批次、日账、动作、controller 行与事件不变，不确认或返还未知用量。迁移后的实际行为结果见下节；Ruff 已通过，不能用静态检查冒充行为通过。
+
+### 持续目标清除后的最后收尾
+
+用户随后清除了持续目标；父与三个子任务均停止新增开发/测试，未继续实施有限 yielded cap 或 clock core。父实现已保存为 `ac0a075665020ceabe9cd34e2d155b4c369f24b9`，正常推送后用 `git ls-remote` 精确核对；`main` 仍是 `a965d7f`。没有真实模型调用、生产账本写入、服务启动或升级。
+
+清除目标前已启动的 `controller-scheduling-tail-01` 只做收尾，结果为 **107 passed / 1 failed / 2 warnings / 202.16 秒 / exit 1**（外层 205.217 秒），160 个非 Markdown 输入前后相同，HEAD 为 `ac0a075`，日志 SHA256 `cf38b8be5592a43a9dcd6e2f40ff5da620dda90436b8548909c2ec3f13a7c94a`。它实际运行 `test_scheduling_limits.py`、`test_scheduling_maintenance.py`、`test_scheduling_latency.py`、`test_context_deadline_pg.py` 和 `test_live_background.py`，使用 `-x`；上述历史未知拒绝恢复用例在这轮已通过，整轮仍未通过，后续用例没有运行。
+
+唯一失败是 `test_private_historical_fixture_with_postgres_docker_and_synthetic_model`：其 test-owned `fixture_inventory` 执行全局 Run-label Docker 清点，返回 `existing_task_container`，历史私有 fixture 拒绝运行，`main` 按原合同 exit 1。日志只证明当时库存非空，尚未确认容器原操作归属或产生者，不能先认定产品故障、无关残留或放宽检查。不要重启公开 `live_background.py`（正式入口仍明确禁用），也不能为通过测试宽扫删除容器。pytest、wrapper 与一次性 PG 已结束并确认清理；后验只读清点见到一个 Exited (0) 的 Run-label 容器，没有正在执行的任务容器，未作删除。脱敏字段清点保存在私有 `controller-scheduling-tail-01-container-inventory.json`；原操作归属核查留给下次恢复。
+
+本次全范围 Ruff `controller-preflight-ruff-03` exit 0；不把它或上述 107 项与之前 396 项相加作为当前完整回归。Community 的 36 项与 Generation 的 113 项独立组件通过且原提交绑定，尚未整合；yielded candidate003 与 Worker SIGKILL 两模块只有静态证据，未运行行为验收。精确工作区、提交和收据见[交接恢复点](DEVELOPMENT_HANDOFF.md#2026-11-14-持续目标清除后的恢复点)。
 
 上述检查是健康本地操作之间的协作期限；Arena.stop/settle 内部仍有只在前后检查的区间，数据库 commit、阻塞系统调用不能由局部检查中断。有限 yielded 集合、跨 execute/角色/批次的进程内 monotonic 不续期映射和完整 Worker.run 等待矩阵仍待，不能称完整维护或前台等待已通过。
