@@ -436,8 +436,15 @@ def test_pure_probe_timeout_does_not_fabricate_cleanup_evidence(yielded, monkeyp
     assert not yielded.scheduler.cleanup_blocked
 
 
+def controller_rows(context):
+    with context.store.connect() as connection:
+        return connection.execute(
+            "SELECT id,data FROM controller_operations ORDER BY id"
+        ).fetchall()
+
+
 @pytest.mark.parametrize("cancelled", [False, True])
-def test_timeout_daemon_chain_keeps_prior_real_operation_inventory(
+def test_prior_unknown_refuses_new_probe_without_changing_evidence(
     yielded, monkeypatch, cancelled
 ):
     run = yielded.store.get(yielded.run_id)
@@ -465,31 +472,97 @@ def test_timeout_daemon_chain_keeps_prior_real_operation_inventory(
             "cleanup_attempt_evidence": prior_attempt,
             "controller_process_evidence": [prior_receipt],
         }
-    cause = SandboxError("Controlled daemon uncertainty")
-    cause.cleanup_evidence = {
-        "daemon_request_unknown": True,
-        "controlled_probe_fault": True,
-    }
-    cause.cleanup_unknown = True
-    error = ExecutionDeadlineExceeded("Controlled timeout with actual prior record")
-    error.__cause__ = cause
+    if cancelled:
+        yielded.store.transition(
+            run["id"], "cancelled", "Controlled cancellation before resume"
+        )
     _, deadline = common_clock(monkeypatch)
     probes = observe_probe(
         monkeypatch,
         yielded,
         deadline,
-        error=error,
-        before_error=lambda: yielded.store.transition(
-            run["id"], "cancelled", "Controlled concurrent API cancellation"
-        )
-        if cancelled
-        else None,
+        error=AssertionError("Prior unknown must refuse before a new probe"),
     )
     before = state(yielded)
+    operations_before = controller_rows(yielded)
     assert not yielded.scheduler.resume_yielded(
         before["run"], yielded.workspace, deadline=deadline
     )
-    assert probes == [yielded.run_id]
+    assert not probes
+    assert state(yielded) == before
+    assert controller_rows(yielded) == operations_before
+    if not cancelled:
+        assert yielded.scheduler.cleanup_blocked
+    with yielded.store.connect() as connection:
+        assert execution_fenced(connection)
+        assert connection.execute(
+            "SELECT data->>'state' AS state FROM controller_operations WHERE id=%s",
+            (operation.operation_id,),
+        ).fetchone()["state"] == "unknown"
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_admitted_probe_unknown_keeps_real_operation_and_prior_inventory(
+    yielded, monkeypatch, cancelled
+):
+    run = yielded.store.get(yielded.run_id)
+    prior = next(
+        row
+        for row in controller_rows(yielded)
+        if row["data"]["run_id"] == run["id"]
+        and row["data"]["operation_kind"] == "sandbox_probe"
+        and row["data"]["state"] == "terminal"
+    )
+    prior_receipt = {
+        **prior["data"]["terminal_evidence"],
+        "controller_operation_id": str(prior["id"]),
+    }
+    prior_attempt = {"controlled_prior_attempt": True}
+    with yielded.store.locked(run["id"]) as (_, current):
+        current["recovery"] = {
+            "cleanup_evidence": prior_receipt,
+            "cleanup_attempt_evidence": prior_attempt,
+            "controller_process_evidence": [prior_receipt],
+        }
+    with yielded.store.connect() as connection:
+        assert not execution_fenced(connection)
+    original = Sandbox._containers
+    faults = []
+
+    def containers(sandbox, identifier, limit, supervisor):
+        # The actual registered probe launches Docker and returns a complete
+        # empty inventory first. The following daemon uncertainty is synthetic;
+        # its operation/process identities and later unknown row are real.
+        identifiers = original(sandbox, identifier, limit, supervisor)
+        assert identifier == run["id"] and identifiers == []
+        operation = supervisor.capability._operation
+        assert operation.record["state"] == "launching"
+        supervisor.evidence.update(
+            daemon_request_unknown=True, controlled_probe_fault=True
+        )
+        faults.append((operation.operation_id, supervisor.evidence))
+        if cancelled:
+            yielded.store.transition(
+                run["id"], "cancelled", "Controlled concurrent API cancellation"
+            )
+        cause = SandboxError(
+            "Controlled daemon uncertainty after actual Docker probe",
+            cleanup_evidence=supervisor.evidence,
+        )
+        cause.cleanup_unknown = True
+        raise ExecutionDeadlineExceeded(
+            "Controlled timeout after actual registered probe"
+        ) from cause
+
+    monkeypatch.setattr(Sandbox, "_containers", containers)
+    _, deadline = common_clock(monkeypatch)
+    probes = observe_probe(monkeypatch, yielded, deadline)
+    before = state(yielded)
+    operations_before = controller_rows(yielded)
+    assert not yielded.scheduler.resume_yielded(
+        before["run"], yielded.workspace, deadline=deadline
+    )
+    assert probes == [yielded.run_id] and len(faults) == 1
     if cancelled:
         after = state(yielded)
         assert after["run"]["state"] == "cancelled"
@@ -508,13 +581,21 @@ def test_timeout_daemon_chain_keeps_prior_real_operation_inventory(
     assert recovery["cleanup_attempt_evidence"] == prior_attempt
     assert recovery["controller_process_evidence"] == [
         prior_receipt,
-        cause.cleanup_evidence,
+        faults[0][1],
     ]
-    assert recovery["cleanup_evidence"] == cause.cleanup_evidence
+    assert recovery["cleanup_evidence"] == faults[0][1]
     assert yielded.scheduler.cleanup_blocked
+    operations_after = controller_rows(yielded)
+    added = [row for row in operations_after if row not in operations_before]
+    assert len(added) == 1 and str(added[0]["id"]) == faults[0][0]
+    record = added[0]["data"]
+    assert record["state"] == "unknown" and record["reason"] == "daemon_unknown"
+    assert record["run_id"] == run["id"]
+    assert record["expected_run_owner"] == run.get("owner")
+    assert len(record["processes"]) == 1
+    process = record["processes"][0]
+    assert process["phase"] == "docker_ps"
+    assert process["reaped"] and process["pipe_eof"]
+    assert process["exit_code"] == 0
     with yielded.store.connect() as connection:
         assert execution_fenced(connection)
-        assert connection.execute(
-            "SELECT data->>'state' AS state FROM controller_operations WHERE id=%s",
-            (operation.operation_id,),
-        ).fetchone()["state"] == "unknown"
