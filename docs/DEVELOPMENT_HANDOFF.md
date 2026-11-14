@@ -2,15 +2,17 @@
 
 更新：2026-11-14；用户于 2026-11-13 恢复开发，最新验收收据为 **UTC 2026-11-14**。用户已明确结束暂停；本页是当前启动入口。原暂停快照保存在 Git 提交 `6a0a227`，不要照其中“尚未执行”的命令重放本轮已执行动作。完整经过、失败和证据见[续接记录](M4_RESUMPTION_20261113.md)。
 
-## 2026-11-14 当前继续点（M4 收尾进行中）
+## 当前继续点（有限后台首片受控验收收尾）
 
 用户随后明确继续 M4 收尾，下面“持续目标清除”一节保留为历史快照，不是当前停止指令。当前只处理执行控制/清理恢复、共同期限、真实 Worker.run 完整等待矩阵和最终验证；不扩展权限、远程访问、App 或云调度，不修改产品模型、凭据或预算。
 
-父工作区和分支不变。已整合 Community、Generation、Worker SIGKILL fixtures、yielded 共同期限、进程生命周期 ExecutionClock、Arena 有限维护及 Background 时钟接线；候选已提交为 `e868ad3`，含 Worker/Scheduler、SDK 动态期限及有限调度 census，尚未完成整合验证。旧 2126 项全量和历史 396/107 项首错轮均不能作为当前源码验收。
+父工作区 `/Users/benson/.codex/worktrees/doonex-delivery-docs/doonex`，最终行为验收非 Markdown 源码 `25c221e3f9cca942341cc3c3678a08bc3d94af26`，176 项输入已与提交逐项绑定。收尾文档仅修改 Markdown，提交前后须核对非 Markdown 字节仍匹配验收源码；当前分支及 main/远程状态见本页末尾的实际核对。
 
-当前关闭条件：专项证明原 Run/批次/分配/窗口/UTC 日期限只收紧、旧 owner 不能派发、cleanup 在锁外且到期不开始新操作；再以实际 Worker.run、一次性 PostgreSQL、真实 Docker 和本地合成模型测量入队提交到首次实际准入，覆盖原计划全部容量和故障维度；最后固定源码重跑完整回归、Ruff、前端构建和文档检查。有限 census 候选为 yielded 16、启动 active/interrupted 64、启动活动 Arena 64；超限拒绝完整集合而非截取前缀。这些候选容量尚不能称发布验收通过。
+`m4-normal43-specialized-05` 与 `m4-closure-full-06` 均已完整结束且退出0；具体通过数、警告、跳过、耗时、输入清单及日志SHA见[最终收尾记录](M4_RESUMPTION_20261113.md#m4-final-closure)。冻结v3独立审计核对43配置/39个唯一实际PASSED节点、两轮同源码与原90秒目标，invalid/pending均为空；151精确节点覆盖、故障/超限/重启、实际资源终态、Ruff06与构建06另有核对。不得用专项或局部通过替代这些门槛。
 
-最新针对性结果：分配期限尾部 20 项、Worker 硬中断/M3 入口 25 项、小容量正常 Worker.run 矩阵 12 场景及原 60 秒限制内的 55 秒真实 shell/verifier 剩余等待两场景已通过。测试已整合至 `cb13165`，产品源码仍为 `e868ad3`；全部原失败保留，具体收据和适用条件见续接记录。后续已将 Responses 基础矩阵、原 60 秒样本与全部故障测试整合至 `df275fe`；故障证据跨冻结版本分轮取得，仍须最终整合复验。近容量会话夹具正在按完整生命周期审计结果修正，Git/yielded 容量与历史调度规模待验，最终完整回归未执行，不能合并 main。行为测试使用独占一次性 PG/Docker，先核对当前持有者与进程再启动。
+原full01–full05、准备失败、observer/命令错误和相关整合失败全部保留，均不提供最终正常覆盖。Git/锁、Sandbox及Responses测试仅修阶段到达/原期限/真实终态的证据，原短窗口与产品预算不变；过程见续接记录，不重复执行已结束检查。真实模型证据仍为 `b462502` 的普通样例及完整后台闭环，本轮等待收尾零真实模型调用。
+
+有限census为yielded16、启动active/interrupted64、启动活动Arena64，超限完整拒绝；单Worker时钟最多4096 scope。43种正常配置只在[冻结健康依赖与容量条件](M4_WAIT_ACCEPTANCE.md)内满足90秒目标，不是通用SLA。最终两轮实际TMPDIR为 `/private/tmp/doonex-m4-verification-20261114`，T7历史失败保留。常驻API/worker未加载，plist仍指向旧M5 `f7a1161`，没有升级服务；M5社区仍关闭。
 
 原遗留停止容器已从原始测试日志核实归属后精确回收，私有收据 `resume-20261113/legacy-fixture-container-recovery-01.json`（SHA256 `ddf42b48b50dfd158f40e50457d5fb4e2197812b2f940470e4bc23ec05f84369`）；没有清空产品账本或历史未知。当前检查与收据统一保存在 `verification/resume-20261113/`，先核对进程及收据再续接，不重复启动仍在运行的检查。
 
@@ -63,15 +65,15 @@ PYTHONPATH=apps/server:tests .venv/bin/python -c 'import doonex; print(doonex.__
 ## 已交付事实
 
 - M1–M3 已通过受控验收；M5 自托管社区本机验收通过，社区仍关闭，没有公开部署、收费或许可证决定。
-- M4 发现、生成分别已通过受控流程。**UTC 2026-11-14 的完整后台闭环、独立账目与界面核验现已通过**，正常完整前台等待上界仍未通过，整个 M4 不能称完成。
+- M4 发现、生成分别已通过受控流程。**UTC 2026-11-14 的完整后台闭环、独立账目与界面核验现已通过**，有限后台首片的条件内等待与最终整合已在 `25c221e` 通过受控核验；循环生成/评测、重复批次、自动推广和质量改善试验仍未完成，整个 M4 不能称完成。
 - 原子 helper 预留 `51cd8c7` 已整合为 `83fe6d0`；有限数据库维护 `6183ec3` 已整合为 `98f0885`。原 worker 启动过滤补丁已应用。不要重复 cherry-pick，也不要把两片历史组件测试相加作为最终整合数。
 - 新 reserved 身份与预算同事务；永久 inode、CAS、期限只收紧及 v2 索引保留。新动作消除首次登记缺记录窗口，旧 record_missing 仍全局阻止，不能补造身份或从空闲 lease 推断没发送。未知预算不返还。
 - 10 个生产维护索引及 `actions_helper_fenced_v2` 的实际定义和 valid/ready/live 核对通过。数据库维护每次最多一个重单位，worker 每循环两次；规模查询计划不等于完整延迟保证。
-- SDK 会话容量 `42688c7` 已整合，正式 file_store=、无缓存有限 inventory、故障锁存、源形状/事件/fanout 限额和 close finally，详见[容量合同](M4_SESSION_CAPACITY.md)。worker 已向 SDK 本地持久化、恢复前核验、哈希和锁传入原 Run 的剩余 monotonic deadline；其余全链接线仍待完成。
+- SDK 会话容量 `42688c7` 已整合，正式 file_store=、无缓存有限 inventory、故障锁存、源形状/事件/fanout 限额和 close finally，详见[容量合同](M4_SESSION_CAPACITY.md)。worker 已向 SDK 本地持久化、恢复前核验、哈希和锁传入原 Run 的剩余 monotonic deadline；后续全链接线与受控结果见[最终收尾记录](M4_RESUMPTION_20261113.md#m4-final-closure)，不能从组件时限推出通用等待保证。
 - 严格 Responses 投影在 `b462502` 支持本网关已核验的中性元数据及细分用量；任意字段、非法工具和非零内置工具仍拒绝。无 retry/fallback，不改写 aggregate 用量。
 - 后续离线切片已整合有限 Git/export（`d42a8ff`）、Sandbox（`1140aed`、`cc4d89e`）及父接线：共同 Run 剩余期限、SDK 本地读取/哈希/锁、isolated helper，以及 process/daemon 两类未知的持久全局阻止。API/Arena 新探测自身的未知也保存。普通确认、空 ps 和重启均不能清除。
 - Tasksets、Skill/Library/Generation、Review/Evidence 的有限文件操作、调度回执及 Worker 调用链现已传递同一执行期限；`f271bfb` 也在每次 SDK Chat/Responses 请求的预算提交后重新收紧实际 timeout。联合专项 390 项通过，直接传输 timeout 不保证 OS 或供应商整请求结束。Arena/Background 组件 `bfdb43f` 的 91 项离线和 190 项 PG/Docker 检查通过；领取复核、凭据读取、首次时钟后的初始化和 completion 锁后期限复核已纳入 `61a9dd3`，完整回归 2126 项通过。
-- `66fed5f` 的独立 controller operation 组件已接入生产：Workspace `4d68f30`、Store/fence `e4b0834`、Sandbox `3a910c5`、CLI actor `cb4416c`、Git 异常身份 `c23a6bf`，以及 API/Worker/cleanup/Evidence/Review/Arena/Scheduler 的 `a5c7ece`。真实 reserve/launch 提交后才 Popen；API 请求和 Worker 入口各自关闭 actor；停止意图先提交、锁外有限清理、再按 nonce/owner/request CAS。**160 项专项通过，但新整合全量与完整 Worker.run 崩溃/等待矩阵尚未通过**。旧测试迁移 `93bd7e3`、`18fd8ed`、Git filters `6b4a404` 已纳入，剩余调用方继续迁移，不能用 fake registry 或生产旁路替代。
+- `66fed5f` 的独立 controller operation 组件已接入生产：Workspace `4d68f30`、Store/fence `e4b0834`、Sandbox `3a910c5`、CLI actor `cb4416c`、Git 异常身份 `c23a6bf`，以及 API/Worker/cleanup/Evidence/Review/Arena/Scheduler 的 `a5c7ece`。真实 reserve/launch 提交后才 Popen；API 请求和 Worker 入口各自关闭 actor；停止意图先提交、锁外有限清理、再按 nonce/owner/request CAS。该历史源码的160项专项通过；后续 `25c221e` 的最终整合和受控完整Worker.run证据见[最终收尾记录](M4_RESUMPTION_20261113.md#m4-final-closure)。旧测试迁移 `93bd7e3`、`18fd8ed`、Git filters `6b4a404` 已纳入，后续调用方迁移亦已纳入最终候选，不能用 fake registry 或生产旁路替代。
 - `scripts/live_background.py` 的公开运行入口已固定拒绝 `legacy_background_harness_disabled`，在读取配置、DB 或 campaign 前零副作用；历史宽范围容器清点不能提供真实 Run 绑定。旧完整后台验收保留，不从这个 harness 重放。
 
 ## 本轮真实验收：全部已经执行，禁止重放
@@ -92,14 +94,12 @@ PYTHONPATH=apps/server:tests .venv/bin/python -c 'import doonex; print(doonex.__
 
 ## 下一步的具体顺序
 
-1. 核对本页最终检查收据及 Git/进程状态。普通 gateway、后台 run_once、所有 prepare/finish/finalize intent 均已消费；不要重跑同一授权、样例或清理脚本。
-2. 先核对父接线专项和后续最终整合收据。有限 Git/export、Sandbox 与 SDK 持久化期限已整合，不重复 cherry-pick；两轮中途失败和诊断记录保留；`61a9dd3` 的最终完整回归 2126 项通过，旧 1826 项仅适用历史源码。
-3. 持久 operation、真实终态 CAS、全局 fence 与锁外 cleanup 已接线。先迁移旧测试中的真实 actor/Run/context 并处理回归，再补完整崩溃与过期上下文矩阵；普通动作 acknowledged 不能解除。`controller-existing-integration-01` 实际为 76 passed / 9 failed / 15 setup errors，不是通过：setup 在共享 Arena fixture 导入 taskset 时缺 registry；其余逐项核对，不能统一归为测试问题。
-4. 已整合内容/证据/SDK 请求期限，不重复 cherry-pick。首次时钟后的初始化、凭据及后台领取 metadata 复核已整合并验证；继续完成有限 yielded 候选与前台优先、批次/窗口向同进程 monotonic 期限的映射。保留冻结输入完整核查，近容量和超限拒绝须实际验证。
-5. 用真实 Worker.run、一次性 PostgreSQL、真实 Docker、本地 synthetic provider，在同一 monotonic 时间线覆盖正常/近容量/故障及启动恢复；记录前台入队提交区间到首次准入 commit。明确容量、队列和健康依赖后才给出数值操作目标。
-6. 最终整合验证及 M4 剩余退出条件通过后推进 main，再考虑常驻服务的固定源码升级和回退收据。公开上线、收费和许可证仍单独确认。
+1. 续接先核对Git、真实进程与终态收据；不要重启已完成检查。普通gateway、后台run_once及原prepare/finish/finalize intent均已消费，不重放真实模型授权或清理脚本。
+2. 核对文档提交的非Markdown输入与 `25c221e` 一致，并保留全部原失败、冻结v3/151节点后验、Ruff/构建和资源终态收据。
+3. 实际main尚未推进时，按已有授权正常推进并同步GitHub、核对本地/远程SHA；若已完成，则只核对实际SHA，不重复制造整合。不能force或删除历史分支/worktree。
+4. 常驻服务升级作为单独固定源码操作处理：先核对配置、未决记录、worker锁与回退路径，不能启动仍指向旧M5的worker。权限/App/云调度/公开上线和收费不在本轮范围；后续开发按路线图明确切片。
 
-这次不需要再跑一个完整真实后台矩阵来“补齐”已通过的相同源码证据；后续如改动相关执行路径，再按影响范围决定新验证。不得用已有后台成功、局部传输超时或几个耗时之和代替完整前台等待验收。
+历史 `b462502` 真实后台矩阵保持原源码证据；本轮恢复界面有API和构建验证，没有新的浏览器点击验收。
 
 ## 检查与私有证据
 
@@ -118,19 +118,19 @@ PYTHONPATH=apps/server:tests .venv/bin/python -c 'import doonex; print(doonex.__
 | 内容与交付期限接线 | `deadline-delivery-integration-01.json/.log`、`deadline-delivery-integration-01-source-binding.json` |
 | 初始化/凭据/领取期限后续检查 | `deadline-initialization-*.json/.log`；不能从名称推断通过，须核对 exit、输入及源码绑定 |
 | 登记与上下文组件 | `../m4-controller-operations/HANDOFF.md`、`../m4-context-deadline/HANDOFF.md`；其中未接线为历史事实 |
-| controller 生产接线与旧入口诊断 | `controller-entrypoints-integration-01.json/.log`、`controller-entrypoints-integration-02.json/.log`、`controller-wiring-source-binding-01.json`、`controller-existing-integration-01.json/.log`；失败保留，新整合全量待验 |
+| controller生产接线与最终等待整合 | 历史entrypoints/existing收据及全部失败保留；最终 `m4-normal43-specialized-05.json/.log`、`m4-closure-full-06.json/.log` 和冻结v3/151节点报告的确切路径与SHA见续接记录 |
 | SDK 容量与近容量样本 | `combined-*.json/.log`、`session-capacity-benchmark.json`、`session-benchmark-source-binding.json` |
 | 实际索引定义核对 | `index-audit.json`，首轮失败保留 |
 | 唯一新后台尝试 | `background-20261114/execution.intent.json`、`execution-receipt.json`、`audit-02/independent-after.json` |
 | 浏览器与只读后验 | `background-20261114/browser-02/`、`post-browser.json`；首轮浏览器缺 executable 的失败保留 |
 | 后续完整路径设计 | `../m4-next-wait-design/REPORT.md`，其中已实施部分以本页更新为准 |
 
-原始运行材料、配置、源码、凭据和日志都属于私有证据，产品 Git 只放实现与脱敏事实。最终回归后已核对临时 PostgreSQL 和任务容器不存在；下次仍先检查实际进程，不能按旧 PID 清理。
+原始运行材料、配置、源码、凭据和日志都属于私有证据，产品 Git 只放实现与脱敏事实。最终两轮后已按各自收据核对临时PostgreSQL、测试进程及Run/test标签容器终态；下次仍先检查实际进程，不能按旧 PID 清理。
 
 ## main 与历史分支
 
 分支多主要来自 M1–M5 的隔离实现与审查，cherry-pick 后原提交未必是当前祖先；不能只靠 branch --merged 判断是否交付。暂停时的详细分类见 `verification/pause-branch-audit-20261106/BRANCHES.md`。两片当时未整合的代码现已纳入当前入口，没有为了本轮再开重复分支。
 
-**当前还不能按既定退出条件推进 main：完整前台等待上界未通过。** 满足该条件并完成最终整合回归/证据核对后，将当前整合分支正常推进到 main；若 main 仍为祖先可 fast-forward，否则先整合远端新提交并重验，不 force push。不需要逐个合并所有历史子分支。
+**有限后台首片的等待和最终整合验收阻塞已解除；main尚待实际推进与远程核对。** 文档与非Markdown输入核对完成后，按已有授权正常推进；若main是祖先可fast-forward，否则先整合远程新提交并重验，不force。无需逐个合并历史子分支。
 
 本轮不删除分支或 worktree。之后先区分已纳入成果、独立未整合改动、脏/忽略文件、服务或固定验收引用；managed worktree 用应用归档保留恢复快照。共享 venv/node_modules 的 M1 依赖和仍被引用的固定目录须先处理，不直接清理。

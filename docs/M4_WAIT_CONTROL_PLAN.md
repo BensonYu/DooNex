@@ -1,6 +1,6 @@
 # M4 等待控制的后续实施顺序
 
-更新：2026-11-14（纽约；真实收据至 UTC 2026-11-14）。**正常完整前台等待上界尚未通过**。原子 helper 预留、有限数据库维护、会话容量和 Responses 投影已整合，真实完整后台闭环、独立账目与界面核验通过，见[续接记录](M4_RESUMPTION_20261113.md)。完整后台成功与完整等待上界是独立退出条件，正式验收基线见 [M4 记录](M4_IMPLEMENTATION.md#8-验证与退出条件)。
+更新：2026-11-14。**有限后台首片的条件内完整等待与最终整合已通过受控验收。** 真实模型完整后台闭环仍绑定 `b462502`，后续实际Worker.run等待/故障/容量/恢复检查绑定 `25c221e`，只使用本地合成模型响应；源码、两轮原始时间线、原90秒目标与限制见[等待验收](M4_WAIT_ACCEPTANCE.md)及[最终收尾记录](M4_RESUMPTION_20261113.md#m4-final-closure)。以下组件数字和历史失败各保留原源码归属，不相加作为最终全量；整个M4循环改进和M5公开上线仍未完成，常驻服务未升级。
 
 ## 已确认的约束
 
@@ -14,7 +14,7 @@ helper 的启动、传输和 IPC 使用一个绝对 monotonic deadline；所有�
 | --- | --- | --- |
 | 原子 helper 预留 | `83fe6d0` 同一预算事务保存完整 reserved 身份；CAS、永久 lease inode、期限只收紧；生产 v2 索引定义核对通过 | 新动作消除 reserve/register 缺记录窗口；旧缺记录不补造身份，仍全局阻止；unknown 不返还 |
 | 有限数据库维护 | `98f0885` 每 maintain 最多一个重维护单位，worker 每循环两次；enabled 授权稳定 keyset，启动 Arena 状态筛选；10 个实际索引定义核对通过 | 原 100,000 Run/Action 及各 10,000 Arena/授权/分配的查询计划是规模样本，不是完整延迟保证；claimed_at 到实际结算仍保守计时 |
-| SDK 会话容量 | `42688c7` 正式 FileStore、构造前完整有限 inventory、故障锁存、序列化源与工具 fanout 限额、partial-write 证据、close finally | 合同和实际 SDK 故障检查见[容量记录](M4_SESSION_CAPACITY.md)；worker 已将原 Run 剩余 monotonic deadline 传入 SDK persistence/restore/锁与 isolated helper；其余文件/初始化和调度路径仍未贯通 |
+| SDK 会话容量 | `42688c7` 正式 FileStore、构造前完整有限 inventory、故障锁存、序列化源与工具 fanout 限额、partial-write 证据、close finally | 合同和实际 SDK 故障检查见[容量记录](M4_SESSION_CAPACITY.md)；worker 已将原 Run 剩余 monotonic deadline 传入 SDK persistence/restore/锁与 isolated helper；后续文件/初始化和调度路径已整合并按末尾最终证据核对 |
 | 真实隔离传输 | `b462502` 的普通样例和完整后台矩阵均通过，旧响应结构失败保留 | 只证明当前 Mac mini、Sol、网关和固定样例，不泛化到任意模型、容量或故障 |
 
 未知工具结果后的继续派发已修复；摘要计算在动作完成事务外，随后 owner CAS，未观察到可靠结果的动作继续保留未知。全局容器/helper 阻止、归属核查、冻结 Skill/任务集/Review 核验和历史失败不能为降低延迟数字而省略。
@@ -29,9 +29,9 @@ create 子进程已启动却没有正常、严格的 ACK 时，CLI 回收和当�
 
 已观察的 `local_process_unknown` 与 `daemon_request_unknown` 沿异常链和返回值合并，普通 pause/cancel/resume、Arena 确认、重启或后续空 ps 均不能清除。独立保留当前 cleanup attempt 与最多 16 份不同未决回执，溢出仍锁存阻止。API/Arena 新探测自身失败也持久记录，不能只抛异常然后遗失其子进程证据。
 
-**Popen 前持久登记和生产接线已实现，完整崩溃矩阵仍待。** 独立组件 `66fed5f` 之后，Workspace、Store/fence、Sandbox、CLI actor 与父调用方已共同纳入 `a5c7ece`。两个实际 Popen 入口只接受已提交 reserve/launch 的 capability，业务全局 fence 同时包含 controller 与旧外部未知；Git/export、mount 与清理探测也须登记。API 每请求、Worker 各入口及 CLI actor 绑定实际 Run/project/nullable owner/action，退出时关闭；不能借用变更后的新 owner。
+**Popen前持久登记与生产接线已实现；下述a5c7ece组件结果为历史快照，最终受控崩溃/恢复覆盖见末尾。** 独立组件 `66fed5f` 之后，Workspace、Store/fence、Sandbox、CLI actor 与父调用方已共同纳入 `a5c7ece`。两个实际 Popen 入口只接受已提交 reserve/launch 的 capability，业务全局 fence 同时包含 controller 与旧外部未知；Git/export、mount 与清理探测也须登记。API 每请求、Worker 各入口及 CLI actor 绑定实际 Run/project/nullable owner/action，退出时关闭；不能借用变更后的新 owner。
 
-停止流程先短事务保存 cleanup intent、提交解锁，再有限清理，最后按 nonce/owner/request CAS；重复 pause 不重复 cleanup，并发 cancel 优先，pending/unknown/损坏 intent 不重放或恢复。160 项真实 PG/Git/Docker 与锁定 SDK 合成传输专项、Ruff、前端构建通过并绑定 `a5c7ece`；旧调用方回归仍有失败，新整合全量尚未通过。组件 leaf SIGKILL、复制上下文到期拒绝和提交后人工抛错的 ACK 测试不能代替完整 Worker.run 崩溃/真实网络丢 ACK 矩阵，详见[接线记录](M4_RESUMPTION_20261113.md#持久-controller-生产接线)。无原 sandbox operation 的历史未知继续阻止；空新表、空 ps 或普通 acknowledged 均不能解除，repair 仅结清新组。
+停止流程先短事务保存 cleanup intent、提交解锁，再有限清理，最后按 nonce/owner/request CAS；重复 pause 不重复 cleanup，并发 cancel 优先，pending/unknown/损坏 intent 不重放或恢复。160 项真实 PG/Git/Docker 与锁定 SDK 合成传输专项、Ruff、前端构建通过并绑定 `a5c7ece`；该历史轮旧调用方回归仍有失败，不能当作最终整合通过；后续迁移与25c221e最终证据见末尾。组件 leaf SIGKILL、复制上下文到期拒绝和提交后人工抛错的 ACK 测试不能代替完整 Worker.run 崩溃/真实网络丢 ACK 矩阵，详见[接线记录](M4_RESUMPTION_20261113.md#持久-controller-生产接线)。无原 sandbox operation 的历史未知继续阻止；空新表、空 ps 或普通 acknowledged 均不能解除，repair 仅结清新组。
 
 API immediate control、Worker reconcile 与 execute 异常三处清理已移出 Run 行锁，并由持久 intent 和 CAS 连接前后事务。组件审查和本机故障检查不替代父整合回归或完整 Worker.run 矩阵，最终收据见[续接记录](M4_RESUMPTION_20261113.md)。
 
@@ -39,9 +39,9 @@ API immediate control、Worker reconcile 与 execute 异常三处清理已移出
 
 工作区已有 10,000 项、单文件 10 MiB、总量 100 MiB、深度 100；Skill/任务集/Review/Evidence 也已有各自容量。`fff5761`、`f2b015c`、`0af9a0b` 与 `f271bfb` 已接入有限扫描、分块读写/hash、archive、冻结上下文和交付调用链；联合专项 390 项通过。Arena/Background 的 `bfdb43f` 组件保留审批、heldout 和环境绑定，91 项离线及 190 项数据库专项通过；其后初始化、凭据及 claim metadata 期限 `61a9dd3` 已通过 2126 项完整回归、Ruff 与前端构建。容量和局部超时仍不能代替完整工作量与调度等待验收。
 
-上述实现按块和项检查 read/write/hash/copy/archive/patch 剩余期限；Git stdout/stderr 与原始树条目在过滤前计数、有限读取，保留危险配置/helper 禁用及 Git 对象类型/大小/提交绑定。只复用冻结不可变且绑定 digest 的准备结果，实际使用前继续核验；首次摘要移出长事务后仍重锁并复核 owner、状态和基线。后续仍须在最终源码验证近容量、超限与完整调度路径，不能从组件数推导完整上界。
+上述实现按块和项检查 read/write/hash/copy/archive/patch 剩余期限；Git stdout/stderr 与原始树条目在过滤前计数、有限读取，保留危险配置/helper 禁用及 Git 对象类型/大小/提交绑定。只复用冻结不可变且绑定 digest 的准备结果，实际使用前继续核验；首次摘要移出长事务后仍重锁并复核 owner、状态和基线。后续 `25c221e` 已按末尾证据核对近容量、超限与完整调度路径；不能从组件数推导通用等待上界。
 
-锁内 Scheduler.preflight → Background.preflight → metadata `_unchanged` 的共同期限已在 `514774a` 接通，19 项组件通过；Worker 模型/工具及 verifier 的最后准入和返回后复检已在 `ac0a075` 接入。预检仍读取模型/凭据/环境文件，必要核验保留。父联合检查为 396 passed / 1 failed，并非联合通过，剩余复验见[续接记录](M4_RESUMPTION_20261113.md)。maintain 复用调用方期限与 30 秒准备窗口的较小值；Arena.stop/sync 仍有只在外部检查的区间，不能将局部接线说成完整维护上界。有限 yielded 集合及跨生命周期批次/窗口 monotonic 映射仍待，完成后再做完整 Worker.run 验收。
+锁内 Scheduler.preflight → Background.preflight → metadata `_unchanged` 的共同期限已在 `514774a` 接通，19 项组件通过；Worker 模型/工具及 verifier 的最后准入和返回后复检已在 `ac0a075` 接入。预检仍读取模型/凭据/环境文件，必要核验保留。父联合检查为 396 passed / 1 failed，并非联合通过，剩余复验见[续接记录](M4_RESUMPTION_20261113.md)。该历史版本的 maintain 复用调用方期限与 30 秒准备窗口的较小值；当时 Arena.stop/sync 仍有只在外部检查的区间，不能将局部接线说成完整维护上界。后续已整合 Arena.stop/sync 内部期限、有限yielded集合及跨生命周期批次/窗口monotonic映射，并在 `25c221e` 运行实际Worker.run受控验收，结果见末尾。
 
 普通、Arena、generation 的前台初始化分别验证。健康本地 IO 下可以约束有限工作量；fsync、replace、阻塞系统调用、文件系统失联或宿主磁盘配额不能由局部 Python deadline 保证。新增整进程边界或宿主写盘配额如改变架构，先记录具体证据与决策。
 
@@ -68,10 +68,10 @@ schema 初始化 DDL 仍在 worker 全局执行锁之前；单个数据库等待
 当前整合与真实结果见[续接记录](M4_RESUMPTION_20261113.md)，当前下一步见[交接](DEVELOPMENT_HANDOFF.md)。私有 `verification/m4-next-wait-design/REPORT.md` 保存原始完整路径审计，`m4-helper-reservation-implementation/HANDOFF.md`、`m4-database-maintenance-implementation/HANDOFF.md` 保存原切片组件证据；其中“未整合”是当时事实，已由本轮整合记录更新。历史组件测试数不相加代替最终全量回归。
 
 
-## 当前收尾候选（2026-11-14，未完成最终验收）
+## 最终收尾结果（受控条件内）
 
-共同期限与调度候选 `e868ad3` 已接通 Worker/Scheduler/Background 的共享进程 clock、SDK store/Responses binding 动态收紧、完整有限 yielded census、Arena 内部维护期限及恢复 intent 提交后的复检。历史 396/107 项首错、2126 项全量均仍只适用原源码；当前具体失败分类和收据见[续接记录](M4_RESUMPTION_20261113.md#m4-收尾共同期限与完整调度候选2026-11-14继续中)。
+共同期限、持久controller与恢复候选最终固定为 `25c221e3f9cca942341cc3c3678a08bc3d94af26`。实际Worker.run的43种正常配置完成专项与同源码无筛选全量配对，冻结v3报告exit0、invalid/pending为空；近容量、历史规模、故障/超限/重启及151精确节点由完整回归和独立审计核对。实际测试数、raw monotonic区间、命令、输入绑定、资源及全部历史失败见[最终收尾记录](M4_RESUMPTION_20261113.md#m4-final-closure)。
 
-候选 census 为 yielded 16、active/interrupted 恢复 64、启动活动批次 64；超限完整拒绝，包含历史 interrupted 的恢复集合不会被静默截断。原批次计划限制 400；单 Worker 的进程 clock 最多保留 4096 个 scope，满额拒绝新 scope，不通过淘汰原时钟续期。准备 deadline 不刷新；已经准入的必要清理仍有独立 15 秒回收窗口，不能将 30 秒准备参数当作冷启动绝对上界。日 allocation 汇总保持原查询合同，实际规模与健康依赖必须在最终等待报告中明确。
+有限census为yielded16、启动active/interrupted64、启动活动Arena64，超限完整拒绝，不静默截断；批次计划仍最多400，单Worker进程clock最多4096 scope，满额拒绝且不淘汰旧时钟续期。准备deadline不刷新；必要清理仍有独立15秒窗口，30秒准备参数不能解释为冷启动硬上界。
 
-完整 Worker.run 正常场景、近容量和故障/重启分片继续使用实际 PG/Docker，只有模型响应为本地合成。当前正在逐项验证；测量 observer 必须在真实外层事务退出后标记 commit，SDK close 按实际 Run 归属记录。此前小样例与静态接线不关闭本计划的完整矩阵退出条件。
+90秒目标只适用于[预冻结条件与各独立配置](M4_WAIT_ACCEPTANCE.md)，不是容量同时取最大值、任意外部供应商、OS/文件系统失联或真实网络ACK丢失的SLA。全部unknown及持久fence保持；本轮无真实模型调用、无常驻服务升级，也不完成循环生成/评测、重复批次、自动推广或M5公开上线。

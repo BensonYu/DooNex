@@ -402,3 +402,169 @@ full02 遗留一个、八项复现遗留两个 Created 容器，均按实际 ins
 本次确认为测试阶段前提不足，生产 Sandbox/controller 不改。原 fixture 用墙钟 0.6 秒推测 shell 已运行，新 fixture 必须观察真实容器命令写完 `running` 标记再取消，仍保留原 10 秒总业务窗口；断言实际 container ID、cancelled 且非 timeout、清理已知无错、零残留及后续命令未执行。第二次立即取消核对无 mount/create/start 业务派发，允许必要最终 ps。未到阶段、结果未知或清理失败不能通过；有针对性和相关整合结果待实际收据。
 
 取消阶段单例 `m4-cancel-phase-target-01` **1 passed / exit 0**，外层 31.245800 秒，日志 SHA256 `78cdaa37efb36eff05e279dc386baf8d327c31bde84ab4596a06e7f8cfb30cde`。随后三个完整相关模块 `m4-cancel-related-01` **90 passed / exit 0**，pytest 83.12 秒、外层 110.143134 秒，日志 SHA256 `d8a1f61c7b2fcb4dd1d356f60485347c3599f48ea14331c658cb41a5ca96a651`。两轮 176 输入前后不变、无 watchdog，绑定 05ee7bb 加收据内未提交的 harness/fixture，不能称干净 05ee7bb 的新证据。原 create ACK 未知、迟到创建、EOF、旧 owner/context 拒绝和真实 SIGKILL 持久阻止均继续通过。修正后的测试准备实际正常进入 pytest；此处只关闭针对性与相邻整合，随后固定候选重新进行 43 专项与完整全量。
+
+### 新固定候选 eb5dd1e：专项通过，完整全量进行中
+
+当前非 Markdown 源码固定为 `eb5dd1e58c98d31afe49e8015240dfccdaef082d`。新 `m4-normal43-specialized-02` 完整执行 **39 passed / 43 配置 / 2 warnings / exit 0**，pytest 1126.25 秒、外层 1154.003637 秒；176 个输入前后及 Git blob 一致，无 watchdog。收据 SHA256 `94c5f162f24cb7b3502326e3229e92e9f834a766fd65b03df09e4c688e407c03`，日志 SHA256 `d74543ed6d9f0f5a85892d251ffde41b5e86ddf3c653da6ad8e18423b2a770ee`。
+
+冻结 v3 的新专项独立审计核对 **43/43 配置、39 个唯一实际 PASSED 节点**，最大较大等待端点 **60.369285708 秒**（原 60 秒 Responses），预冻结 90 秒目标保持。报告 exit 2/pending、invalid=[]，恰有 43 final 项待完整全量配对，不能写成最终通过。新 manifest SHA256 `107ee3fc01cfbf9dfa754ee758e2929e18d7e5847712c620645479446e198ff3`，专项审计 SHA256 `597786dc1d2ad84408ef0846df3bcbba7e9ccc2b6fcd2095a1159f005711e0e7`；原八轮失败全部核验、计零覆盖，没有源码差异豁免。
+
+同一候选 `m4-closure-ruff-04`、`m4-closure-web-04` 均 exit 0，176 输入不变。新环境收据 `m4-final-environment-04.json` SHA256 `83c0fd16efc312a827569ad9cbb8e64c5a644e0ee1808a9603944ca06e9c41d6`，系统盘 TMPDIR、大小写不敏感、已有固定镜像。独立 `m4-pre-full04-source-resources.json` 核对三轮全部输入、日志和 Git blobs 一致，Run/test 容器及测试进程为空后，唯一启动 `m4-closure-full-04`，命令为 `env TMPDIR=/private/tmp/doonex-m4-verification-20261114 .venv/bin/python scripts/test_local.py -s -vv -rs`，无测试筛选，外层 watchdog 7200 秒。完整结果待终态收据；不据启动或中间通过数提前合并 main。
+
+完整回归 full04 中途出现 `test_stream_checks_original_saved_operation_deadline` 失败，仍在执行，尚无终态 traceback。静态核对发现原测试保存 0.1 秒期限后还须经过提交、Reader 初始化、请求预留及客户端准备，末尾 `count + 1` 断言只是阶段结果校验，不能保证故障注入前已到达 stream；此为候选原因，不能据此认定本轮根因。保持源码与运行不变，先收集完整失败，再原样复现并观察实际请求与持久预留阶段。该项对应原期限不刷新及到期停止派发的既有条件，没有增加验收范围。
+
+同轮随后新增 `test_finite_cleanup_window_cannot_refresh_for_stalled_ps` 失败，仍待终态，不称只剩两项问题。该例涉及入口 3 秒业务期限、独立 1 秒清理窗口、rm/ps 共用截止与最终持久结算。静态核对发现原 `entry < 1.8` 还隐含准备阶段少于 0.8 秒，而 `ps.at-rm.at < 1` 不能单独证明清理期限未刷新；旧审查提出的同期限被动观察未落实。实际失败位置和分类仍须完整 traceback 及原样观察器复现，不据此放宽清理条件或增加时间数字。
+
+两项原样复现的被动观察器已在私有验证目录准备，尚未执行；不改生产返回值、期限、休眠或原测试断言。Discovery 为 `resume-20261113/m4_discovery_observer.py`（SHA256 `2d9ac2b917ec80d4ecc3303dec60b6fba12bb8e0c10f56402dcd39afd69588ba`），清理为 `m4-worker-wait-scale/m4_stalled_ps_observer_001.py`（SHA256 `9bf2d70c68c09556598fd00126ef9d89183e73748eb300d2e2dc126e538c206b`）。后者记录真实 `Sandbox.run`、`_Cleanup.start`、各 process、permit 与 settle 起止，仅在原测试调用结束后读取持久 controller 行。完整回归结束并核对资源后才由父独占运行；静态审查和观察器准备不计为复现或验收通过。
+
+### full04 终态及原样复现入口
+
+`m4-closure-full-04` 已无筛选全部执行：**2611 passed / 2 failed / 3 warnings / 0 skipped / exit 1**，pytest 6038.68 秒、外层 6066.936805 秒；176 输入不变，watchdog 未触发。收据 SHA256 `8125f3cfc74190f81cdd184889c8a4da8b91552425fc6160d7dd3768d9218e46`，日志 SHA256 `d44e193a4f3e21c6ee2ea2a645015c632e7fbca148364802cd8900d879ed9619`。结束后原测试进程退出，实际 Run/test 标签库存均成功查询为空。
+
+终态 traceback 明确：Discovery 的 failed、unknown 和 BLOB 预留断言已通过，但 HTTP 请求数为原 6 次而非 7 次；原 stream 故障尚未到达，预留后、HTTP 前的本地期限拒绝正是当前源码路径。Sandbox stalled-ps 在总调用耗时 `470525.761739125 - 470523.866629708 = 1.895109417` 秒处触发 `<1.8` 断言；其后的 unknown、容器缺席及 rm/ps 时间差断言均未执行，不能从本轮日志推断它们通过。父保持原源码，用两个被动观察器启动唯一 `m4-closure-failures-reproduce-02`；该轮尚未终态，静态候选原因不替代实际阶段证据。完整等待矩阵的正常输出只保留为失败轮诊断，不关闭最终条件。
+
+### full04 原样阶段复现与最小合同修正
+
+原源码的 `m4-closure-failures-reproduce-02` 已结束：**1 passed / 1 failed / exit 1**，pytest 3.34 秒、外层 33.709153 秒；176 输入不变，无 watchdog。日志 SHA256 `648635c97ca5f60b47717491fa9899534abbb51032384bfda6d52e8c542bde72`。Discovery 本次真实到达 HTTP，收到 220 字节后按原 deadline 保存 unknown；单例通过不覆盖 full04 的原失败。
+
+stalled-ps 原断言再次在整个调用 1.846354 秒处失败。被动观察保存实际共同 D=474390.341268958：准备约 0.7775 秒，rm/ps 共用清理窗口，ps 完整回收/EOF 确认在 D 后约 10.25 毫秒，Supervisor 返回在 D 后约 10.75 毫秒，持久结算约 57.33 毫秒。全部六个真实子进程的 after_process 与持久记录一致，rm/ps 均 exit -9 且 reaped/EOF；最终 unknown/supervision_unknown，global fence=true。不能声称回收与持久结算严格在 D 内。观察收据 `m4-stalled-ps-reproduce-01.json` SHA256 `3a79ff412116c7aa5c06c87dede0ef6ba884c80347fb82f55ea7fa214aa37e30`。
+
+随后 `m4-discovery-reserve-delay-01` 在真实 blob reserve 提交后显式注入 0.15 秒有限延迟，原样断言以 **6 != 7 / exit 1** 重现；HTTP 前拒绝，received=0、http_status=null、unknown 与完整 4,259,840 字节预留保留。外层 33.546855 秒，输入不变、无 watchdog，日志 SHA256 `e8f2e6fe06a8676fbca756a930f0cccd55ee29116d81f190b83a0bad540b386a`。这是受控延迟因果诊断，不冒充 full04 的微观时序。两次资源终态均无 Run/test 标签容器。
+
+根因归类为两个测试阶段/时间锚点前提不足；现有证据未显示这两处生产 deadline 刷新。只改两个测试文件：Discovery 在同一 UTC/monotonic 逻辑钟上保存原 0.1 秒期限，真实 commit 后到 0.04，再真实读取 0.09/0.11 的分块响应；精确核对首块已接受、第二块计入 received、第三块不消费、原 intent/unknown/完整预留与零后续请求。它不证明墙钟上界。两个 cleanup 夹具保留入口业务 3 秒和清理 1 秒，直接被动核对首次 cleanup 及所有 rm/ps 的同一 D，并采用模块已有 0.3 秒回收/结算余量；同时保留业务+清理+余量的外层保护、实际进程 EOF 和持久终态/fence。旧总调用 <1.8 隐含准备必小于 0.8 秒，不能单独代表清理期限合同；新断言没有延长产品窗口或改变完整 Worker 的 90 秒目标。
+
+冻结 v3 对 full04 的失败审计仍为 **invalid / exit 1 / final=null**，43 项最终覆盖计零；报告 SHA256 `a69e2a0149f92bd6c1ff9f0afca40613e52ab53acd9741601ca3bf48dc1a5e66`。诊断最大等待端点 60.382775375 秒不计最终通过。修改后的针对性、相关整合及同源码新 43 专项/全量尚待；不沿用 eb5dd1e 的成功专项跨源码配对。
+
+### 相关整合的新 repair 失败与阶段合同
+
+两项原修正的 `m4-deadline-contract-target-01` 为 **3 passed / exit 0**，pytest 12.21 秒、外层 41.569067 秒，日志 SHA256 `083a1f717b0384fee93ef7e18c1a69a3e15554f9cfd46fa639b55104b6cfcaa1`。随后四模块 `m4-deadline-contract-related-01` 无首错停止，**232 passed / 1 failed / exit 1**，pytest 132.63 秒、外层 159.850445 秒，日志 SHA256 `eda530d97a78b16a38767460d677a714108e962b1e2054049f26b33ff92e9d4f`。唯一新失败为 PG controller EOF 样例的独立 repair 返回 cleanup_unknown；前面的原 unknown/fence 断言通过。不能据此把失败写成原未知丢失或恢复权限已通过。
+
+暂停全量准备后，重新核对该模块整个初始执行→未知持久化→普通拒绝→新 repair 调用链。原 EOF 业务 0.6 秒从真实 PG 登记和 mount/create/start 前开始，任意 !EOF 可来自尚未派发的 permit，不能证明真实逃逸 fork；repair 的独立 0.5 秒又包含真实登记及两至三次 CLI。原日志及残留 operations 只证明最终 ps 已进入，没有原 repair 的完整 D/EOF/数据库终态，因此原失败的具体未知子原因仍不能倒签确定。
+
+首次私有 observer `m4-controller-repair-reproduce-01` 误读 ProcessPermit.sequence 而触发 AttributeError（实际字段 seq），**2 failed / exit 1**，日志 SHA256 `ad1a464db62f10387db26c91041497b8f04edaa048bb2aa0e2599dc98fb495e9`；它改变了异常路径，明确排除为诊断工具失败。原文件保留。修正 observer 后的原样 `m4-controller-repair-reproduce-02` **2 passed / exit 0**，外层 32.508264 秒，日志 SHA256 `7ee7eea5cafd2f96ae84e6d5945300555324717bfa1d87aa104e75f463f6697c`：真实 child.pid 和 start exit0/reaped/!EOF 已观察；原 rm/ps 因期限耗尽没有启动；新 repair 在 0.289 秒内完成 ps/rm/ps，原记录不变、全局阻止仍在。单例成功不覆盖整合失败。
+
+`m4-controller-repair-delay-01` 明确在新 repair 首个真实 ps 返回后注入 0.35 秒有限延迟，原入口期限不变，后续 rm/ps 拒绝派发、repair 保持 unknown、全局阻止继续有效；原成功断言再次失败（exit 1），日志 SHA256 `4372557e41b69f3cd2dc88b3a9d6e501385419b97c67b59f5a06d425803b30b2`。这是受控因果诊断，不是原失败微观时序复原。
+
+最小修正只针对该成功恢复样例：初始 EOF 采用入口一次性 3 秒并要求真实 child、精确 start PID/exit0/reaped/!EOF；ACK 要求实际 create 的严格坏标识原因。独立 repair 使用新的入口 3 秒，所有 ps/rm 共用同一截止，严格匹配实际残留所需的完整阶段、真实回收/EOF、新 terminal、原记录逐字段不变及全局阻止；普通无 repair 入口必须零派发。模块默认 0.5 秒及专门清理到期测试不改，生产代码、原未知、产品预算和 90 秒完整目标不改。此前仅修已报错模块的阶段前提不足，故本次同时复核该模块全部同类调用，不按名字将所有失败归为测试问题。新 targeted 与模块结果待实际收据。
+
+repair 新定点 `m4-controller-repair-target-01` **2 passed / exit 0**，pytest 6.08 秒、外层 36.266119 秒，日志 SHA256 `5f7b561e68a4d59d4b450f8611d0b4e72eeb6f875d97a388f4d030485d5c6ec9`；完整 controller 模块 `m4-controller-repair-module-01` **43 passed / exit 0**，pytest 17.41 秒、外层 46.892837 秒，日志 SHA256 `af279eb99787872d351dd97b5a75c559f4da0bd9b5960941403962f58d630dbe`。所有实际输入前后不变、无 watchdog，绑定 eb5dd1e 加收据捕获的三份测试修改，不称旧干净 HEAD 的新验收。
+
+三个测试文件已固定为新候选 `d65920fe17a402fb20887657741ce3cd5753bfdb`，生产源码不变。新 `m4-normal43-specialized-03` 沿用原 39 nodeid/43 配置命令与系统盘 TMPDIR，唯一执行中；随后需新无筛选完整全量，不能用旧专项跨源码配对。环境收据 `m4-final-environment-05.json` SHA256 `3bdf654f4ec68db23d1aa8c65bfc0f7eaad9700d4773deb4927ac1b5d68cb875` 在专项执行中采集，明确包含该轮唯一 test PG，最终空库存须另行核对。首次环境采集使用系统 Python 不支持 datetime.UTC 而在写收据前失败，已改用项目 Python；未影响测试、源码或原验收目标。
+
+
+`m4-normal43-specialized-03` 随后在一次性 PostgreSQL 60 秒启动准备处退出 **1**，外层 63.132837 秒、watchdog=false、176 输入不变，**尚未进入 pytest，43 配置均未执行**。日志 SHA256 `ff7b3a0372cf84f623a8ef3e73025bf3c7a0fd8cfd005ee6a5b49c1b17a4d9d7`。没有据此增加窗口或更改源码；父先独占运行 `m4-pg-startup-diagnostic-02`，用相同镜像/真实 TCP SELECT 1，在明确的诊断窗口内保留启动日志/状态，再决定环境恢复。诊断不计产品验收。
+
+环境诊断02用相同镜像和 TCP SELECT 1 于 28.563608 秒成功，保存日志显示 initdb 同步约 20 秒、bootstrap checkpoint sync 5.873 秒；VM 可用内存约 6.3 GiB、磁盘占用 12%、OOMKilled=false。诊断结束后精确删除自身容器、库存为空，收据 SHA256 `1c3df33a7b1aa276eb7e168d1fdc2455710d8182873bd9c58456370ef592effc`。这些是新诊断实证；原专项03未保存删除前的 PG 日志，不能把它的具体延迟来源倒签确定。保持候选和 60 秒准备窗口不变，环境核对后唯一启动新 `m4-normal43-specialized-04`，不重复仍运行的检查。
+
+### d65920f 新专项通过、无筛选 full05 开始
+
+`m4-normal43-specialized-04` 完整结束：**39 passed / 2 warnings / 0 skipped / exit 0**，覆盖冻结 43 个正常配置，pytest 1160.39 秒、外层 1189.759291959 秒；176 个非 Markdown 输入不变、无 watchdog，收据 SHA256 `5a0d5a4f6e9f73feef83390942b647755818d4cadfdb5a16a593a87ad0c0cc74`、日志 SHA256 `890e750f99bf4345edcb8ad0401cb53cfd9d406077c1c458237ff75c4a1aadef`。严格时间线审计单独执行，专项成功尚不关闭最终条件。
+
+同一候选的 `m4-closure-ruff-05` 与 `m4-closure-web-05` 均 exit 0、176 输入不变。`m4-before-full05-source-resource-audit.json` 逐输入核对当前字节与 d65920f Git blob，三份日志 SHA 均匹配；实际 Run/test 标签库存为空、无活动测试进程。随后唯一启动 `m4-closure-full-05`：`env TMPDIR=/private/tmp/doonex-m4-verification-20261114 .venv/bin/python scripts/test_local.py -s -vv -rs`，外层 7200 秒 watchdog，无筛选、无首错停止；此处尚未终态，不能沿用旧全量或宣称通过。源码保持固定，本轮没有真实模型调用或常驻服务升级。
+
+专项04的冻结 v3 独立审计为 **pending / exit 2 / invalid=[] / 恰好 43 final pending / final=null**：43 配置、39 唯一 PASSED 节点、176 输入和原 90 秒目标核对有效，没有源码差异豁免；最大 raw 区间为 `[60.369906583, 60.402813250]` 秒，来自 Responses 原 60 秒普通前台样本。原 8 轮失败加 full04 与专项03准备失败共 10 项哈希排除均验证，正常覆盖计零。新 manifest `../m4-wait-independent-audit/same_source_manifest-d65920f-specialized-04.json` SHA256 `151aeb436ffd30b26f465a487c766fb3fd653ae6f8d618a2ac038aa0f567c2f9`；专项审计 `audit-same-source-d65920f-specialized04-01.json` SHA256 `fef2cb64d93bb1ff4919d8f20c0733693ba748e9994a68523cf0adbb669ea40f`。尚待同源码 full05 终态配对，不能把 pending 解释为最终通过。
+
+### full05 终态失败：Git 超时回收样例未到 Popen
+
+`m4-closure-full-05` 无筛选完整结束：**2611 passed / 2 failed / 3 warnings / 0 skipped / exit 1**，pytest 6185.75 秒、外层 6216.471921708 秒；176 输入不变、无 watchdog，绑定 d65920f。收据 SHA256 `5f695b6016b6fb405707b484b73c1a4b1363c02924e954185f40fec30e21b984`，日志 SHA256 `2fcf900a16b2f2a74cf3fb870109f90ef5746edd253c1a35c1e7f95fbc383dfb`。原 Discovery、stalled-ps 及 PG repair 修正均通过本轮；新的两项失败不能据此前通过忽略，等待矩阵正常输出仅为失败轮诊断，不能形成最终通过。结束后的实际 Run/test 标签库存为空，无活动测试进程。
+
+两项失败均为 `test_git_timeout_reaps_child_and_preserves_outer_marker[False/True]`。原 0.1 秒 deadline 从真实 PG reserve/launch 之前开始；False 在 Operation.launch 的持久 transition 与 live 检查后（controller_operations.py:1071）拒绝，True 在 before_process 的 PG 行/全局阻止与 live 复检后（:1229）拒绝，均为 RegistryError(deadline)，没有到 Popen。该样例期待 WorkspaceError/ExecutionDeadlineExceeded 并检查子进程回收，但本轮没有进入其目标阶段。尚未据此修改产品异常或放宽期限；父先原样被动观察全部登记/准入/Popen/持久结果，另做有限延迟因果诊断。此前逐模块修正未充分覆盖同类阶段前提，现暂停追加补丁，独立横审所有相关短期限测试，明确真实阶段、拒绝与回收合同后再选择最小修正。
+
+### full05 的阶段因果诊断与横向合同核对
+
+原样被动诊断 `m4-git-timeout-original-01` 为 **2 passed / exit 0**（外层28.265816秒，收据SHA256 `ab1f0739e9d157149138cb6c9dcf7bfaa91e6739755111bce6ee2fc4b38c46c0`）。两次真实Popen到达时原0.1秒期限仅剩约2毫秒和7.5毫秒；真实子进程exit -9、两管道关闭、持久terminal且fence=false。本轮成功不覆盖full05失败，也未证明Python用户代码已开始。
+
+`m4-git-timeout-reserve-delay-01` 在真实reserve完成后显式注入0.15秒，两个原样断言均 **failed / exit 1**，外层34.711061秒、176输入不变、无watchdog；收据SHA256 `0b85894f46d68d6e31cc87684d8735f97f3913a689e6f4a6a7af18ac7896b1ff`，日志SHA256 `5f5046c95326b192becb1f896f52ccc19ae0a0864e27caca0b6ec9474bfad737`。两例实际launch前拒绝，零Popen，持久reserved、attempted_processes=0、fence=true。此为因果诊断，不倒签原full05的微观时序。原始阶段与持久行均保留在同目录的 `m4-git-phases-001-{original,delay}-{false,true}.json`。
+
+full05冻结v3失败审计为invalid/exit1，唯一invalid为final-full非零退出，final=null、43 final pending；报告SHA256 `d34b9728964f23410949bc7be7700a6174097d9b114d5fa1f0813e8192aa298c`。另行151节点审计确认151个精确节点均各一次PASSED、176输入及14份覆盖源码绑定，但仍因整轮两项失败为invalid/exit1，报告SHA256 `d59ead8c9ad3318740af99ece469eee1594c55035b85da95278a2cf43490190d`。局部覆盖不提升为全量通过。
+
+此前按报错模块逐项修正，没有充分横查「极短期限经过准备后仍假定目标阶段必达」的共同前提。本次先核对完整reserve→launch→before_process→Popen→回收→持久结算，再横审Git继承管道、配置FIFO、Sandbox控制、Responses helper和锁等待。静态发现不冒充新运行失败；只修与退出条件直接有关的阶段证据，不改产品代码、模型配置、预算或90秒目标。回收成功样例采用入口一次性有限余量并明确READY/实际PID/EOF/原D/持久终态；启动前期限拒绝单列，零派发和持久阻止保留。针对性及相关整合尚待实际收据，不能仅凭接线关闭。
+
+Git阶段修正的 `m4-git-phase-target-01` 为 **8 passed / exit0**，外层57.432238秒、日志SHA256 `eafcdd5edb9c4ba067112abf2d28d3c17f6f14a87a6a17f4c591abf740b8c877`。随后Workspace/Controller/Git filters/Session store/Execution deadline五个完整模块 `m4-phase-related-01` **180 passed / 2 warnings / 0 skipped / exit0**，pytest106.58秒、外层133.512466秒，日志SHA256 `d48416b333fd5b97bfb24390d1a221b9168189907a831552e013adaa7cbff93e`。两轮176输入前后不变，无watchdog，绑定d65920f加各收据捕获的测试改动，不能冒充干净d65920f结果。结束后实际Run/test容器库存为空。
+
+Git回收样例入口3秒涵盖真实PG登记，必须收到子进程READY、实际exit -9/reap/EOF、原D逐值保持及持久terminal；继承管道须有实际child PID、leader自然exit0、!EOF及持久unknown/fence。Git配置FIFO以真实非阻塞writer握手证明reader打开，原固定3秒localD内停止，只有config进程、无后续status，持久终态及真实回收匹配。PG launch和before_process两阶段各以原逻辑截止验证真实事务后过期、零Popen、持久阻止。SDK/文件锁样例使用一次入口3秒并实际观察acquire/flock竞争，保留原D和零模型/工具回调；不把准备阶段到期算作锁等待。以上仅修组件测试阶段合同，不提高产品任何期限或完整Worker90秒目标。
+
+### 横向审查后相关整合的容量成功样例失败
+
+五模块修改已提交 `8139763`，Sandbox七个阶段节点修正整合为 `42bc90a`。`m4-sandbox-phase-target-01` **7 passed / exit0**，pytest10.62秒、外层40.748369秒，日志SHA256 `0fbd2a11a907a7e829568e00de3e4b2305564e8d7a6d40a69157c9c129d7ca64`。三个完整Sandbox模块 `m4-sandbox-phase-related-01` **89 passed / 1 failed / exit1**，pytest85.42秒、外层115.940318秒、176输入不变、无watchdog，日志SHA256 `34e10fccb7fef06542f901a875c735e89a6c60619342e87bc597f91f0859f192`。新七项均通过，但原完整容器列表成功样例返回ps timeout，不能据局部通过忽略此失败。
+
+保持原源码和原断言，`m4-probe-capacity-original-01` 原样被动复现 **1 failed / exit1**，外层32.096494秒，日志SHA256 `de2a77aec648a31db3219801e85a6e81cba903c95e847fbcd929f31121840385`。阶段收据 `m4-probe-capacity-stages-original-01.json`：原D=484284.317017541，真实reserve约44.9ms、launch45ms、before_process43.5ms；实际ps开始于484284.228360750，process在484284.262262583返回timeout、exit0/reap/EOF，持久结算在484284.342348完成，unknown/fence=true。Supervisor从原D内保留部分回收窗口，没有刷新D。此例已到真实ps，不能混称未Popen。
+
+此前横审主要关注故障样例的阶段到达，遗漏同一极短夹具下成功样例的性能假设；现重新分类整个模块默认0.35秒的调用方，区分容量/格式/正常清理成功合同与明确窗口/到期拒绝合同。没有统一增加产品期限，也没有修改评分或清除unknown。具体修正及新结果待后续实际收据。
+
+Responses单文件阶段合同候选整合为 `b282b17`，子工作区16个离线节点通过，仅为无PG/模型的helper阶段证据。父首次相关命令 `m4-responses-phase-related-01` 误写不存在的 `tests/test_responses_recovery.py`，**exit4、未执行测试**，外层28.277763秒，日志SHA256 `0e2a6e1da013f5c5d4d34cca374ca699c3f84b04a1f6b1db538161f4cb461f58`；这是父测试命令错误，不归因产品。核对文件清单后使用实际 `tests/test_sdk_responses_recovery.py` 启动独立related02，原错误日志保留。
+
+正确的 `m4-responses-phase-related-02` 完整执行三个相关模块，**78 passed / exit0**，pytest47.86秒、外层77.914926秒，日志SHA256 `e1daa17cc92372f131c8a6890f66556a9908a21d39cb2405e507af11a5328065`；绑定b282b17、176输入前后不变、无watchdog，结束后Run/test容器库存为空。独立只读审查未发现实质问题；独立EOF只在真实waitpid之后、真实close前对该测试输出管道进行有界非阻塞观察，不修改产品接受判定。synthetic回调不是PG持久化证据，相关成功不替代新完整配对。
+
+### 普通完成夹具与显式短窗口分离
+
+新的两文件测试候选整合为 `25c221e`。默认3秒仅用于普通完成/格式/容量的有限测试准备与清理；4个原0.35秒、ACK原0.5秒、escaped原0.2秒、两个1秒及两个0.3秒专门窗口全部局部显式保留，对应原断言和数字逐AST核对不变，PG wait仍使用原逻辑1秒。只有三个标准库合成CLI的shebang加 `-S`，不加载共享venv的site初始化；生产mount/helper、真实Docker和产品15秒清理默认未改，不能称真实Docker性能改善。
+
+完整列表必须观察实际完整stdout/exit0/reap/EOF、唯一ps原D与持久terminal/remaining64/non-fenced；错误和超限列表必须观测精确字节或截断/错误、unknown/fence，repair使用独立一次入口D且原unknown逐项保留。最终缺席核查须实际ps正常返回非空字节；取消须实际create/rm/ps和当前snapshot absence，daemon未知不能清除。独立只读审查未发现实质问题。
+
+`m4-sandbox-fixture-target-01` **16 passed / exit0**，pytest28.76秒、外层56.225976秒，日志SHA256 `9abe107fd14b1275730ace70c5cc5e64a9b5ee7f751559fea4854d490ae1fc80`；绑定25c221e、176输入不变，无watchdog。随后三个完整Sandbox模块的related01尚在执行；原89/1失败和原样失败均保留，不提前关闭最终条件。
+
+
+三个完整Sandbox模块 `m4-sandbox-fixture-related-01` 已终态：**90 passed / exit0**，pytest89.43秒、外层120.974882秒；收据SHA256 `70320ea8b4f635f62c250aecd46d9369100a20655ba5d1d65239d7612c1a3632`、日志SHA256 `55df907f824d6fe537b3a7a792f74f750cbcf52e57849efc49cd740348ea3537`。176输入前后不变、无watchdog；原失败保留。
+
+### 固定25c221e的新完整配对（执行中）
+
+最终候选为 `25c221e3f9cca942341cc3c3678a08bc3d94af26`。同源码 `m4-closure-ruff-06`、`m4-closure-web-06` 均exit0；收据SHA256分别为 `aea627e51b8b9ddb14b73b8e2ddd2da94ea9a7fafe05b347927597fa04ebe407`、`8dc60dbd95802344a353d6d1141b09ba5b042c478b015da203b55528ccc05603`。`m4-before-specialized05-source-resource-audit.json` 核对16/90/Ruff/构建收据与日志SHA、176项当前字节和Git blob一致，启动前Run/test库存为空、无活动检查。环境记录 `m4-final-environment-06.json` SHA256 `894c41e3148af62250628d3afb434f2019540e1c61d9aab5b9701f8923f94249`，继续使用系统盘TMPDIR及原固定依赖。
+
+随后唯一启动 `m4-normal43-specialized-05`，完整复用专项04的39节点/43配置原参数及3600秒外层watchdog。此处尚无终态，不以进度标记视为通过。通过后须执行同源码、无筛选、无首错停止的 `m4-closure-full-06`，并完成冻结v3和151精确节点独立审计。原90秒目标、全部容量和排除规则不变；本轮零真实模型调用、未升级常驻服务。
+
+
+专项05完整终态：**39 passed / 2 warnings / 0 skipped / exit0**，pytest1154.44秒、外层1185.087606042秒，176输入不变、无watchdog。收据SHA256 `a49ebe6283628cda37af6e2113ffc24a51bbf009e8db008a7ca99a6385133967`，日志SHA256 `e13d1d99c3552907074cf52df8965db7923f5bbe25bbcd2bab566f3b2239958c`。`m4-before-full06-source-resource-audit.json` 核对专项/Ruff/构建收据、日志SHA及176输入与25c221e一致，实际Run/test容器为空且无活动检查。
+
+随后唯一启动 `m4-closure-full-06`：`env TMPDIR=/private/tmp/doonex-m4-verification-20261114 .venv/bin/python scripts/test_local.py -s -vv -rs`，7200秒外层watchdog，无筛选、无首错停止。当前尚无全量终态；专项与全量必须严格同源码配对，旧失败及全部未知保留，不能提前关闭等待退出条件。
+
+
+专项05冻结v3独立审计为 **pending / exit2 / invalid=[] / 43 final pending**，43配置、39唯一节点、176输入和90秒原目标核对有效；最大raw等待区间为 `[60.723724916, 60.763902875]` 秒，来自原60秒Responses样本。原10项排除完整保留，追加full05为第11项，均计零正常覆盖；无源码差异豁免。新manifest `../m4-wait-independent-audit/same_source_manifest-25c221e-specialized-05.json` SHA256 `c12a86cf5f954f278c75ccb9b6c8121224aac933de3b54f1137abf6804b7f87c`，审计 `audit-same-source-25c221e-specialized05-01.json` SHA256 `69221c576c8b6424b3273791061bc5219954080b018b03a324d5aaae796adc20`。全量06尚在执行，pending不是最终通过。
+
+
+<a id="m4-final-closure"></a>
+
+### 最终收尾：25c221e 同源码配对与完整整合通过（UTC 2026-11-14）
+
+以上“执行中”和 pending 均为当时快照。本次最终非 Markdown 源码固定为 `25c221e3f9cca942341cc3c3678a08bc3d94af26`，176 项输入在专项05、full06、Ruff06、构建06及当前文件/Git blob 间逐项一致；没有源码差异豁免。后续收尾仅更新 Markdown，不将旧 2126 项、分轮组件或失败轮中的正常输出作为本次最终结果。
+
+| 检查 | 实际终态 | pytest / 外层耗时 |
+| --- | --- | --- |
+| `m4-normal43-specialized-05` | 39 passed、2 warnings、0 skipped、exit 0；冻结43配置完整执行 | 1154.44 / 1185.087606042 秒 |
+| `m4-closure-full-06` | 2614 passed、3 warnings、0 failed、0 skipped、exit 0；无筛选、无首错停止 | 6360.20 / 6390.693510250 秒 |
+| `m4-closure-ruff-06` | All checks passed、exit 0 | 外层0.083017542秒 |
+| `m4-closure-web-06` | 前端生产构建成功、exit 0 | 外层0.881449833秒 |
+
+四项均未触发 watchdog，输入前后不变。full06 于 UTC `2026-11-14T21:15:37.516047+00:00` 开始，采用一次性 PostgreSQL、真实 Docker、本地合成模型和实际 Worker.run；本轮零真实模型调用，不修改产品模型、凭据、预算。收据记录 `PYTHONPATH=apps/server:tests`，共享解释器/依赖不变。实际执行命令如下；这是已完成证据，不是待重放命令：
+
+```bash
+env TMPDIR=/private/tmp/doonex-m4-verification-20261114 .venv/bin/python scripts/test_local.py -s -vv -rs 'tests/test_worker_wait_capacity.py::test_actual_worker_complete_yielded_census[full]' 'tests/test_worker_wait_capacity.py::test_actual_worker_near_git_export_capacity[raw_bytes_near]' 'tests/test_worker_wait_capacity.py::test_actual_worker_near_git_export_capacity[raw_entries_near]' 'tests/test_worker_wait_capacity.py::test_actual_worker_near_git_export_capacity[retained_bytes_near]' 'tests/test_worker_wait_capacity.py::test_actual_worker_near_git_export_capacity[retained_entries_near]' 'tests/test_worker_wait_matrix.py::test_actual_worker_wait_timeline[arena-model]' 'tests/test_worker_wait_matrix.py::test_actual_worker_wait_timeline[arena-preparation]' 'tests/test_worker_wait_matrix.py::test_actual_worker_wait_timeline[arena-shell]' 'tests/test_worker_wait_matrix.py::test_actual_worker_wait_timeline[arena-verifier]' 'tests/test_worker_wait_matrix.py::test_actual_worker_wait_timeline[generation-model]' 'tests/test_worker_wait_matrix.py::test_actual_worker_wait_timeline[generation-preparation]' 'tests/test_worker_wait_matrix.py::test_actual_worker_wait_timeline[generation-shell]' 'tests/test_worker_wait_matrix.py::test_actual_worker_wait_timeline[generation-verifier]' 'tests/test_worker_wait_matrix.py::test_actual_worker_wait_timeline[ordinary-model]' 'tests/test_worker_wait_matrix.py::test_actual_worker_wait_timeline[ordinary-preparation]' 'tests/test_worker_wait_matrix.py::test_actual_worker_wait_timeline[ordinary-shell]' 'tests/test_worker_wait_matrix.py::test_actual_worker_wait_timeline[ordinary-verifier]' 'tests/test_worker_wait_matrix.py::test_real_sixty_second_action_yields_after_long_remaining_work[shell]' 'tests/test_worker_wait_matrix.py::test_real_sixty_second_action_yields_after_long_remaining_work[verifier]' 'tests/test_worker_wait_responses.py::test_actual_isolated_worker_wait_timeline[arena-model]' 'tests/test_worker_wait_responses.py::test_actual_isolated_worker_wait_timeline[arena-preparation]' 'tests/test_worker_wait_responses.py::test_actual_isolated_worker_wait_timeline[arena-shell]' 'tests/test_worker_wait_responses.py::test_actual_isolated_worker_wait_timeline[arena-verifier]' 'tests/test_worker_wait_responses.py::test_actual_isolated_worker_wait_timeline[generation-model]' 'tests/test_worker_wait_responses.py::test_actual_isolated_worker_wait_timeline[generation-preparation]' 'tests/test_worker_wait_responses.py::test_actual_isolated_worker_wait_timeline[generation-shell]' 'tests/test_worker_wait_responses.py::test_actual_isolated_worker_wait_timeline[generation-verifier]' 'tests/test_worker_wait_responses.py::test_actual_isolated_worker_wait_timeline[ordinary-model]' 'tests/test_worker_wait_responses.py::test_actual_isolated_worker_wait_timeline[ordinary-preparation]' 'tests/test_worker_wait_responses.py::test_actual_isolated_worker_wait_timeline[ordinary-shell]' 'tests/test_worker_wait_responses.py::test_actual_isolated_worker_wait_timeline[ordinary-verifier]' 'tests/test_worker_wait_responses.py::test_isolated_request_completes_near_original_deadline[arena]' 'tests/test_worker_wait_responses.py::test_isolated_request_completes_near_original_deadline[generation]' 'tests/test_worker_wait_responses.py::test_isolated_request_completes_near_original_deadline[ordinary]' tests/test_worker_wait_responses.py::test_isolated_sixty_second_request_completes_near_original_deadline 'tests/test_worker_wait_scale.py::test_actual_worker_scale_preserves_accounting_to_foreground_admission[cold_start]' 'tests/test_worker_wait_scale.py::test_actual_worker_scale_preserves_accounting_to_foreground_admission[warm_ready]' 'tests/test_worker_wait_session_capacity.py::test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore[bytes]' 'tests/test_worker_wait_session_capacity.py::test_near_capacity_active_branch_receipt_and_actual_cold_worker_restore[small]'
+env TMPDIR=/private/tmp/doonex-m4-verification-20261114 .venv/bin/python scripts/test_local.py -s -vv -rs
+.venv/bin/ruff check apps/server/doonex tests scripts
+pnpm --dir apps/web build
+```
+
+全部原始文件位于私有 `~/Library/Application Support/DooNex/verification/`。下表路径相对该目录，产品仓库只记录脱敏结果及哈希：
+
+| 收据 | SHA256 | 对应日志SHA256 |
+| --- | --- | --- |
+| `resume-20261113/m4-normal43-specialized-05.json` | `a49ebe6283628cda37af6e2113ffc24a51bbf009e8db008a7ca99a6385133967` | `e13d1d99c3552907074cf52df8965db7923f5bbe25bbcd2bab566f3b2239958c` |
+| `resume-20261113/m4-closure-full-06.json` | `a9f657c7e949c859948d862bf25dd109c52c962c666eeec094d658efbf004cf5` | `40cd20e8d5a8b758a18ab45c59bd9f4c17faf89e3cab6ed08293108bea29151b` |
+| `resume-20261113/m4-closure-ruff-06.json` | `aea627e51b8b9ddb14b73b8e2ddd2da94ea9a7fafe05b347927597fa04ebe407` | `82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18` |
+| `resume-20261113/m4-closure-web-06.json` | `8dc60dbd95802344a353d6d1141b09ba5b042c478b015da203b55528ccc05603` | `f0c0894d8768b0dff903ca173a2a543744e0f4ac8f350e8f7d0ecc93b7e30c64` |
+
+冻结 v3 审计 `m4-wait-independent-audit/audit-same-source-25c221e-full06-passed-01.json` 为 **passed / exit0 / invalid=[] / pending=[]**，SHA256 `81e1181efa8c7b188926c7100700580b6a8dcbe263bfefa161c5606e562ca05c`。专项及全量各43配置/39唯一节点、176输入与runner完全一致，changed_files=[]、source_delta_exceptions=0；原90秒目标及审计规则未改。manifest `same_source_manifest-25c221e-specialized-05.json` SHA256 `c12a86cf5f954f278c75ccb9b6c8121224aac933de3b54f1137abf6804b7f87c`；原专项pending报告保留，不能改写为当时已通过。
+
+按同一 monotonic 时间线的入队提交前后到首次实际准入计算，专项最大 raw 区间为 **[60.72372491599526, 60.76390287495451] 秒**（log146/support145），全量为 **[60.38583641703008, 60.41734975000145] 秒**（log2982/support2981），均为原60秒Responses配置。较大端点用于90秒判定，不用局部timeout或Worker.execute入口替代。冻结的11项历史排除逐项核对，每项最终正常覆盖计零；全部失败、未知与预留保留。健康依赖、独立容量配置和前置队列的边界以[等待验收](M4_WAIT_ACCEPTANCE.md)为准，不外推所有容量同时最大或宿主/文件系统失联时按时成功。
+
+`m4-worker-wait-scale/WORKER_EXIT_151_FINAL06_AUDIT_001.json` 为 **passed_node_coverage / invalid=[]**，审计进程exit0，SHA256 `a73e944a3142aceefff677acfa2161105bd5e53a11e1b0fe3b56f0d68d6b1ed9`。151个精确节点各恰好一次PASSED，正常优先、容量拒绝、暂停/取消/清理/崩溃、期限/未知拒绝及账目保持五个组分别40/19/27/71/84，组间重叠，不能相加。全量collected/start/terminal/summary均2614；176输入及14份覆盖源码匹配。审计器 `audit_worker_exit_151_003.py` SHA256 `b0b8dcf65534c7e9c9da1e310690127913962921197759088a225922b7aa2f0a`，准备记录 `WORKER_EXIT_151_PREPARATION_003.json` SHA256 `9d2c48a46c8f59b725972c356037518c913ffdec0d53b4d6fe4ccb6207188e01`；规则正文未变，仅绑定最终候选，64个catalog函数AST保持。
+
+故障证据的具体边界如下：
+
+- 三条实际Worker.run SIGKILL marker分别为checkpoint_before_save→interrupted（log2807）、checkpoint_after_commit→yielded（log2827）、cleanup_intent_committed→interrupted（log2845）；均exit=-9、synthetic、latency_sample=false，原request/usage/first_started/action/session与父账目保持。这三个杀点没有live controller operation，不能泛化为任意Popen在途kill。cleanup intent样例保留unknown_calls=1及reserved_tokens>0，前台仍queued、零模型调用、禁止stop_containers重放且global fence；另外两例允许已排队前台完成，后台不重放。
+- 在途shell另由 `tests/test_worker_process.py::test_killed_worker_preserves_changes_and_blocks_unresolved_controller`（log2652–2666）验证：真实Docker写progress=x并sleep，捕获容器及pending shell/sandbox_execute后kill；重启保留controller行、账本、首次时钟与session，零新模型调用，两种普通resume确认均400，重启仍fence。该节点断言非零exit，没有单独断言=-9，不作为第四条SIGKILL marker。
+- 普通provider unknown样例 `near_capacity_unknown_model_reservation`（log3052–3053）保留合成TimeoutError、calls=unknown_calls=1、reserved_tokens>0与usage=null，重启不重放原SDK，独立前台可完成。普通provider未知不等于全局controller fence；控制未知与期限到期停止新派发由各自精确节点验证。
+
+最终资源/源码审计 `resume-20261113/m4-final06-source-resource-audit.json` SHA256 `761804214be9a5b432f10eb2be11810a8ee4ea720bddec2f8d49c90ddb33c51b`：四份收据及日志哈希一致、176当前字节和Git blob匹配，无活动测试进程，Run/test标签容器均空。一次性PG带 `doonex.test=true`，已不存在；test_local.py finally只回收自己的容器。库存核对不代替逐controller的reap/EOF证明，后者来自具体测试断言和marker。审计脚本SHA256 `b6b2b3d97bbd4d47c1446da6673551b18de16a90e10c55e536d6c604c9ef22ef`，共同runner SHA256 `aac47930fdc5b948097afe126f1cb74a9abf5dd3d4b31c09e64e09d815dc7fa5`。
+
+**本轮关闭有限后台首片的执行/清理恢复整合、共同期限与前台优先、条件内完整等待及最终回归条件。** 真实模型和浏览器证据仍绑定 `b462502`，本轮没有新真实模型或浏览器点击验收。循环生成/评测、重复批次、自动推广、生成版本质量改善未完成，不宣称整个M4–M5完成。API/worker仍未加载、plist保留旧M5 `f7a1161`、社区关闭，服务未升级；升级另按固定源码、核查与回退流程处理。main推进及远程SHA以[交接页](DEVELOPMENT_HANDOFF.md#main-与历史分支)的实际记录为准。
