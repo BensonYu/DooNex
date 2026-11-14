@@ -145,6 +145,34 @@ def observe_process_deadlines(monkeypatch):
     return calls
 
 
+def observe_cleanup_window(monkeypatch):
+    original = implementation._Cleanup.start
+    calls = []
+
+    def observed(self):
+        before = time.monotonic()
+        deadline = original(self)
+        calls.append((before, time.monotonic(), deadline))
+        return deadline
+
+    monkeypatch.setattr(implementation._Cleanup, "start", observed)
+    return calls
+
+
+def assert_shared_cleanup_window(windows, deadlines, returned):
+    before, after, deadline = windows[0]
+    assert before + 1.0 <= deadline <= after + 1.0
+    assert {entry[2] for entry in windows} == {deadline}
+    assert [(phase, at) for phase, at in deadlines if phase in {"rm", "ps"}] == [
+        ("rm", deadline),
+        ("ps", deadline),
+    ]
+    # The one-second cleanup window starts after business preparation. Keep the
+    # module's existing .3s reap/settlement tolerance, measured from that window,
+    # rather than assuming all earlier registry/DB/process setup takes < .8s.
+    assert returned < deadline + 0.3
+
+
 @pytest.mark.postgres
 def test_common_deadline_covers_create_and_attach(fake_docker, tmp_path, monkeypatch):
     control, configure, context = fake_docker
@@ -499,14 +527,21 @@ def test_lost_remove_ack_resolves_only_after_complete_ps(
 ):
     control, configure, context = fake_docker
     monkeypatch.setattr(implementation, "CLEANUP_SECONDS", 1.0)
+    windows = observe_cleanup_window(monkeypatch)
+    deadlines = observe_process_deadlines(monkeypatch)
     sandbox = configure(rm_delay=30)
     entered = time.monotonic()
     result = sandbox.run(tmp_path, "true", 3, context.run_id, **context.binding)
-    assert time.monotonic() - entered < 1.8
+    returned = time.monotonic()
+    assert returned - entered < 3 + 1.0 + 0.3
+    assert_shared_cleanup_window(windows, deadlines, returned)
+    assert result["exit_code"] == 0 and not result["timed_out"]
     assert not result["cleanup_unknown"], result
     assert result["cleanup_evidence"]["container_absence_confirmed"] is True
     assert_reaped_and_eof(result["cleanup_evidence"])
     assert [item["operation"] for item in operations(control)][-2:] == ["rm", "ps"]
+    record = context.records()[0]
+    assert record["state"] == "terminal" and not context.fenced()
 
 
 @pytest.mark.postgres
@@ -517,16 +552,29 @@ def test_finite_cleanup_window_cannot_refresh_for_stalled_ps(
     # Give the second CLI enough launch time to test an actually stalled ps,
     # rather than merely exhausting the window before it can start.
     monkeypatch.setattr(implementation, "CLEANUP_SECONDS", 1.0)
+    windows = observe_cleanup_window(monkeypatch)
+    deadlines = observe_process_deadlines(monkeypatch)
     sandbox = configure(rm_delay=30, ps_delay=30)
     entered = time.monotonic()
     result = sandbox.run(tmp_path, "true", 3, context.run_id, **context.binding)
-    assert time.monotonic() - entered < 1.8
+    returned = time.monotonic()
+    assert returned - entered < 3 + 1.0 + 0.3
+    assert_shared_cleanup_window(windows, deadlines, returned)
+    assert result["exit_code"] == 0 and not result["timed_out"]
     assert result["cleanup_unknown"]
     assert result["cleanup_evidence"]["container_absence_confirmed"] is False
     calls = operations(control)
     removed = next(item for item in calls if item["operation"] == "rm")
     listed = next(item for item in calls if item["operation"] == "ps")
     assert listed["at"] - removed["at"] < 1.0
+    assert_reaped_and_eof(result["cleanup_evidence"])
+    processes = result["cleanup_evidence"]["processes"][-2:]
+    assert [(p["operation"], p["reason"]) for p in processes] == [
+        ("rm", "timeout"),
+        ("ps", "timeout"),
+    ]
+    record = context.records()[0]
+    assert record["state"] == "unknown" and context.fenced()
 
 
 @pytest.mark.postgres

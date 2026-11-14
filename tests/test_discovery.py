@@ -9,11 +9,11 @@ import hashlib
 import json
 import stat
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import quote
 
 import httpx
@@ -27,6 +27,7 @@ from doonex.discovery import (
     MAX_BYTES,
     MAX_REQUESTS,
     MIT_BODY,
+    READ_ALLOWANCE,
     TREE_BYTES,
     Discovery,
     DiscoveryError,
@@ -1241,30 +1242,92 @@ def test_stream_checks_original_saved_operation_deadline(
     service, public_git, monkeypatch
 ):
     receipt = scan(service)
+    prefix = list(public_git.calls)
+    # Control only Discovery's clock. Real DB commits and HTTP stream consumption
+    # remain in the path; their preparation time must not skip the target phase.
+    origin = datetime.now(UTC)
+    clock = SimpleNamespace(elapsed=0.0)
+
+    class ClockDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return (origin + timedelta(seconds=clock.elapsed)).astimezone(tz)
+
+    monkeypatch.setattr(discovery, "datetime", ClockDateTime)
+    monkeypatch.setattr(
+        discovery, "time", SimpleNamespace(monotonic=lambda: 100 + clock.elapsed)
+    )
     original = service._claim
+    claimed = {}
+    observations = []
+    chunks = []
+    consumed = []
 
     def short_claim(*args):
         value = original(*args)
-        value["operation"]["deadline_at"] = (
-            datetime.now(UTC) + timedelta(seconds=0.1)
-        ).isoformat()
+        deadline = (origin + timedelta(seconds=0.1)).isoformat()
+        value["operation"]["deadline_at"] = deadline
         with service.store.connect() as connection:
             service._save(connection, value)
+        claimed.update(value["operation"])
+        # Reader maps the remaining .06, rather than receiving another .1.
+        clock.elapsed = 0.04
         return value
 
-    def slow(request):
-        if "/git/blobs/" in request.url.path:
-            time.sleep(0.15)
+    class DeadlineStream(httpx.SyncByteStream):
+        def __iter__(self):
+            clock.elapsed = 0.09
+            consumed.append("first")
+            yield chunks[0]
+            consumed.append("first_accepted")
+            clock.elapsed = 0.11
+            consumed.append("second")
+            yield chunks[1]
+            consumed.append("third")
+            yield chunks[2]
+
+    def stream(request, value):
+        assert "/git/blobs/" in request.url.path
+        # A separate connection sees the original operation and committed intent
+        # before the response is delivered. No reserve/settle path is replaced.
+        with service.store.connect() as connection:
+            saved = service._load(connection, receipt["id"])
+        observations.append(saved)
+        raw = json.dumps(value).encode()
+        chunks.extend((raw[:20], raw[20:40], raw[40:]))
+        assert all(chunks)
+        return httpx.Response(200, stream=DeadlineStream())
 
     monkeypatch.setattr(service, "_claim", short_claim)
-    public_git.before = slow
-    count = len(public_git.calls)
-    with pytest.raises(DiscoveryError, match="operation_deadline"):
+    public_git.override = stream
+    with pytest.raises(DiscoveryError) as raised:
         preview(service, receipt)
+    assert raised.value.code == "operation_deadline"
+    assert len(observations) == 1
+    assert observations[0]["operation"] == claimed
+    assert claimed["deadline_at"] == (origin + timedelta(seconds=0.1)).isoformat()
+    intent = observations[0]["requests"][-1]
+    assert intent["kind"] == "blob" and intent["status"] == "reserved"
+    assert intent["reserved_bytes"] == BLOB_BYTES + READ_ALLOWANCE
     saved = service.get(receipt["id"])
-    assert saved["status"] == "failed" and saved["requests"][-1]["status"] == "unknown"
-    assert saved["budget"]["bytes_reserved"] >= BLOB_BYTES
-    assert len(public_git.calls) == count + 1
+    assert saved["status"] == "failed"
+    assert saved["error"] == {"code": "operation_deadline"}
+    assert saved["requests"][:-1] == receipt["requests"]
+    assert saved["requests"][-1] == {
+        "sequence": intent["sequence"],
+        "kind": "blob",
+        "status": "unknown",
+        "error": "operation_deadline",
+        "http_status": 200,
+        "received_bytes": len(chunks[0]) + len(chunks[1]),
+    }
+    assert saved["budget"]["bytes_reserved"] == BLOB_BYTES + READ_ALLOWANCE
+    with service.store.connect() as connection:
+        persisted = service._load(connection, receipt["id"])
+    assert persisted["requests"][-1]["reserved_bytes"] == intent["reserved_bytes"]
+    assert consumed == ["first", "first_accepted", "second"]
+    assert public_git.calls[:-1] == prefix
+    assert len(public_git.calls) == len(prefix) + 1
 
 
 def test_receipt_budget_limits_do_not_increase_with_controller_constants(

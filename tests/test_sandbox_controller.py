@@ -22,7 +22,11 @@ from doonex import sandbox as implementation
 from doonex.sandbox import Sandbox, SandboxError, _Cleanup, _evidence, _Supervisor
 from doonex.store import OwnershipLost
 from test_controller_operations import controller_store as store_fixture
-from test_sandbox_deadline import FAKE_DOCKER
+from test_sandbox_deadline import (
+    FAKE_DOCKER,
+    assert_reaped_and_eof,
+    observe_process_deadlines,
+)
 
 controller_store = store_fixture
 
@@ -843,37 +847,64 @@ def test_pg_database_wait_expiry_at_production_leaf_starts_zero_processes(
 @pytest.mark.postgres
 @pytest.mark.parametrize("kind", ["ack", "eof"])
 def test_pg_actual_ack_or_eof_unknown_keeps_independent_fence_and_repair_scope(
-    pg_sandbox, kind
+    pg_sandbox, kind, monkeypatch
 ):
     fixture = pg_sandbox
     if kind == "ack":
-        with pytest.raises(SandboxError) as error:
+        with pytest.raises(
+            SandboxError, match="malformed container identifier"
+        ) as error:
             run(fixture, create_output="bad\n")
         evidence = error.value.cleanup_evidence
         assert evidence["daemon_request_unknown"]
     else:
         result = fixture.configure(pipe_child=True, escaped_child=True).run(
-            fixture.workspace, "true", 0.6, fixture.run_id, **fixture.binding
+            fixture.workspace, "true", 3, fixture.run_id, **fixture.binding
         )
         evidence = result["cleanup_evidence"]
         assert result["cleanup_unknown"] and evidence["local_process_unknown"]
     original = pg_records(fixture)[0]
     assert original["state"] == "unknown" and pg_fenced(fixture)
     if kind == "eof":
-        assert any(not item["pipe_eof"] for item in original["processes"])
+        # The escaped child must actually exist: a pre-launch expired permit
+        # with pid=None is also unknown, but does not exercise inherited EOF.
+        assert (fixture.control / "child.pid").exists()
+        start = next(p for p in original["processes"] if p["phase"] == "docker_start")
+        assert start["pid"] and start["exit_code"] == 0
+        assert start["reaped"] and not start["pipe_eof"]
+    else:
+        create = next(p for p in original["processes"] if p["phase"] == "docker_create")
+        assert create["pid"] and create["exit_code"] == 0
+        assert create["reaped"] and create["pipe_eof"]
     fixture.store.finish_action(fixture.binding["parent_action_id"], "acknowledged", {})
     assert pg_fenced(fixture)
+    before = commands(fixture)
     with pytest.raises(co.RegistryError, match="fenced"):
         fixture.configure().stop_run(fixture.run_id, **fixture.binding)
+    assert commands(fixture) == before
     binding = {
         name: value
         for name, value in fixture.binding.items()
         if name != "parent_action_id"
     }
+    # Repair is a new finite operation, not extra time for the original group.
+    # Its real DB admission and complete ps[/rm]/ps sequence share one deadline.
+    monkeypatch.setattr(implementation, "CLEANUP_SECONDS", 3)
+    deadlines = observe_process_deadlines(monkeypatch)
+    expected = (
+        ["ps", "rm", "ps"] if (fixture.control / "container").exists() else ["ps", "ps"]
+    )
+    entered = time.monotonic()
     result = fixture.configure().stop_run(
         fixture.run_id, repair_of=original["operation_id"], **binding
     )
+    assert time.monotonic() - entered < 3 + 0.3
     assert not result["cleanup_unknown"] and pg_fenced(fixture)
+    assert result["remaining"] == [] and not result["errors"]
+    assert [row["operation"] for row in commands(fixture)[len(before) :]] == expected
+    assert [phase for phase, _ in deadlines] == expected
+    assert len({deadline for _, deadline in deadlines}) == 1
+    assert_reaped_and_eof(result["cleanup_evidence"])
     records = pg_records(fixture)
     assert (
         next(
@@ -887,9 +918,11 @@ def test_pg_actual_ack_or_eof_unknown_keeps_independent_fence_and_repair_scope(
         record for record in records if record["repair_of"] == original["operation_id"]
     )
     assert repair["state"] == "terminal"
-    assert all(
-        item["phase"] in {"docker_ps", "docker_rm"} for item in repair["processes"]
-    )
+    assert repair["business_deadline_monotonic_ns"] == int(deadlines[0][1] * 1e9)
+    assert [item["phase"] for item in repair["processes"]] == [
+        "docker_" + phase for phase in expected
+    ]
+    assert all(item["exit_code"] == 0 for item in repair["processes"])
 
 
 @pytest.mark.postgres
