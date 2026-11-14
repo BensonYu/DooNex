@@ -3,18 +3,28 @@
 import json
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
 
+import controller_test_support
 import pytest
 from doonex import generation, skills, tasksets
+from doonex.cleanup import operation_context
 from doonex.deadline import ExecutionDeadlineExceeded
 from doonex.discovery import MIT_BODY
 from doonex.evidence import Evidence
+from doonex.generation import StartInput
 from doonex.library import Library
 from doonex.skills import SkillRegistry, _json, _sha, prepare_bytes
+from doonex.store import now
 from doonex.tasksets import TaskSetRegistry
+from doonex.worker import run_directory
 from doonex.workspace import FileContent, WorkspaceProcessUnknown, manifest_digest
+from test_generation import setup_generation as generation_setup_fixture
+
+controller_registry = controller_test_support.controller_registry
+setup_generation = generation_setup_fixture
 
 
 def test_taskset_snapshot_digest_unchanged_with_deadline(tmp_path):
@@ -347,25 +357,57 @@ def test_generation_prepare_output_candidate_resume_one_deadline(
     assert all(value == deadline for _, value in seen)
 
 
+@pytest.mark.postgres
 def test_generation_final_evidence_and_resume_share_one_deadline(
-    offline_generation, monkeypatch
+    setup_generation, monkeypatch, controller_registry
 ):
-    service, run, directory, _files, _value = offline_generation
+    service, body, _files, _taskset, _project = setup_generation
+    draft = service.create(body)
+    started = service.start(
+        draft["id"],
+        StartInput(
+            expected_revision=draft["revision"],
+            confirm_model_usage=True,
+            confirm_derivative_rights=True,
+        ),
+    )
+    with service.store.locked(started["run_id"]) as (_, current):
+        current.update(
+            state="running", owner="content-deadline-test-owner", first_started_at=now()
+        )
+    run = service.store.get(started["run_id"])
+    directory = run_directory(service.settings, run["id"])
+    directory.mkdir(mode=0o700, parents=True)
     deadline = time.monotonic() + 10
     workspace = service.prepare_workspace(run, directory, deadline=deadline)
     run["baseline_digest"] = workspace.baseline_digest
+    with service.store.locked(run["id"]) as (_, current):
+        current["baseline_digest"] = run["baseline_digest"]
+    run = service.store.get(run["id"])
     run["generation_output"] = service.save_output(
         run,
         directory,
         json.dumps({"append_text": "Preserve the public contract."}),
         deadline=deadline,
     )
+    with service.store.locked(run["id"]) as (_, current):
+        current["generation_output"] = run["generation_output"]
+        current["assignments"]["executor"]["state"] = "completed"
+    run = service.store.get(run["id"])
     run["generation_candidate"] = service.build_candidate(
         run, directory, deadline=deadline
     )
     run["state"] = "verifying"
+    with service.store.locked(run["id"]) as (_, current):
+        current.update(
+            generation_candidate=run["generation_candidate"], state=run["state"]
+        )
+    run = service.store.get(run["id"])
     evidence = Evidence.capture(
-        workspace,
+        replace(
+            workspace,
+            operation_context=operation_context(service.store.get(run["id"])),
+        ),
         directory,
         [],
         SimpleNamespace(image="offline-no-execution"),
@@ -374,6 +416,9 @@ def test_generation_final_evidence_and_resume_share_one_deadline(
         deadline=deadline,
     )
     run["evidence"] = evidence
+    with service.store.locked(run["id"]) as (_, current):
+        current["evidence"] = evidence
+    run = service.store.get(run["id"])
     inspected = []
     original = Evidence.inspect
 
@@ -387,6 +432,9 @@ def test_generation_final_evidence_and_resume_share_one_deadline(
     assert final["evidence_report_sha256"] == evidence["report_sha256"]
     assert evidence["verified"] is False and evidence["commands"] == []
     run["generation_candidate"] = final
+    with service.store.locked(run["id"]) as (_, current):
+        current["generation_candidate"] = final
+    run = service.store.get(run["id"])
     service.validate_run(run, directory, require_workspace=True, deadline=deadline)
     assert (
         service.finalize_candidate(run, directory, evidence, deadline=deadline) == final

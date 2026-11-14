@@ -10,10 +10,13 @@ import json
 import stat
 import tarfile
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
+import controller_test_support
 import pytest
+from doonex.cleanup import operation_context
 from doonex.discovery import MIT_BODY
 from doonex.evidence import Evidence
 from doonex.generation import (
@@ -47,6 +50,7 @@ MIT = (
     "MIT License\n\nCopyright (c) 2026 Controlled Fixture Authors\n\n" + MIT_BODY + "\n"
 ).encode()
 HIDDEN = "HIDDEN-GENERATION-ANSWER-SENTINEL-NOT-MODEL-INPUT"
+controller_registry = controller_test_support.controller_registry
 OUTPUT = json.dumps(
     {
         "append_text": "Inspect existing conventions before editing.\nKeep the change focused."
@@ -198,7 +202,17 @@ def candidate_run(service, body):
 
 def completed_run(service, body):
     draft, run, directory, workspace, start = candidate_run(service, body)
-    evidence = Evidence.capture(workspace, directory, [], Sandbox(), 1, run["id"])
+    evidence = Evidence.capture(
+        replace(
+            workspace,
+            operation_context=operation_context(service.store.get(run["id"])),
+        ),
+        directory,
+        [],
+        Sandbox(),
+        1,
+        run["id"],
+    )
     final = service.finalize_candidate(run, directory, evidence)
     with service.store.locked(run["id"]) as (_c, current):
         current.update(
@@ -277,7 +291,7 @@ def test_start_concurrency_consumes_one_exact_intent(setup_generation):
 
 
 def test_full_candidate_preserves_binary_modes_empty_and_cache_named_assets(
-    setup_generation,
+    setup_generation, controller_registry
 ):
     service, body, parent, _taskset, _project = setup_generation
     draft, run, directory, workspace, _start = completed_run(service, body)
@@ -426,10 +440,22 @@ def test_candidate_publish_crash_can_resume_without_reconstructing_output(
     )
 
 
-def test_final_publish_crash_reuses_same_evidence(setup_generation):
+def test_final_publish_crash_reuses_same_evidence(
+    setup_generation, controller_registry
+):
     service, body, _parent, _taskset, _project = setup_generation
     _draft, run, directory, workspace, _start = candidate_run(service, body)
-    evidence = Evidence.capture(workspace, directory, [], Sandbox(), 1, run["id"])
+    evidence = Evidence.capture(
+        replace(
+            workspace,
+            operation_context=operation_context(service.store.get(run["id"])),
+        ),
+        directory,
+        [],
+        Sandbox(),
+        1,
+        run["id"],
+    )
     first = service.finalize_candidate(run, directory, evidence)
     original = (directory / "generation-final/report.json").read_bytes()
     assert service.finalize_candidate(run, directory, evidence) == first
@@ -454,7 +480,9 @@ def test_final_publish_crash_reuses_same_evidence(setup_generation):
         "evidence",
     ],
 )
-def test_all_bound_artifact_tampering_blocks_import(setup_generation, mutation):
+def test_all_bound_artifact_tampering_blocks_import(
+    setup_generation, mutation, controller_registry
+):
     service, body, _parent, _taskset, _project = setup_generation
     draft, run, directory, _workspace, _start = completed_run(service, body)
     preview = service.preview(
@@ -520,7 +548,7 @@ def test_stopped_or_reassigned_owner_cannot_publish(setup_generation):
 
 
 def test_parent_rejection_blocks_new_import_without_changing_frozen_run(
-    setup_generation,
+    setup_generation, controller_registry
 ):
     service, body, _parent, _taskset, _project = setup_generation
     draft, run, directory, _workspace, _start = completed_run(service, body)
@@ -534,7 +562,7 @@ def test_parent_rejection_blocks_new_import_without_changing_frozen_run(
 
 
 def test_import_db_failure_preserves_orphan_and_reuses_original_report(
-    setup_generation, monkeypatch
+    setup_generation, monkeypatch, controller_registry
 ):
     service, body, _parent, _taskset, _project = setup_generation
     draft, _run, _directory, _workspace, _start = completed_run(service, body)
@@ -617,7 +645,9 @@ def test_explicit_confirmations_and_input_bounds_are_strict(setup_generation):
         parse_output(b"x" * (MAX_OUTPUT_BYTES + 1))
 
 
-def test_private_artifacts_have_fixed_permissions(setup_generation):
+def test_private_artifacts_have_fixed_permissions(
+    setup_generation, controller_registry
+):
     service, body, _parent, _taskset, _project = setup_generation
     _draft, _run, directory, _workspace, _start = completed_run(service, body)
     for name in ("generation-output", "generation-candidate", "generation-final"):
@@ -769,7 +799,9 @@ def test_visible_projection_changes_block_start(setup_generation):
     assert service.store.list_runs() == []
 
 
-def test_concurrent_import_publishes_one_pending_version(setup_generation):
+def test_concurrent_import_publishes_one_pending_version(
+    setup_generation, controller_registry
+):
     service, body, _parent, _taskset, _project = setup_generation
     draft, _run, _directory, _workspace, _start = completed_run(service, body)
     preview = service.preview(
@@ -900,7 +932,9 @@ def test_unbound_candidate_publication_recomputes_every_report_field(setup_gener
     assert service.build_candidate(run, directory) == candidate
 
 
-def test_unbound_invalid_report_and_final_schema_cannot_be_rebound(setup_generation):
+def test_unbound_invalid_report_and_final_schema_cannot_be_rebound(
+    setup_generation, controller_registry
+):
     service, body, _parent, _taskset, _project = setup_generation
     _draft, run, directory, _workspace, _start = start_run(service, body)
     run = bind_finish(service, run, directory, '{"append_text":"Copyright fake"}')
@@ -922,7 +956,17 @@ def test_unbound_invalid_report_and_final_schema_cannot_be_rebound(setup_generat
     # A separate completed source tests the final publication-before-Run-bind
     # window: the worker has not saved the final binding yet.
     _draft, run, directory, workspace, _start = candidate_run(service, body)
-    evidence = Evidence.capture(workspace, directory, [], Sandbox(), 1, run["id"])
+    evidence = Evidence.capture(
+        replace(
+            workspace,
+            operation_context=operation_context(service.store.get(run["id"])),
+        ),
+        directory,
+        [],
+        Sandbox(),
+        1,
+        run["id"],
+    )
     service.finalize_candidate(run, directory, evidence)
     path = directory / "generation-final/report.json"
     final = json.loads(path.read_bytes())
