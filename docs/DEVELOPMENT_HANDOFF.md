@@ -6,7 +6,7 @@
 
 | 对象 | 当前事实 |
 | --- | --- |
-| 开发入口 | `codex/responses-transport`；真实后台验收源码 `b4625026e1e247dedeee8859b8cd5cf36086b040`；后续内容、交付及 SDK 期限接线 `f271bfb` 联合专项 390 项通过；初始化/凭据/领取期限 `61a9dd3` 已通过 2126 项完整回归；登记组件 `66fed5f` 和 Arena/Background 组件 `bfdb43f` 已整合，生产登记入口尚未启用；见下文 |
+| 开发入口 | `codex/responses-transport`；真实后台验收源码 `b4625026e1e247dedeee8859b8cd5cf36086b040`；后续期限 `61a9dd3` 的 2126 项完整回归通过；其后 controller 生产登记、actor 与锁外 cleanup 已纳入 `a5c7ece`，160 项专项、Ruff 与构建通过；旧调用方迁移及新整合全量仍待，见下文 |
 | 开发目录 | `/Users/benson/.codex/worktrees/doonex-delivery-docs/doonex` |
 | 固定真实验收目录 | `/Users/benson/.codex/worktrees/responses-process-transport-tests/doonex`，detached `b462502`；保持干净，不在此开发 |
 | main | `a965d7faaf83f6f70f22971da21ab5aa03e27257`，M3 已验收版本，尚未推进 |
@@ -39,7 +39,8 @@ PYTHONPATH=apps/server:tests .venv/bin/python -c 'import doonex; print(doonex.__
 - 严格 Responses 投影在 `b462502` 支持本网关已核验的中性元数据及细分用量；任意字段、非法工具和非零内置工具仍拒绝。无 retry/fallback，不改写 aggregate 用量。
 - 后续离线切片已整合有限 Git/export（`d42a8ff`）、Sandbox（`1140aed`、`cc4d89e`）及父接线：共同 Run 剩余期限、SDK 本地读取/哈希/锁、isolated helper，以及 process/daemon 两类未知的持久全局阻止。API/Arena 新探测自身的未知也保存。普通确认、空 ps 和重启均不能清除。
 - Tasksets、Skill/Library/Generation、Review/Evidence 的有限文件操作、调度回执及 Worker 调用链现已传递同一执行期限；`f271bfb` 也在每次 SDK Chat/Responses 请求的预算提交后重新收紧实际 timeout。联合专项 390 项通过，直接传输 timeout 不保证 OS 或供应商整请求结束。Arena/Background 组件 `bfdb43f` 的 91 项离线和 190 项 PG/Docker 检查通过；领取复核、凭据读取、首次时钟后的初始化和 completion 锁后期限复核已纳入 `61a9dd3`，完整回归 2126 项通过。
-- `66fed5f` 已加入独立 controller operation 表和严格登记组件，82 项组件检查通过；**Store、全局 fence、API/worker/CLI 与两个生产 Popen 入口尚未接齐**。不能把该组件完成写成启动崩溃窗口已覆盖。Git 和 Sandbox 入口正分别在独立工作区实施；锁内 cleanup 的拆分和父接线尚待。
+- `66fed5f` 的独立 controller operation 组件已接入生产：Workspace `4d68f30`、Store/fence `e4b0834`、Sandbox `3a910c5`、CLI actor `cb4416c`、Git 异常身份 `c23a6bf`，以及 API/Worker/cleanup/Evidence/Review/Arena/Scheduler 的 `a5c7ece`。真实 reserve/launch 提交后才 Popen；API 请求和 Worker 入口各自关闭 actor；停止意图先提交、锁外有限清理、再按 nonce/owner/request CAS。**160 项专项通过，但新整合全量与完整 Worker.run 崩溃/等待矩阵尚未通过**。旧测试迁移 `93bd7e3`、`18fd8ed`、Git filters `6b4a404` 已纳入，剩余调用方继续迁移，不能用 fake registry 或生产旁路替代。
+- `scripts/live_background.py` 的公开运行入口已固定拒绝 `legacy_background_harness_disabled`，在读取配置、DB 或 campaign 前零副作用；历史宽范围容器清点不能提供真实 Run 绑定。旧完整后台验收保留，不从这个 harness 重放。
 
 ## 本轮真实验收：全部已经执行，禁止重放
 
@@ -61,7 +62,7 @@ PYTHONPATH=apps/server:tests .venv/bin/python -c 'import doonex; print(doonex.__
 
 1. 核对本页最终检查收据及 Git/进程状态。普通 gateway、后台 run_once、所有 prepare/finish/finalize intent 均已消费；不要重跑同一授权、样例或清理脚本。
 2. 先核对父接线专项和后续最终整合收据。有限 Git/export、Sandbox 与 SDK 持久化期限已整合，不重复 cherry-pick；两轮中途失败和诊断记录保留；`61a9dd3` 的最终完整回归 2126 项通过，旧 1826 项仅适用历史源码。
-3. 补齐 Popen 前持久 operation 身份、真实终态 CAS 与全局 fence；普通动作 acknowledged 不能解除。将 cleanup 移出 Run 锁前须先有持久身份和 owner 校验，不只移动调用。
+3. 持久 operation、真实终态 CAS、全局 fence 与锁外 cleanup 已接线。先迁移旧测试中的真实 actor/Run/context 并处理回归，再补完整崩溃与过期上下文矩阵；普通动作 acknowledged 不能解除。`controller-existing-integration-01` 实际为 76 passed / 9 failed / 15 setup errors，不是通过：setup 在共享 Arena fixture 导入 taskset 时缺 registry；其余逐项核对，不能统一归为测试问题。
 4. 已整合内容/证据/SDK 请求期限，不重复 cherry-pick。首次时钟后的初始化、凭据及后台领取 metadata 复核已整合并验证；继续完成有限 yielded 候选与前台优先、批次/窗口向同进程 monotonic 期限的映射。保留冻结输入完整核查，近容量和超限拒绝须实际验证。
 5. 用真实 Worker.run、一次性 PostgreSQL、真实 Docker、本地 synthetic provider，在同一 monotonic 时间线覆盖正常/近容量/故障及启动恢复；记录前台入队提交区间到首次准入 commit。明确容量、队列和健康依赖后才给出数值操作目标。
 6. 最终整合验证及 M4 剩余退出条件通过后推进 main，再考虑常驻服务的固定源码升级和回退收据。公开上线、收费和许可证仍单独确认。
@@ -70,7 +71,7 @@ PYTHONPATH=apps/server:tests .venv/bin/python -c 'import doonex; print(doonex.__
 
 ## 检查与私有证据
 
-当前已提交交付接线 `f271bfb` 的联合专项 **390 passed / 3 warnings / 169.56 秒 / exit 0，无跳过**，146 份非 Markdown 输入与提交逐项绑定。登记组件 `66fed5f` 的 82 项及上下文组件 `bfdb43f` 的 91/190 项为各自组件证据，不能相加当全量。其后的初始化/凭据/领取期限接线 `61a9dd3` 完整回归 **2126 passed / 3 warnings / 828.30 秒 / exit 0，无跳过**，外层 832.395 秒；同一 151 个非 Markdown 输入的 162 项专项、Ruff 与前端构建均通过，并逐项绑定该提交，结果见续接记录。历史 `43f6147` 的 334 项和 `full-03` 的 220 passed / 1 failed / exit 2 均保留。
+历史交付接线 `f271bfb` 的联合专项 **390 passed / 3 warnings / 169.56 秒 / exit 0，无跳过**，146 份非 Markdown 输入与提交逐项绑定。初始化/凭据/领取期限 `61a9dd3` 的完整回归 **2126 passed / 3 warnings / 828.30 秒 / exit 0，无跳过**，外层 832.395 秒；同一 151 个非 Markdown 输入的 162 项专项、Ruff 与前端构建均通过。后续 controller 生产接线 `a5c7ece` 的 **160 passed / 2 warnings / 35.37 秒 / exit 0**、Ruff 与前端构建已绑定同一 159 个输入；这不是新完整回归。旧入口诊断在 `6b4a404` 为 **76 passed / 9 failed / 15 errors / 85.98 秒 / exit 1**，外层 89.699 秒，输入不变，临时 PG 已清理，失败完整保留。各项证据与限制见续接记录。
 
 历史 `b462502` 全量 **1826 passed / 3 warnings / 905.09 秒 / exit 0，无跳过**；138 份非 Markdown 输入前后相同且绑定该提交，临时 PostgreSQL 与任务容器已清理。`689bc2a` 的旧全量为 1747 passed / 3 warnings；会话/Responses 联合专项 526 passed / 2 warnings；b462502 Responses 专项 222 passed / 1 warning。Ruff 与本轮实际前端构建已通过，当前源码与验证绑定见续接记录。
 
@@ -84,7 +85,8 @@ PYTHONPATH=apps/server:tests .venv/bin/python -c 'import doonex; print(doonex.__
 | 后续期限接线专项及中途失败 | `deadline-integration-*.json/.log`、`full-03.json/.log`；最终状态见续接记录 |
 | 内容与交付期限接线 | `deadline-delivery-integration-01.json/.log`、`deadline-delivery-integration-01-source-binding.json` |
 | 初始化/凭据/领取期限后续检查 | `deadline-initialization-*.json/.log`；不能从名称推断通过，须核对 exit、输入及源码绑定 |
-| 登记与上下文组件 | `../m4-controller-operations/HANDOFF.md`、`../m4-context-deadline/HANDOFF.md`；生产启用仍待父接线 |
+| 登记与上下文组件 | `../m4-controller-operations/HANDOFF.md`、`../m4-context-deadline/HANDOFF.md`；其中未接线为历史事实 |
+| controller 生产接线与旧入口诊断 | `controller-entrypoints-integration-01.json/.log`、`controller-entrypoints-integration-02.json/.log`、`controller-wiring-source-binding-01.json`、`controller-existing-integration-01.json/.log`；失败保留，新整合全量待验 |
 | SDK 容量与近容量样本 | `combined-*.json/.log`、`session-capacity-benchmark.json`、`session-benchmark-source-binding.json` |
 | 实际索引定义核对 | `index-audit.json`，首轮失败保留 |
 | 唯一新后台尝试 | `background-20261114/execution.intent.json`、`execution-receipt.json`、`audit-02/independent-after.json` |

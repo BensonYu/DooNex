@@ -87,7 +87,7 @@ M4 的整体探索方向包括低优先级后台评测、GitHub 候选发现、�
 
 新批次为 5 tasks ×（baseline + 2 approved skills）× 1 repeat，15/15 completed_verified；后台 45 calls / 56,689 tokens，前台 3 calls / 3,219 tokens。独立审计 259 项、真实浏览器 32 项及 7 张截图复核通过；原会话与首次启动时钟保持。此为 tuning 调度验收，不产生推广资格、Skill 优胜或通用成功率结论。UTC 11 月 6、7 日的失败、未知预留和冻结日账逐项保留。
 
-剩余主项是[正常完整前台等待上界](M4_WAIT_CONTROL_PLAN.md)：共同剩余期限、Docker 管道及回收、有限 Git/export/快照/验证复制和普通/Arena/generation 前台初始化，再以同一 monotonic 时间线验证实际 Worker.run 的正常、近容量和故障矩阵。内容/交付及逐次 SDK 请求期限现已整合，`f271bfb` 联合专项 390 项通过；controller 登记和 Arena/Background 组件各有独立证据，生产登记入口仍未启用。初始化/凭据/领取期限 `61a9dd3` 已通过 2126 项完整回归、Ruff 与前端构建；继续完成持久登记全链、锁外 cleanup、有限 yielded 处理及实际 Worker.run 验收。不能将局部 deadline、直接驱动 Worker.execute 的 4.946589 秒样本、完整后台成功或几个组件耗时相加作为该条件通过。
+剩余主项是[正常完整前台等待上界](M4_WAIT_CONTROL_PLAN.md)：共同剩余期限、Docker 管道及回收、有限 Git/export/快照/验证复制和普通/Arena/generation 前台初始化，再以同一 monotonic 时间线验证实际 Worker.run 的正常、近容量和故障矩阵。内容/交付及逐次 SDK 请求期限现已整合，`f271bfb` 联合专项 390 项通过；初始化/凭据/领取期限 `61a9dd3` 的 2126 项完整回归、Ruff 与前端构建通过。随后 controller 生产登记、actor 与锁外 cleanup 已纳入 `a5c7ece`，160 项专项、Ruff 与前端构建通过；继续迁移旧调用方、完成新整合全量、调度共同期限、有限 yielded 处理及实际 Worker.run 验收。不能将局部 deadline、直接驱动 Worker.execute 的 4.946589 秒样本、完整后台成功或几个组件耗时相加作为该条件通过。
 
 真实验收源码 `b462502` 的完整回归 1826 项、Ruff 和前端构建通过；后续共同期限接线 `61a9dd3` 的完整回归 2126 项通过，新源码绑定与剩余全链接线见续接记录，不能沿用旧全量；历史 1650 项适用于 `31d937f`。API/worker 未加载，旧 plist 仍指向 M5 `f7a1161`，常驻服务没有升级；不能自动恢复不认识新 helper 阻止规则的旧 worker。先完成剩余退出条件及最终整合检查，再按原约定推进 main 和固定源码服务升级。M5 仍关闭，公开部署、收费和许可证单独决定。
 

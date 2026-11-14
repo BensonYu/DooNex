@@ -153,4 +153,40 @@ PYTHONPATH=apps/server:tests .venv/bin/python scripts/test_local.py \
 
 绑定收据为 `deadline-initialization-final-source-binding.json`，SHA256 `305318a3cff18a066352c904cc8b0fbb2705de5c8303830065a10934326556b6`。临时数据库已由脚本清理；本轮没有真实模型调用、生产账本写入或服务升级。两轮完整回归失败、临时数据库连接失败及确定性诊断均保留，不能将它们改写为通过。
 
-下一片仍是持久 controller 登记的生产接线。Workspace `28a19e8`、Store/fence `6a011106`、Sandbox `8d406bb`，以及旧测试迁移 `5cfdb23`（78 项）与 `5070c01`（90 项）分别有组件证据，尚未纳入父分支；异常关联和 CLI actor 正做后续检查。父 API/Worker/cleanup/Evidence/Review/Arena/Scheduler 草稿与入口测试仍在私有目录，未应用，不能宣称生产可用。整合后须重新验证真实 Git/Docker、请求隔离、停止意图与锁外清理，继续完成调度共同期限、有限 yielded 和实际 Worker.run 矩阵。
+上述为 `61a9dd3` 当时的最终绑定。之后持久 controller 生产接线已整合，当前状态及未完成条件见下节；不能继续按旧的“草稿未应用”状态实施，也不能将 2126 项历史全量套用新源码。
+
+## 持久 controller 生产接线
+
+| 父提交 | 原切片 | 已纳入内容 |
+| --- | --- | --- |
+| `4d68f30` | `28a19e8` | Workspace 持久 controller group，Git config/export 及临时 Git 的显式 capability |
+| `e4b0834` | `6a011106` | Store 初始化、严格 SQL 终态与索引、业务/登记两层 fence、实际 project/owner/action 绑定 |
+| `3a910c5` | `8d406bb` | Sandbox 两个实际进程入口的显式 capability，覆盖 mount、create/start/inspect、rm 与完整 ps |
+| `93bd7e3`、`18fd8ed` | `5cfdb23`、`5070c01` | Workspace/Sandbox 原检查迁移至真实持久 actor，保留隔离及故障断言 |
+| `cb4416c` | `77a2418` | 有限 CLI actor 验证原连接实际持有 worker 锁；旧 background harness 在读取配置/DB/campaign 前明确禁用 |
+| `c23a6bf` | `fa88055` | Git launch/终态异常保留实际 operation ID，普通已终态业务错误不一律伪造 record_unknown |
+| `a5c7ece` | 父整合 | API/Worker/cleanup/Evidence/Review/Arena/Scheduler 生产调用方与专项 |
+| `6b4a404` | `3bbc114` | Git filters 测试迁移；26 项组件检查通过，原 25 passed / 1 failed 保留 |
+
+Store 在初始化时安装窄 controller 表、严格终态函数和索引。业务 `execution_fenced` 同时含旧外部未知与 controller 未决；只有 registry 内部续接使用 external fence，不为业务提供 exclude。registry 严格读取真实 Run/project/owner/action，owner 为 null 合法但不能省略身份检查。实际进程启动前必须确认 reserve/launch 已提交，回收分别核对实际 reap 与双 EOF；repair 只结清新组，不清旧 unknown。
+
+API 每请求使用 fresh registry/ContextVar，finally 关闭；保留原 auth/Host/Origin。Worker 的 run/reconcile/execute 入口分别建立并关闭本层 registry、恢复外层，lease 实际核对当前连接持有 WORKER_LOCK。停止链先用短事务提交 intent、解锁后执行有限 cleanup，再按 nonce/owner/request 摘要 CAS；重复 pause 不重复 cleanup，并发 cancel 优先，旧 CAS 不覆盖变更后的状态。pending/unknown/损坏 intent 不重放、不恢复。Evidence/Review 临时 Git、verifier、Arena resume 和 Scheduler receipt 使用实际 workspace/verification 身份。
+
+实际专项：
+
+```bash
+PYTHONPATH=apps/server:tests .venv/bin/python scripts/test_local.py \
+  tests/test_controller_cleanup.py tests/test_controller_entrypoints.py \
+  tests/test_controller_store.py tests/test_workspace_controller.py \
+  tests/test_sandbox_controller.py tests/test_live_controller.py
+```
+
+首次 `controller-entrypoints-integration-01` 为 **158 passed / 2 failed / 2 warnings / 34.92 秒 / exit 1**，日志 SHA256 `7b1fe9a78cce81ae0d5fa154d46c633f61bb4f56be32666838cb1d3b1b5c32b9`。新 stale-CAS 测试直接索引未领取 Run 可能缺失的 owner；原日志未直出被 cleanup 捕获的 KeyError，根因来自静态 setup 核对。仅将 snapshot/比较改为 `.get(key)`，保留 owner/request/intent CAS、预算、首次时钟和单终态断言，未修改产品语义。
+
+修正后的 `controller-entrypoints-integration-02` 为 **160 passed / 2 warnings / 35.37 秒 / exit 0**，外层 38.583 秒；同一 159 个非 Markdown 输入的 Ruff 与实际前端构建 exit 0。`controller-wiring-source-binding-01.json` 逐项绑定 `a5c7ece102626c8c38cba20cdd5f42ef59876a22`，SHA256 `77bcec272c7c606109ae24f12a416bbc30969e0d0da1e98b63895ecc7506a4d8`；专项日志 SHA256 `9c901fe29838b2e8279c1cfe91231fedc40bc855e1486210a73e402dbb11fc48`。独立审查另保存全部 159 份实际测试输入。后续 `6b4a404` 仅迁移 Git filters 测试，不能再说当前全部输入与专项相同。
+
+专项包括真实 API→Run→Workspace→SDK shell→Evidence 纵向；每次实际 Popen 前以第二 PG 连接取得 advisory xact lock 和 Run NOWAIT 行锁，确认 launching 已提交。三处 cleanup、重复 pause/并发 cancel、owner/request/intent 变化和两个并发 API threadpool ContextVar 已检查；已真实提交终态后人工抛 RegistryError 的 ACK 未知保留，普通恢复不清除。
+
+这些证据仍有边界：API 过期 copy_context 的 late Git 在测试线程执行，Worker closed context 直接检查，没有完整 late OS thread 矩阵；ACK 测试为真实提交后人工抛错，不是真实网络 ACK 丢失；leaf SIGKILL 不等于完整 Worker.run crash 矩阵。**未通过新整合完整回归，也未证明完整前台等待上界。**
+
+旧入口首轮 `controller-existing-integration-01` 在 `6b4a404` 实际为 **76 passed / 9 failed / 15 setup errors / 2 warnings / 85.98 秒 / exit 1**，外层 89.699 秒，输入前后不变；日志 SHA256 `2048ceeae52804ebddb8a65a25708f4ec6e3efd5b5499e872c5883f3943b29b5`。15 个 setup 在共享 Arena fixture 导入 taskset 时缺 registry，其余 Worker/cleanup 行为正在逐项核对，不先认定全部为测试问题。测试进程结束且一次性 PG 已清理，原失败保留。下一步迁移真实调用上下文、处理回归并完成新整合全量，再继续调度 preflight 共同期限、有限 yielded、批次/窗口 monotonic 映射及实际 Worker.run 矩阵；不重放已通过的真实后台批次，不推进 main 或升级服务。

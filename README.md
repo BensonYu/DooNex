@@ -48,7 +48,7 @@ M5 面向自托管单站点，范围与实际检查见 [M5 记录](docs/M5_IMPLE
 
 首个验证环境为 Apple Silicon Mac mini、macOS、Docker 与 Python 3.12。系统 Python 3.9 不用于应用运行；`uv` 根据项目约束创建 Python 3.12 环境。还需可用的 Git、Node.js 和 `pnpm`，前端包管理器锁定为 `pnpm@11.1.1`。这些命令供本机开发使用，不代表已验证其他硬件或公网部署。
 
-当前整合成果位于 `codex/responses-transport` 分支，`main` 暂保留 M3，等待 M4 剩余退出条件通过。本轮已整合原子 helper 身份、有限数据库维护及 [SDK 会话容量](docs/M4_SESSION_CAPACITY.md)，真实验收源码 `b462502` 通过 **1826 项本机测试**、Ruff 和前端构建。后续已整合有限 Git/export、Sandbox 清理、内容/交付及逐次 SDK 请求的共同期限，`f271bfb` 联合专项 390 项通过。初始化、凭据及后台领取期限已提交为 `61a9dd3`，完整回归 **2126 项通过**，同一源码的 Ruff 和前端构建通过。控制操作登记组件已有证据，生产入口尚未启用；未完成接线及证据见[续接记录](docs/M4_RESUMPTION_20261113.md#下一步与合并条件)与[等待控制计划](docs/M4_WAIT_CONTROL_PLAN.md)。后续源码变化仍须重新验证。当前 API/worker 未加载，保留的 plist 仍指向旧 M5 版本；常驻服务尚未升级。以下命令检出当前整合分支。
+当前整合成果位于 `codex/responses-transport` 分支，`main` 暂保留 M3，等待 M4 剩余退出条件通过。本轮已整合原子 helper 身份、有限数据库维护及 [SDK 会话容量](docs/M4_SESSION_CAPACITY.md)，真实验收源码 `b462502` 通过 **1826 项本机测试**、Ruff 和前端构建。后续已整合有限 Git/export、Sandbox 清理、内容/交付及逐次 SDK 请求的共同期限，`f271bfb` 联合专项 390 项通过。初始化、凭据及后台领取期限 `61a9dd3` 的完整回归 **2126 项通过**，同一源码的 Ruff 和前端构建通过。其后持久 controller 登记、生产 actor、Git/Sandbox 入口和锁外 cleanup 已纳入 `a5c7ece`，**160 项专项**、Ruff 与前端构建通过；旧调用方迁移和新整合完整回归仍待，不能沿用 2126 项为当前源码结论。证据及剩余退出条件见[续接记录](docs/M4_RESUMPTION_20261113.md#持久-controller-生产接线)与[等待控制计划](docs/M4_WAIT_CONTROL_PLAN.md)。当前 API/worker 未加载，保留的 plist 仍指向旧 M5 版本；常驻服务尚未升级。以下命令检出当前整合分支。
 
 ```bash
 git clone --branch codex/responses-transport git@github.com:BensonYu/DooNex.git doonex
@@ -147,15 +147,7 @@ git status --short
 
 SDK 续接缺陷已修复；旧两轮供应商超时与未知预留保留，UTC 2026-11-14 的新完整批次、原会话续接、独立账目和界面核验均已通过。调用上限和在途撤销已有受控证据，正常完整前台等待上界仍未完成。一次授权仅有一个批次，不自动补跑或推广；候选发现和生成使用各自的明确操作。实际检查、已知失败与等待边界见 [M4 实施记录](docs/M4_IMPLEMENTATION.md)。
 
-受控真实让出验收要求已有有限授权草稿和从未开始、无动作或停止请求的 `paused` 前台样例，二者使用相同已确认模型；先停止普通 worker，再显式运行：
-
-```bash
-.venv/bin/python scripts/live_background.py --confirm-model-usage \
-  --enable-authorization --authorization-id EXISTING_DRAFT_UUID \
-  --foreground-run-id PRISTINE_PAUSED_RUN_UUID --model ACTUAL_API_MODEL_ID
-```
-
-脚本持有 campaign 与 worker 锁，先持久化批次及前台的完整额度，再启用草稿、创建唯一批次。它在首个后台模型请求预留后插入指定前台，验证安全让出、前台交付和原 SDK 会话续接；没有替换模型传输。它不提供通用样例创建或未知故障恢复，已有尝试禁止重跑。失败和未知记录保留；SIGKILL 或主机丢失后须先核查持久状态，不能直接重启普通 worker。
+历史 `scripts/live_background.py` harness 已用于上述固定源码的完整真实验收，已有尝试禁止重跑。当前生产控制登记要求每个实际进程绑定可核验的 Run/owner/action；旧 harness 的宽范围容器清点不满足该合同，公开运行入口现固定以 `legacy_background_harness_disabled` 拒绝，在读取配置、数据库或 campaign 之前停止。它不再作为当前验收命令；后续等待矩阵须走实际 Worker.run。失败和未知记录保留；SIGKILL 或主机丢失后先核查持久状态，不能直接重启普通 worker。
 
 ## 自托管 Skill 社区
 

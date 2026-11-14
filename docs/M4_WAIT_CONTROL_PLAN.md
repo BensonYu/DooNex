@@ -29,11 +29,11 @@ create 子进程已启动却没有正常、严格的 ACK 时，CLI 回收和当�
 
 已观察的 `local_process_unknown` 与 `daemon_request_unknown` 沿异常链和返回值合并，普通 pause/cancel/resume、Arena 确认、重启或后续空 ps 均不能清除。独立保留当前 cleanup attempt 与最多 16 份不同未决回执，溢出仍锁存阻止。API/Arena 新探测自身失败也持久记录，不能只抛异常然后遗失其子进程证据。
 
-**本片仍未覆盖 Popen 后、终态回执持久前控制器崩溃的窗口。** 下一步须在 Popen 前持久 logical operation 身份，按 owner/operation 的真实终态回执 CAS 结算；不能让普通 unknown→acknowledged 清除 process/daemon fence，不能补造 PID 或从空闲 lease 推断未发送。已有 shell/verification action 可作为准入身份；Git/export、mount 和清理探测也须登记。
+**Popen 前持久登记和生产接线已实现，完整崩溃矩阵仍待。** 独立组件 `66fed5f` 之后，Workspace、Store/fence、Sandbox、CLI actor 与父调用方已共同纳入 `a5c7ece`。两个实际 Popen 入口只接受已提交 reserve/launch 的 capability，业务全局 fence 同时包含 controller 与旧外部未知；Git/export、mount 与清理探测也须登记。API 每请求、Worker 各入口及 CLI actor 绑定实际 Run/project/nullable owner/action，退出时关闭；不能借用变更后的新 owner。
 
-登记组件 `66fed5f` 已通过 82 项检查，包含独立窄表、严格终态 SQL 函数/索引核对、reserve/launch commit 后能力、真实进程回执和有限 ps/rm repair。**目前尚未生产启用**：Store 初始化与 fence、ambient actor、Git/Sandbox 生产入口、锁外 cleanup 及 API/worker/CLI 调用方必须一起闭合。无原 sandbox operation 的历史未知继续阻止，不能用空新表、空 ps 或跳过自身 fence 代替部署前核查。repair 仅结清新组，不清原 unknown。
+停止流程先短事务保存 cleanup intent、提交解锁，再有限清理，最后按 nonce/owner/request CAS；重复 pause 不重复 cleanup，并发 cancel 优先，pending/unknown/损坏 intent 不重放或恢复。160 项真实 PG/Git/Docker 与锁定 SDK 合成传输专项、Ruff、前端构建通过并绑定 `a5c7ece`；旧调用方回归仍有失败，新整合全量尚未通过。组件 leaf SIGKILL、复制上下文到期拒绝和提交后人工抛错的 ACK 测试不能代替完整 Worker.run 崩溃/真实网络丢 ACK 矩阵，详见[接线记录](M4_RESUMPTION_20261113.md#持久-controller-生产接线)。无原 sandbox operation 的历史未知继续阻止；空新表、空 ps 或普通 acknowledged 均不能解除，repair 仅结清新组。
 
-容器清理目前仍在既有行锁内；移出前须冻结 cleanup 身份、持久阻止及 owner/状态 CAS。组件审查和本机故障检查不替代父整合回归或完整 Worker.run 矩阵，最终收据见[续接记录](M4_RESUMPTION_20261113.md)。
+API immediate control、Worker reconcile 与 execute 异常三处清理已移出 Run 行锁，并由持久 intent 和 CAS 连接前后事务。组件审查和本机故障检查不替代父整合回归或完整 Worker.run 矩阵，最终收据见[续接记录](M4_RESUMPTION_20261113.md)。
 
 ## 有限文件操作与前台初始化
 
